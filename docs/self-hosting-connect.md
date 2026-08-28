@@ -28,7 +28,9 @@ the gate keeps the entire wildcard for labels:
 bb.<domain>                    → bb-web        (account app)
 <handle>.<domain>              → bb-connect    → a paired bb
 <handle>--<port>.<domain>      → bb-connect    → a shared port
-<domain>                       → 301 → bb.<domain>
+<domain>/api/connect/*         → bb-web        (mobile enrollment)
+<domain>/.well-known/*         → bb-web        (mobile app links)
+other <domain> requests        → 301 → bb.<domain>
 ```
 
 `bb` is in `RESERVED_HANDLES`, so it can never be claimed as a server label.
@@ -36,6 +38,10 @@ bb.<domain>                    → bb-web        (account app)
 URLs derive from `BASE_DOMAIN`, and better-auth scopes its cookie to
 `.<domain>`, which is what lets the gate validate the same session on
 `<handle>.<domain>`.
+
+Mobile pairing derives the account apex from the paired server URL. The apex
+API and app-link paths therefore route directly to `bb-web`; redirecting those
+requests to `bb.<domain>` breaks POST requests and mobile app association.
 
 ### Bind the app with a route, not a custom domain
 
@@ -76,10 +82,19 @@ Not covered by the committed configs — these are manual:
    covers the same one level.
 
 4. **Apex redirect** (optional). A Single Redirect on the
-   `http_request_dynamic_redirect` phase, `http.host eq "<domain>"` →
-   `concat("https://bb.<domain>", http.request.uri.path)`, 301, preserve query.
-   Without it the apex is dead, and `bb connect status` shows a broken dashboard
-   link (it derives the apex by dropping one label from the server URL).
+   `http_request_dynamic_redirect` phase sends ordinary apex requests to
+   `concat("https://bb.<domain>", http.request.uri.path)` with status 301 and
+   the query string preserved. Exclude the paths routed directly to `bb-web`:
+
+   ```text
+   (http.host eq "<domain>"
+    and not starts_with(http.request.uri.path, "/api/connect/")
+    and not starts_with(http.request.uri.path, "/.well-known/"))
+   ```
+
+   Without the redirect, the dashboard link derived from the paired server URL
+   is dead. Without the exclusions, mobile pairing receives redirect HTML
+   instead of the account API's JSON response.
 
    Create the rule **before** adding the apex DNS record — a record with no rule
    serves 522s against the placeholder IP instead of a clean NXDOMAIN.
@@ -191,6 +206,15 @@ bb connect --code <CODE> --base-url https://bb.<domain> --server https://<handle
 Share URLs derive correctly from the server URL, so
 `https://<handle>--<port>.<domain>` works with no further configuration.
 
+### Pairing the mobile app
+
+Settings → Remote access → **Add mobile device** and
+`bb connect machine-code` derive `https://<domain>` from the paired server URL.
+The committed `bb-web` routes and the apex redirect exclusions above must both
+be active. The generated pairing payload then names the account apex and the
+paired server separately, so the mobile app redeems its code at the apex and
+connects to `https://<handle>.<domain>`.
+
 ## Verifying
 
 The gate proxies `/install.sh` and `/install/version` without authentication, so
@@ -203,6 +227,18 @@ curl https://<handle>.<domain>/install/version   # served by your local bb, thro
 Other useful signals: an unauthenticated visitor to `<handle>.<domain>` should
 get a 401 sign-in page; an unknown label 404s; `bb connect status --json`
 reports `state: connected` and `remoteClients` counts live realtime sockets.
+
+Mobile pairing has three focused checks:
+
+```sh
+curl -X POST https://<domain>/api/connect/machine-code
+curl https://<domain>/.well-known/apple-app-site-association
+bb connect machine-code --json
+```
+
+The unauthenticated POST returns a JSON 401 rather than redirect HTML, the app
+association returns JSON 200, and the authenticated CLI command returns the
+apex, paired server URL, one-time code, and expiry.
 
 Note that auth runs **before** routing, so a request to an unshared port returns
 401 (not shared → not signed in) rather than 404. The tunnel client is what

@@ -31,5 +31,9 @@
       }
     ]
   },
-  "routes": [{ "pattern": "bb.btool.sh/*", "zone_name": "btool.sh" }]
+  "routes": [
+    { "pattern": "bb.btool.sh/*", "zone_name": "btool.sh" },
+    { "pattern": "btool.sh/api/connect/*", "zone_name": "btool.sh" },
+    { "pattern": "btool.sh/.well-known/*", "zone_name": "btool.sh" }
+  ]
 }
