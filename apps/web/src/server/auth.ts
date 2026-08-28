@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { APIError } from "better-auth/api";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { drizzle } from "drizzle-orm/d1";
 import {
@@ -10,6 +11,10 @@ import {
   verification,
 } from "@bb/connect-db";
 import type { Env } from "./env.js";
+import {
+  isGithubLoginAllowed,
+  resolveGithubAllowlist,
+} from "./github-allowlist.js";
 import { resolveDevEmailPasswordEnabled } from "./local-auth.js";
 
 export type Auth = ReturnType<typeof createAuth>;
@@ -18,6 +23,7 @@ export function createAuth(env: Env) {
   const db = drizzle(env.DB);
   const appUrl = new URL(env.APP_URL);
   const devEmailPasswordEnabled = resolveDevEmailPasswordEnabled(env);
+  const githubAllowlist = resolveGithubAllowlist(env);
   const subdomainOrigin = `${appUrl.protocol}//*.${env.BASE_DOMAIN}${
     appUrl.port ? `:${appUrl.port}` : ""
   }`;
@@ -45,7 +51,14 @@ export function createAuth(env: Env) {
         clientId: env.GITHUB_CLIENT_ID,
         clientSecret: env.GITHUB_CLIENT_SECRET,
         overrideUserInfoOnSignIn: true,
-        mapProfileToUser: (profile) => ({ githubLogin: profile.login }),
+        mapProfileToUser: (profile) => {
+          if (!isGithubLoginAllowed(githubAllowlist, profile.login)) {
+            throw new APIError("FORBIDDEN", {
+              message: "This GitHub account is not allowed to sign in.",
+            });
+          }
+          return { githubLogin: profile.login };
+        },
       },
     },
     advanced: {

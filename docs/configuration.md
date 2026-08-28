@@ -623,6 +623,11 @@ need the experiment on, the bb paired (`bb connect --code …`), and the connect
 plugin enabled; with the experiment off the panel hides the section and
 `bb connect machine-code` exits 1 with a pointer to the toggle.
 
+To run your own gate on your own domain instead of pairing to getbb.app, see
+[docs/self-hosting-connect.md](self-hosting-connect.md). Pairing against a
+self-hosted gate takes `--base-url` (where codes are redeemed) in addition to
+`--server`.
+
 ## Experiments
 
 Experimental surfaces are changed in Settings → Experiments or with

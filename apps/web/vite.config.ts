@@ -14,15 +14,22 @@ import { resolveSiteOrigin } from "./src/server/site-origin.js";
 
 export default defineConfig(({ command }) => {
   const cloudDev = resolveCloudDevViteSettings(command, process.env);
+  const wranglerConfigPath = fileURLToPath(
+    new URL(
+      process.env.BB_WEB_WRANGLER_CONFIG ?? "./wrangler.jsonc",
+      import.meta.url,
+    ),
+  );
   const siteOrigin = resolveSiteOrigin(
     cloudDev?.vars.APP_URL ??
       unstable_readConfig({
-        config: fileURLToPath(new URL("./wrangler.jsonc", import.meta.url)),
+        config: wranglerConfigPath,
         env: process.env.CLOUDFLARE_ENV,
       }).vars.APP_URL,
   );
   const cloudflareConfig: PluginConfig = {
     viteEnvironment: { name: "ssr" },
+    configPath: wranglerConfigPath,
     ...(cloudDev
       ? {
           persistState: { path: cloudDev.persistStatePath },

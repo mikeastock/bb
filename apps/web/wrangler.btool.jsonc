@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bb-web",
+  "account_id": "26dace28f8bcc23d105d7c198c69e7c8",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "@tanstack/react-start/server-entry",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "vars": {
+    "BASE_DOMAIN": "btool.sh",
+    "APP_URL": "https://bb.btool.sh",
+    "ALLOWED_GITHUB_LOGINS": "mikeastock"
+  },
+  "secrets": {
+    "required": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "BETTER_AUTH_SECRET"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bb-connect-prod",
+      "database_id": "7ad976bb-23b9-4bb4-8d82-c01658da6e27"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TUNNEL_DO",
+        "class_name": "TunnelDO",
+        "script_name": "bb-connect"
+      }
+    ]
+  },
+  "routes": [{ "pattern": "bb.btool.sh/*", "zone_name": "btool.sh" }]
+}
