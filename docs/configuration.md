@@ -1458,6 +1458,11 @@ need the experiment on, the bb signed in (`bb account login`), and the connect
 plugin enabled; with the experiment off the panel hides the section and
 `bb connect machine-code` exits 1 with a pointer to the toggle.
 
+To run your own gate on your own domain instead of pairing to getbb.app, see
+[docs/self-hosting-connect.md](self-hosting-connect.md). Pairing against a
+self-hosted gate takes `--base-url` (where codes are redeemed) in addition to
+`--server`.
+
 ## Message editing
 
 Message editing is available for eligible, accepted root user messages in a

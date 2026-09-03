@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bb-web",
+  "account_id": "26dace28f8bcc23d105d7c198c69e7c8",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "./src/server-entry.ts",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "vars": {
+    "BASE_DOMAIN": "buildr-bb.com",
+    "APP_URL": "https://bb.buildr-bb.com",
+    "ALLOWED_GITHUB_LOGINS": "mikeastock"
+  },
+  "secrets": {
+    "required": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "BETTER_AUTH_SECRET"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bb-connect-prod",
+      "database_id": "7ad976bb-23b9-4bb4-8d82-c01658da6e27"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TUNNEL_DO",
+        "class_name": "TunnelDO",
+        "script_name": "bb-connect"
+      }
+    ]
+  },
+  "routes": [
+    { "pattern": "bb.buildr-bb.com/*", "zone_name": "buildr-bb.com" },
+    { "pattern": "buildr-bb.com/api/connect/*", "zone_name": "buildr-bb.com" },
+    { "pattern": "buildr-bb.com/.well-known/*", "zone_name": "buildr-bb.com" }
+  ]
+}
