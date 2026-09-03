@@ -1079,6 +1079,11 @@ in and the `share-server-links` skill for `bb connect` and port shares.
 `https://getbb.app` and `https://vibecodethis.site` (plus
 `http://bb.localhost:<port>` in a development build).
 
+To run your own gate on your own domain instead of pairing to getbb.app, see
+[docs/self-hosting-connect.md](self-hosting-connect.md). Pairing against a
+self-hosted gate takes `--base-url` (where codes are redeemed) in addition to
+`--server`.
+
 Settings → Mobile links the iOS TestFlight and Android APK downloads and pairs
 the bb mobile app (`bb connect machine-code`, see `bb guide machines`). Mobile
 builds, the optional `GOOGLE_SERVICES_JSON` Firebase config, and publishing
