@@ -10,7 +10,7 @@
   "vars": {
     "BASE_DOMAIN": "buildr-bb.com",
     "APP_URL": "https://bb.buildr-bb.com",
-    "ALLOWED_GITHUB_LOGINS": "mikeastock"
+    "ALLOWED_GITHUB_LOGINS": "mikeastock,gedward"
   },
   "secrets": {
     "required": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "BETTER_AUTH_SECRET"]
