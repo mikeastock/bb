@@ -192,20 +192,20 @@ is unacceptable for a field authorization depends on.
 
 ## Pairing a bb
 
-When the app host differs from `BASE_DOMAIN`, pairing needs **both** flags:
+`bb-app` on npm refuses `https://buildr-bb.com` before it sends a pairing code.
+This deploy's client is the `buildr-bb-app` package, which allows that apex.
 
 ```sh
-bb connect --code <CODE> --base-url https://bb.<domain> --server https://<handle>.<domain>
+npx -p buildr-bb-app bb connect --code <CODE> --server https://<handle>.<domain>
 ```
 
-- `--base-url` points code redemption at the account app. Without it the client
-  uses its hardcoded `https://getbb.app`.
-- `--server` sets the tunnel destination. Without it, `serverUrlForHandle`
-  appends the handle to the base URL's host and derives
-  `<handle>.bb.<domain>` — two labels deep, covered by neither the DNS wildcard
-  nor the certificate.
+`--server` is the handle URL the dashboard prints. The client drops the first
+hostname label and redeems at `https://<domain>`. Leave off
+`--base-url https://bb.<domain>`. That host is the account app, and passing it
+makes the client look for `https://<handle>.bb.<domain>`, which this DNS and
+certificate do not cover.
 
-Share URLs derive correctly from the server URL, so
+Share URLs derive from the server URL, so
 `https://<handle>--<port>.<domain>` works with no further configuration.
 
 ### Pairing the mobile app

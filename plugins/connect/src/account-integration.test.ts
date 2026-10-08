@@ -439,7 +439,7 @@ describe("connect on top of bb account", () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain(
-      "https://getbb.app or https://vibecodethis.site",
+      "https://buildr-bb.com",
     );
     expect(stub.requests).toEqual([]);
     expect(await accountState()).toBe("signed-out");

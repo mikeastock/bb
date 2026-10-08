@@ -223,7 +223,7 @@ serves it at `<handle>.getbb.app` and shares HTTP ports from any enrolled host
 `bb connect machine-code` mints a one-time, 10-minute code that pairs the bb
 mobile app (also shown under Settings → Mobile → Add mobile device); `--json`
 prints `{code, serverUrl, apex, expiresAt}`. Without an installed bb, pair a
-dashboard code with `npx -p bb-app@latest bb connect --code <code>`.
+dashboard code with `npx -p buildr-bb-app bb connect --code <code>`.
 
 ## Move the server
 
