@@ -31,6 +31,13 @@
       }
     ]
   },
+  "ratelimits": [
+    {
+      "name": "LINK_START_RATE_LIMITER",
+      "namespace_id": "1",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ],
   "routes": [
     { "pattern": "bb.buildr-bb.com/*", "zone_name": "buildr-bb.com" },
     { "pattern": "buildr-bb.com/api/account/*", "zone_name": "buildr-bb.com" },
