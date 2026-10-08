@@ -33,6 +33,7 @@
   },
   "routes": [
     { "pattern": "bb.buildr-bb.com/*", "zone_name": "buildr-bb.com" },
+    { "pattern": "buildr-bb.com/api/account/*", "zone_name": "buildr-bb.com" },
     { "pattern": "buildr-bb.com/api/connect/*", "zone_name": "buildr-bb.com" },
     { "pattern": "buildr-bb.com/.well-known/*", "zone_name": "buildr-bb.com" }
   ]

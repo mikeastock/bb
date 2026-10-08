@@ -28,6 +28,7 @@ the gate keeps the entire wildcard for labels:
 bb.<domain>                    → bb-web        (account app)
 <handle>.<domain>              → bb-connect    → a paired bb
 <handle>--<port>.<domain>      → bb-connect    → a shared port
+<domain>/api/account/*         → bb-web        (account identity and linking)
 <domain>/api/connect/*         → bb-web        (mobile enrollment)
 <domain>/.well-known/*         → bb-web        (mobile app links)
 other <domain> requests        → 301 → bb.<domain>
@@ -88,6 +89,7 @@ Not covered by the committed configs — these are manual:
 
    ```text
    (http.host eq "<domain>"
+    and not starts_with(http.request.uri.path, "/api/account/")
     and not starts_with(http.request.uri.path, "/api/connect/")
     and not starts_with(http.request.uri.path, "/.well-known/"))
    ```
