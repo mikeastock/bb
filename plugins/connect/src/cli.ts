@@ -189,13 +189,13 @@ export function registerConnectCli(args: {
             type: "string",
             placeholder: "url",
             description:
-              "Server URL the dashboard printed, https://<handle>.getbb.app or https://<handle>.vibecodethis.site; only its apex origin is used",
+              "Server URL the dashboard printed, https://<handle>.getbb.app, https://<handle>.vibecodethis.site, or https://<handle>.buildr-bb.com; only its apex origin is used",
           },
           "base-url": {
             type: "string",
             placeholder: "url",
             description:
-              "getbb.app origin: https://getbb.app or https://vibecodethis.site (development builds also accept http://bb.localhost:<port>)",
+              "Account origin: https://getbb.app, https://vibecodethis.site, or https://buildr-bb.com (development builds also accept http://bb.localhost:<port>)",
           },
           json: JSON_OPTION,
         },

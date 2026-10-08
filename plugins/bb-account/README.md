@@ -85,5 +85,5 @@ server revokes the previous one.
 The base URL is `https://getbb.app`. In development, `BB_DEV_CONNECT_BASE_URL`
 may name an `http://bb.localhost:<port>` origin or `https://vibecodethis.site`.
 `--base-url` and the rpc `baseUrl` override it per command but accept only
-`https://getbb.app` and `https://vibecodethis.site`, plus
-`http://bb.localhost:<port>` in a development build.
+`https://getbb.app`, `https://vibecodethis.site`, and `https://buildr-bb.com`,
+plus `http://bb.localhost:<port>` in a development build.

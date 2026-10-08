@@ -30,11 +30,11 @@ sign-in, if any.
   denied, or expire, and exits non-zero unless it signed in.
 - `bb account login --code XXXX-XXXX [--json]` pairs with a one-time code from
   the getbb.app dashboard. `bb connect --code <code>` is an alias.
-- `--base-url <url>` points sign-in at `https://getbb.app` or
-  `https://vibecodethis.site` (staging); a development build also accepts
-  `http://bb.localhost:<port>`. Any other origin is refused. In a source
-  checkout, `pnpm dev` sets `BB_DEV_CONNECT_BASE_URL` so sign-in uses that
-  worktree's local Cloud.
+- `--base-url <url>` points sign-in at `https://getbb.app`,
+  `https://vibecodethis.site`, or `https://buildr-bb.com`. A development build
+  also accepts `http://bb.localhost:<port>`. Any other origin is refused. In a
+  source checkout, `pnpm dev` sets `BB_DEV_CONNECT_BASE_URL` so sign-in uses
+  that worktree's local Cloud.
 
 Signing in again replaces the account this bb is signed in to, and revokes the
 previous server on getbb.app when the new sign-in is for a different one.

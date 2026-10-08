@@ -1057,11 +1057,20 @@ describe("who may use bb account", () => {
 });
 
 describe("base URL overrides", () => {
-  it("allows only getbb.app and staging, plus bb.localhost in development", () => {
+  it("allows getbb.app, staging, and buildr-bb.com, plus bb.localhost in development", () => {
     for (const env of [{}, { NODE_ENV: "production" }, { NODE_ENV: "test" }]) {
       expect(isAllowedBaseUrl("https://getbb.app", env)).toBe(true);
       expect(isAllowedBaseUrl("https://vibecodethis.site", env)).toBe(true);
+      expect(isAllowedBaseUrl("https://buildr-bb.com", env)).toBe(true);
       expect(isAllowedBaseUrl("http://bb.localhost:59329", env)).toBe(false);
+      for (const origin of [
+        "https://gabe.buildr-bb.com",
+        "https://bb.buildr-bb.com",
+        "https://buildr-bb.com.evil.test",
+        "http://buildr-bb.com",
+      ]) {
+        expect(isAllowedBaseUrl(origin, env), origin).toBe(false);
+      }
     }
     const development = { NODE_ENV: "development" };
     expect(isAllowedBaseUrl("http://bb.localhost:59329", development)).toBe(
@@ -1094,11 +1103,11 @@ describe("base URL overrides", () => {
     ]);
     expect(cli.exitCode).toBe(1);
     expect(cli.stderr).toContain(
-      "https://getbb.app or https://vibecodethis.site",
+      "https://buildr-bb.com",
     );
     await expect(
       host.harness.callRpc("login.start", { baseUrl: "https://evil.test" }),
-    ).rejects.toThrow("https://getbb.app or https://vibecodethis.site");
+    ).rejects.toThrow("https://buildr-bb.com");
     expect(stub.requests).toEqual([]);
   });
 });

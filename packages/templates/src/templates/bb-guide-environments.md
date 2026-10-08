@@ -188,7 +188,7 @@ bb account (getbb.app sign-in):
   bb account login                        Print a getbb.app link and code to approve
     --wait                                Wait for that sign-in to finish
     --code <code>                         Pair with a one-time dashboard code
-    --base-url <url>                      https://getbb.app or https://vibecodethis.site
+    --base-url <url>                      https://getbb.app, https://vibecodethis.site, or https://buildr-bb.com
   bb account logout                       Revoke the credential and sign out
 
   `bb account login` returns after printing the link; approve it in any
@@ -209,14 +209,14 @@ Remote access (bb connect):
 
   bb connect --code <code> [--server https://<handle>.getbb.app]
     --code <code>          One-time pairing code from the dashboard
-    --server <url>         Dashboard server URL; only its getbb.app or
-                           vibecodethis.site apex is used
+    --server <url>         Dashboard server URL; only its getbb.app,
+                           vibecodethis.site, or buildr-bb.com apex is used
 
   The bb SERVER holds the tunnel itself — so it stays up as long as bb is
   running and reconnects on restart (no foreground process). It connects with
   the server credential bb account holds.
   Without an installed bb, pair via npm:
-  `npx -p bb-app@latest bb connect --code <code>`.
+  `npx -p buildr-bb-app bb connect --code <code>`.
 
   bb connect status                       Show the server's connect status
   bb connect off                          Turn remote access off, stay signed in

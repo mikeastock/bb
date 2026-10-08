@@ -102,11 +102,11 @@ account plugin accepts only those origins, only when `NODE_ENV=development`,
 and uses the value as the sign-in default; the Connect plugin
 uses it for its dashboard link while signed out. Explicit
 `bb account login --base-url ...`, `bb connect --server ...`, or
-`--base-url ...` targets take precedence but accept only `https://getbb.app`
-and `https://vibecodethis.site` (plus `http://bb.localhost:<port>` when
-`NODE_ENV=development`), and packaged/production bb keeps the
-`https://getbb.app` default. This value is launcher-managed, not a
-`bb-app config` setting.
+`--base-url ...` targets take precedence but accept only `https://getbb.app`,
+`https://vibecodethis.site`, and `https://buildr-bb.com` (plus
+`http://bb.localhost:<port>` when `NODE_ENV=development`), and
+packaged/production bb keeps the `https://getbb.app` default. This value is
+launcher-managed, not a `bb-app config` setting.
 
 After `bb-app config` writes `~/.bb/config.json` or `bb-app env` writes
 `~/.bb/env.json`, it asks the running local server to reload. If bb is not
@@ -1399,10 +1399,11 @@ The getbb.app dashboard's pairing command,
 `bb connect --code <code> --server https://<handle>.getbb.app`, signs this bb
 in like `bb account login --code <code>` and also turns remote access back on
 if it was off. Pair from a machine without an installed bb via
-`npx -p bb-app@latest bb connect …`. `--server` and `--base-url` (on both
-`bb connect` and `bb account login`) accept only `https://getbb.app` and
-`https://vibecodethis.site` origins (a `--server` URL is reduced to its apex);
-a development build also accepts `http://bb.localhost:<port>`.
+`npx -p buildr-bb-app bb connect …`. `--server` and `--base-url` (on both
+`bb connect` and `bb account login`) accept only `https://getbb.app`,
+`https://vibecodethis.site`, and `https://buildr-bb.com` (a `--server` URL is
+reduced to its apex); a development build also accepts
+`http://bb.localhost:<port>`.
 
 The connect plugin's `remoteAccess` setting turns remote access off and on
 without signing out. `bb connect off` closes the tunnel and machine shares and
@@ -1459,9 +1460,9 @@ plugin enabled; with the experiment off the panel hides the section and
 `bb connect machine-code` exits 1 with a pointer to the toggle.
 
 To run your own gate on your own domain instead of pairing to getbb.app, see
-[docs/self-hosting-connect.md](self-hosting-connect.md). Pairing against a
-self-hosted gate takes `--base-url` (where codes are redeemed) in addition to
-`--server`.
+[docs/self-hosting-connect.md](self-hosting-connect.md). Pairing against the
+Buildr gate takes `--server https://<handle>.buildr-bb.com`. The client
+redeems at the apex `https://buildr-bb.com`.
 
 ## Message editing
 

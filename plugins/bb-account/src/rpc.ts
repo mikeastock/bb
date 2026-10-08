@@ -28,7 +28,7 @@ export function resolveBaseUrl(
   const origin = normalizeOrigin(override, "baseUrl");
   if (!policy.allowed(origin)) {
     throw new Error(
-      `bb can't sign in to ${origin}; use https://getbb.app or https://vibecodethis.site (a development build also accepts http://bb.localhost:<port>)`,
+      `bb can't sign in to ${origin}; use https://getbb.app, https://vibecodethis.site, or https://buildr-bb.com (a development build also accepts http://bb.localhost:<port>)`,
     );
   }
   return origin;

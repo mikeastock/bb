@@ -55,8 +55,9 @@ signed in; `bb connect on` turns it back on. Both set the connect
 pairing, and `bb account status` shows which account is signed in.
 `bb connect --code <code>` still pairs with a dashboard code like
 `bb account login --code <code>`, and also turns remote access back on if it
-was off. `--server` takes the dashboard's `https://<handle>.getbb.app` (or
-`https://<handle>.vibecodethis.site`) URL; other origins are refused.
+was off. `--server` takes the dashboard's `https://<handle>.getbb.app`,
+`https://<handle>.vibecodethis.site`, or `https://<handle>.buildr-bb.com` URL.
+The client uses that URL's apex, and any other apex is refused.
 
 ## Agent instructions setting
 
