@@ -1,0 +1,142 @@
+# Polls get-bb/bb main and publishes mikeastock/bb connect-self-hosted as
+# buildr-bb-app. Scheduled runs only start from the fork's default branch.
+# The job checks out connect-self-hosted, rebases it in the runner, and does
+# not push. Official bb-app is never published.
+name: Publish buildr-bb-app
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and pack without publishing.
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-buildr-bb-app
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish buildr-bb-app
+    if: github.repository == 'mikeastock/bb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout connect-self-hosted
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: connect-self-hosted
+
+      - name: Rebase onto upstream and choose a version
+        id: plan
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/get-bb/bb.git
+          git fetch upstream main --no-tags
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::connect-self-hosted does not rebase onto get-bb/bb main."
+            exit 1
+          fi
+          if ! grep -q 'https://buildr-bb.com' plugins/bb-account/src/base-url.ts; then
+            echo "::error::Rebased tree does not allow https://buildr-bb.com."
+            exit 1
+          fi
+          upstream_sha="$(git rev-parse --short=9 upstream/main)"
+          base_version="$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const version = JSON.parse(readFileSync("packages/bb-app/package.json", "utf8")).version;
+            const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)/u.exec(version);
+            if (match === null) {
+              console.error("Invalid bb-app version");
+              process.exit(1);
+            }
+            process.stdout.write(match[0]);
+          ')"
+          version="${base_version}-buildr.g${upstream_sha}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "BUILDR_VERSION=${version}" >> "$GITHUB_ENV"
+          if npm view "buildr-bb-app@${version}" version >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "buildr-bb-app@${version} is already published."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Will publish buildr-bb-app@${version}."
+          fi
+
+      - name: Set up pnpm
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9.15.0
+          run_install: false
+
+      - name: Set up Node.js
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Ensure npm supports trusted publishing
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        run: |
+          npm_version="$(npm --version)"
+          node - "$npm_version" <<'NODE' || npm install --global npm@latest
+          const version = process.argv[2];
+          const [major, minor, patch] = version.split(".").map(Number);
+          const supported =
+            major > 11 ||
+            (major === 11 && (minor > 5 || (minor === 5 && patch >= 1)));
+          process.exit(supported ? 0 : 1);
+          NODE
+          npm --version
+
+      - name: Install dependencies
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build bb-app
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        run: pnpm exec turbo run build --filter=bb-app --output-logs=new-only
+
+      - name: Smoke the packed client
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        run: pnpm exec turbo run smoke:tarball --filter=bb-app --force --output-logs=new-only
+
+      - name: Point the packed manifest at buildr-bb-app
+        if: steps.plan.outputs.publish == 'true' || github.event.inputs.dry_run == 'true'
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const path = "packages/bb-app/package.json";
+          const pkg = JSON.parse(readFileSync(path, "utf8"));
+          pkg.name = "buildr-bb-app";
+          pkg.version = process.env.BUILDR_VERSION;
+          pkg.repository.url = "git+https://github.com/mikeastock/bb.git";
+          writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+          NODE
+
+      - name: Publish buildr-bb-app
+        if: steps.plan.outputs.publish == 'true' && github.event.inputs.dry_run != 'true'
+        working-directory: packages/bb-app
+        run: npm publish --access public --tag latest
+
+      - name: Preview the publish
+        if: github.event.inputs.dry_run == 'true'
+        working-directory: packages/bb-app
+        run: npm publish --dry-run --tag latest
