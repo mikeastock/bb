@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 import type { PluginComposerThreadRowStatus } from "@get-bb/plugin-sdk";
+import { createKeyedListeners } from "./keyed-listeners";
 
 type ThreadRowStatusListener = () => void;
 type ThreadRowStatusOwner = string | symbol;
@@ -11,19 +12,37 @@ const statusesByThreadId = new Map<
     { pluginId: string; status: PluginComposerThreadRowStatus }
   >
 >();
-const listenersByThreadId = new Map<string, Set<ThreadRowStatusListener>>();
+const threadRowStatusListeners = createKeyedListeners<string>();
 const groupListeners = new Set<ThreadRowStatusListener>();
 
+let statusSnapshot: ReadonlyMap<string, PluginComposerThreadRowStatus> | null =
+  null;
+
 function notify(threadId: string): void {
-  const listeners = listenersByThreadId.get(threadId);
-  if (listeners) {
-    for (const listener of [...listeners]) {
-      listener();
-    }
-  }
+  statusSnapshot = null;
+  threadRowStatusListeners.notify(threadId);
   for (const listener of [...groupListeners]) {
     listener();
   }
+}
+
+const EMPTY_STATUS_SNAPSHOT: ReadonlyMap<
+  string,
+  PluginComposerThreadRowStatus
+> = new Map();
+
+export function getPluginThreadRowStatuses(): ReadonlyMap<
+  string,
+  PluginComposerThreadRowStatus
+> {
+  if (statusSnapshot !== null) return statusSnapshot;
+  const next = new Map<string, PluginComposerThreadRowStatus>();
+  for (const threadId of statusesByThreadId.keys()) {
+    const status = getPluginThreadRowStatus(threadId);
+    if (status !== null) next.set(threadId, status);
+  }
+  statusSnapshot = next.size === 0 ? EMPTY_STATUS_SNAPSHOT : next;
+  return statusSnapshot;
 }
 
 export function getPluginThreadRowStatus(
@@ -32,16 +51,6 @@ export function getPluginThreadRowStatus(
   const statuses = statusesByThreadId.get(threadId);
   if (!statuses || statuses.size === 0) return null;
   return statuses.values().next().value?.status ?? null;
-}
-
-function getPluginThreadRowStatusForThreads(
-  threads: readonly { id: string }[],
-): PluginComposerThreadRowStatus | null {
-  for (const thread of threads) {
-    const status = getPluginThreadRowStatus(thread.id);
-    if (status) return status;
-  }
-  return null;
 }
 
 export function setPluginThreadRowStatus(
@@ -98,18 +107,7 @@ export function subscribePluginThreadRowStatus(
   threadId: string,
   listener: ThreadRowStatusListener,
 ): () => void {
-  let listeners = listenersByThreadId.get(threadId);
-  if (!listeners) {
-    listeners = new Set();
-    listenersByThreadId.set(threadId, listeners);
-  }
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-    if (listeners.size === 0) {
-      listenersByThreadId.delete(threadId);
-    }
-  };
+  return threadRowStatusListeners.subscribe(threadId, listener);
 }
 
 function subscribePluginThreadRowStatusGroup(
@@ -134,27 +132,21 @@ export function usePluginThreadRowStatus(
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-export function usePluginThreadRowStatusForThreads(
-  threads: readonly { id: string }[],
-): PluginComposerThreadRowStatus | null {
-  const getSnapshot = useCallback(
-    () => getPluginThreadRowStatusForThreads(threads),
-    [threads],
-  );
+export function usePluginThreadRowStatuses(): ReadonlyMap<
+  string,
+  PluginComposerThreadRowStatus
+> {
   return useSyncExternalStore(
     subscribePluginThreadRowStatusGroup,
-    getSnapshot,
-    getSnapshot,
+    getPluginThreadRowStatuses,
+    getPluginThreadRowStatuses,
   );
 }
 
 export function resetPluginThreadRowStatusesForTest(): void {
+  statusSnapshot = null;
   statusesByThreadId.clear();
-  for (const listeners of listenersByThreadId.values()) {
-    for (const listener of [...listeners]) {
-      listener();
-    }
-  }
+  threadRowStatusListeners.notifyAll();
   for (const listener of [...groupListeners]) {
     listener();
   }

@@ -1,11 +1,10 @@
-import type { ComponentProps, ReactNode, Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import { Button, type ButtonProps } from "../button";
-import { Icon, type IconName } from "../icon";
 import { ScrollArea } from "../scroll-area";
 import { cn } from "../../../lib/utils";
-import { ResourceOverview, ResourceSectionTitle } from "./detail-shell";
+import { ResourceSectionTitle } from "./detail-shell";
 import { ResourceActionButton } from "./row";
-import { ResourceTabDescription, ResourceToolbar } from "./toolbar";
+import { ResourceTabDescription } from "./toolbar";
 
 export interface ResourceCollectionMode<Mode extends string> {
   id: Mode;
@@ -30,14 +29,12 @@ export function ResourceCollectionPage<Mode extends string>({
   onModeChange,
   actions,
   children,
-  className,
   bandClassName,
 }: {
   id: string;
   description: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
-  className?: string;
   bandClassName?: string;
 } & ResourceCollectionModeProps<Mode>) {
   const modeList = modes ?? [];
@@ -46,15 +43,15 @@ export function ResourceCollectionPage<Mode extends string>({
   const activeTabId = hasModes ? `${id}-${activeMode}-tab` : undefined;
   const activePanelId = hasModes ? `${id}-${activeMode}-panel` : undefined;
   return (
-    <div className={cn("flex h-full min-h-0 flex-col gap-5", className)}>
+    <div className="flex h-full min-h-0 flex-col gap-5">
       {}
-      <div className="pr-3">
+      <div className="md:pr-3">
         <div className={bandClassName}>
           <ResourceTabDescription>{description}</ResourceTabDescription>
         </div>
       </div>
       {hasModes || actions !== undefined ? (
-        <div className="pr-3">
+        <div className="md:pr-3">
           <div
             className={cn(
               "flex flex-wrap items-center justify-between gap-2",
@@ -145,7 +142,6 @@ export function ResourceCollectionViewport({
   footer,
   scrollId,
   viewportRef,
-  className,
   contentClassName,
   bandClassName,
 }: {
@@ -154,18 +150,17 @@ export function ResourceCollectionViewport({
   footer?: ReactNode;
   scrollId?: string;
   viewportRef?: Ref<HTMLDivElement>;
-  className?: string;
   contentClassName?: string;
   bandClassName?: string;
 }) {
   return (
     <div
-      className={cn("flex h-full min-h-0 flex-col gap-5", className)}
+      className="flex h-full min-h-0 flex-col gap-5"
       data-resource-collection-viewport
     >
       {}
       {toolbar ? (
-        <div className="shrink-0 pr-3">
+        <div className="shrink-0 md:pr-3">
           <div className={bandClassName}>{toolbar}</div>
         </div>
       ) : null}
@@ -177,7 +172,7 @@ export function ResourceCollectionViewport({
         viewportRef={viewportRef}
         viewportProps={{
           id: scrollId,
-          className: cn("overscroll-contain pr-3", contentClassName),
+          className: cn("overscroll-contain md:pr-3", contentClassName),
           "data-resource-collection-scroll": true,
         }}
       >
@@ -185,37 +180,13 @@ export function ResourceCollectionViewport({
       </ScrollArea>
       {footer ? (
         <div
-          className="sticky bottom-0 z-10 shrink-0 border-t border-border/70 bg-background pt-3 pr-3"
+          className="sticky bottom-0 z-10 shrink-0 border-t border-border/70 bg-background pt-3 md:pr-3"
           data-resource-collection-footer
         >
           <div className={bandClassName}>{footer}</div>
         </div>
       ) : null}
     </div>
-  );
-}
-
-export function ResourceOverviewSection({
-  id,
-  label,
-  toolbar,
-  className,
-  children,
-}: {
-  id: string;
-  label: ReactNode;
-  toolbar: ReactNode;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <section aria-labelledby={id} className={cn("space-y-2", className)}>
-      <ResourceSectionTitle id={id} className="px-3">
-        {label}
-      </ResourceSectionTitle>
-      {toolbar}
-      {children}
-    </section>
   );
 }
 
@@ -238,188 +209,60 @@ export function ResourceBrowseGrid({
   );
 }
 
-export interface ResourceBrowseSectionItem {
-  id: string;
-  content: ReactNode;
-}
-
-export function ResourceBrowseSection({
-  icon,
-  attribution,
-  onBrowseAll,
-  items,
-  state,
-}: {
-  icon: IconName;
-  attribution?: ReactNode;
-  onBrowseAll?: () => void;
-  items?: readonly ResourceBrowseSectionItem[];
-  state?: ReactNode;
-}) {
-  const visibleItems = items ?? [];
-  const shouldShowOverflowFade = visibleItems.length > 3;
-  if (state === undefined && visibleItems.length === 0) return null;
-
-  return (
-    <ResourceSourceShelf
-      label="Browse"
-      leading={
-        <Icon
-          name={icon}
-          className="size-3.5 shrink-0 text-muted-foreground"
-          aria-hidden
-        />
-      }
-      attribution={attribution}
-      browseAction={
-        onBrowseAll ? (
-          <ResourceShelfSeeAllAction type="button" onClick={onBrowseAll} />
-        ) : undefined
-      }
-      contentMode={state === undefined ? "rail" : "panel"}
-      scrollOverlay={
-        state === undefined && shouldShowOverflowFade ? (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-y-0 right-0 w-[var(--resource-source-shelf-fade-ramp)] bg-gradient-to-r from-transparent to-surface-recessed-solid"
-          />
-        ) : undefined
-      }
-    >
-      {state ??
-        visibleItems.map((item) => (
-          <ResourceSourceItem key={item.id}>{item.content}</ResourceSourceItem>
-        ))}
-    </ResourceSourceShelf>
-  );
-}
-
-export function ResourceOverviewPage({
-  description,
-  browse,
-  installed,
-  className,
-}: {
-  description: ReactNode;
-  browse: ComponentProps<typeof ResourceBrowseSection>;
-  installed: {
-    headingId: string;
-    label: ReactNode;
-    searchValue: string;
-    searchPlaceholder: string;
-    searchLabel?: string;
-    onSearchChange: (value: string) => void;
-    controls?: ReactNode;
-    action?: ReactNode;
-    body: ReactNode;
-  };
-  className?: string;
-}) {
-  return (
-    <ResourceOverview
-      className={className}
-      description={description}
-      browse={<ResourceBrowseSection {...browse} />}
-    >
-      <ResourceOverviewSection
-        id={installed.headingId}
-        label={installed.label}
-        toolbar={
-          <ResourceToolbar
-            searchValue={installed.searchValue}
-            searchPlaceholder={installed.searchPlaceholder}
-            searchLabel={installed.searchLabel}
-            onSearchChange={installed.onSearchChange}
-            controls={installed.controls}
-            action={installed.action}
-          />
-        }
-      >
-        {installed.body}
-      </ResourceOverviewSection>
-    </ResourceOverview>
-  );
-}
-
 export function ResourceSourceShelf({
   label,
-  attribution,
   description,
+  hideDescriptionWhenNarrow = false,
   leading,
   browseAction,
-  scrollOverlay,
-  contentMode = "rail",
-  contentSurface = "recessed",
   children,
 }: {
   label: ReactNode;
-  attribution?: ReactNode;
   description?: ReactNode;
+  hideDescriptionWhenNarrow?: boolean;
   leading?: ReactNode;
   browseAction?: ReactNode;
-  scrollOverlay?: ReactNode;
-  contentMode?: "rail" | "panel";
-  contentSurface?: "recessed" | "plain";
   children: ReactNode;
 }) {
   return (
-    <section className="w-full max-w-full space-y-[var(--resource-source-shelf-section-gap)] text-popover-foreground">
-      <div className="flex min-w-0 items-center gap-[var(--resource-source-shelf-label-gap)] px-[var(--resource-source-shelf-inset)] text-xs text-muted-foreground">
-        <div className="flex min-w-0 items-center gap-[var(--resource-source-shelf-label-gap)]">
-          {leading}
-          <ResourceSectionTitle className="truncate">
-            {label}
-          </ResourceSectionTitle>
-          {attribution !== undefined &&
-          attribution !== null &&
-          attribution !== false ? (
-            <span className="truncate text-subtle-foreground">
-              {attribution}
-            </span>
-          ) : null}
+    <section className="@container/resource-shelf w-full max-w-full space-y-[var(--resource-source-shelf-section-gap)] text-popover-foreground">
+      <div className="flex min-w-0 items-end gap-[var(--resource-source-shelf-label-gap)] px-[var(--resource-source-shelf-header-inset,var(--resource-source-shelf-inset))] text-xs text-muted-foreground">
+        <div
+          className={cn(
+            "min-w-0 flex-1",
+            hideDescriptionWhenNarrow
+              ? "@min-[40rem]/resource-shelf:space-y-[var(--resource-source-shelf-section-gap)]"
+              : "space-y-[var(--resource-source-shelf-section-gap)]",
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-[var(--resource-source-shelf-label-gap)]">
+            {leading}
+            <ResourceSectionTitle className="truncate">
+              {label}
+            </ResourceSectionTitle>
+          </div>
+          {description === undefined ? null : (
+            <div
+              className={cn(
+                "min-w-0 items-center gap-3",
+                hideDescriptionWhenNarrow
+                  ? "hidden @min-[40rem]/resource-shelf:flex"
+                  : "flex",
+              )}
+            >
+              <p className="min-w-0 max-w-2xl text-xs leading-relaxed text-muted-foreground">
+                {description}
+              </p>
+            </div>
+          )}
         </div>
-        {browseAction && description === undefined ? (
-          <div className="ml-auto shrink-0 text-xs text-muted-foreground">
+        {browseAction ? (
+          <div className="shrink-0 text-xs text-muted-foreground">
             {browseAction}
           </div>
         ) : null}
       </div>
-      {description === undefined ? null : (
-        <div className="flex min-w-0 items-center gap-3 px-[var(--resource-source-shelf-inset)]">
-          <p className="min-w-0 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            {description}
-          </p>
-          {browseAction ? (
-            <div className="ml-auto shrink-0 text-xs text-muted-foreground">
-              {browseAction}
-            </div>
-          ) : null}
-        </div>
-      )}
-      <div
-        className={cn(
-          contentSurface === "recessed"
-            ? "rounded-lg bg-surface-recessed/70 p-[var(--resource-source-shelf-inset)]"
-            : "px-[var(--resource-source-shelf-inset)]",
-        )}
-      >
-        {contentMode === "panel" ? (
-          children
-        ) : (
-          <div className="relative">
-            <div className="-ml-[var(--resource-source-shelf-shadow-left-bleed)] -my-[var(--resource-source-shelf-shadow-bleed)] overflow-x-auto pl-[var(--resource-source-shelf-shadow-left-bleed)] py-[var(--resource-source-shelf-shadow-bleed)]">
-              <div className="flex w-full snap-x snap-mandatory gap-[var(--resource-source-shelf-item-gap)]">
-                {children}
-              </div>
-            </div>
-            {scrollOverlay ? (
-              <div className="pointer-events-none absolute inset-x-0 top-[var(--resource-source-shelf-shadow-bleed)] bottom-[var(--resource-source-shelf-shadow-bleed)]">
-                {scrollOverlay}
-              </div>
-            ) : null}
-          </div>
-        )}
-      </div>
+      <div className="px-[var(--resource-source-shelf-inset)]">{children}</div>
     </section>
   );
 }
@@ -433,7 +276,7 @@ export function ResourceShelfAction({
       variant="ghost"
       size="sm"
       className={cn(
-        "h-auto shrink-0 rounded-md px-[var(--resource-source-shelf-action-inline)] py-[var(--resource-source-shelf-action-block)] text-xs font-normal text-muted-foreground hover:bg-state-hover hover:text-foreground",
+        "-my-[var(--resource-source-shelf-action-block)] h-auto shrink-0 rounded-md px-[var(--resource-source-shelf-action-inline)] py-[var(--resource-source-shelf-action-block)] text-xs font-normal leading-relaxed text-muted-foreground hover:bg-state-hover hover:text-foreground",
         className,
       )}
       {...props}
@@ -452,25 +295,6 @@ export function ResourceShelfSeeAllAction({
   );
 }
 
-export function ResourceSourceItem({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={cn(
-        "w-[22rem] shrink-0 snap-start md:w-[var(--resource-source-shelf-item-width)]",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
 type ResourceBrowseCardProps = {
   className?: string;
   leading?: ReactNode;
@@ -481,6 +305,7 @@ type ResourceBrowseCardProps = {
   byline?: ReactNode;
   headerAction?: ReactNode;
   footerMeta?: ReactNode;
+  footer?: ReactNode;
   pointerOnlyOpen?: boolean;
 } & (
   | { openLabel: string; onOpen: (trigger: HTMLButtonElement) => void }
@@ -497,6 +322,7 @@ export function ResourceBrowseCard({
   byline,
   headerAction,
   footerMeta,
+  footer,
   pointerOnlyOpen = false,
   openLabel,
   onOpen,
@@ -568,6 +394,11 @@ export function ResourceBrowseCard({
           {footerMeta}
         </span>
       ) : null}
+      {footer ? (
+        <div className="pointer-events-none relative col-span-2 row-start-3 min-w-0">
+          {footer}
+        </div>
+      ) : null}
     </div>
   );
 
@@ -583,12 +414,10 @@ export function ResourceBrowseCard({
 export function ResourceTemplateBrowseCard({
   title,
   description,
-  actionLabel = "Use template",
   onUse,
 }: {
   title: string;
   description: ReactNode;
-  actionLabel?: string;
   onUse: () => void;
 }) {
   return (
@@ -596,12 +425,12 @@ export function ResourceTemplateBrowseCard({
       title={title}
       description={description}
       descriptionLines={3}
-      openLabel={`${actionLabel}: ${title}`}
+      openLabel={`Use template: ${title}`}
       pointerOnlyOpen
       headerAction={
         <ResourceActionButton
-          label={`${actionLabel}: ${title}`}
-          tooltipLabel={actionLabel}
+          label={`Use template: ${title}`}
+          tooltipLabel="Use template"
           icon="MessageCirclePlus"
           className="size-7 hover:bg-state-hover focus-visible:bg-state-hover"
           onClick={onUse}

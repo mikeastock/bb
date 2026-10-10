@@ -23,6 +23,7 @@ out
 /build
 /apps/app/build/
 /packages/bb-app/host-daemon/
+/packages/bb-app/host-package/
 /apps/desktop/release/
 /apps/desktop/.electron-builder.generated.json
 
@@ -90,3 +91,10 @@ provider-recordings/raw/
 **/provider-corpus/**
 !apps/server/test/provider-corpus/**
 !scripts/provider-corpus/**
+.builtin-server-test-*/
+.builtin-host-test-*/
+
+/plugins/.bundled-stage-*/
+/plugins/*/.bundled-runtime/
+
+.ci-health/

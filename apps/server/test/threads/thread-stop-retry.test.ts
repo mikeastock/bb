@@ -1,12 +1,16 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { getThread, listEvents } from "@bb/db";
-import type { Environment, Thread } from "@bb/domain";
-import { describe, expect, it } from "vitest";
+import { getThread, listEvents, markThreadDeleted } from "@bb/db";
+import type { EnvironmentRow } from "@bb/db";
+import type { Thread } from "@bb/domain";
+import { describe, expect, it, vi } from "vitest";
 import {
   finalizeStoppedThread,
   hasLiveThreadStopInFlight,
+  requestThreadStorageDeletion,
   requestThreadStopForCurrentState,
+  stopThreadForCurrentState,
 } from "../../src/services/threads/thread-lifecycle.js";
+import { HostOnlineRpcTimeoutError } from "../../src/ws/hub.js";
 import {
   listQueuedThreadCommands,
   reportQueuedCommandError,
@@ -23,7 +27,7 @@ import {
 import { withTestHarness, type TestAppHarness } from "../helpers/test-app.js";
 
 interface ActiveThreadStopFixture {
-  environment: Environment;
+  environment: EnvironmentRow;
   thread: Thread;
 }
 
@@ -74,6 +78,67 @@ async function waitForStopRpcIdle(args: WaitForStopRpcIdleArgs): Promise<void> {
 }
 
 describe("thread stop dispatch", () => {
+  it("keeps a deleted thread tombstone until storage deletion succeeds", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedActiveThreadStopFixture({
+        harness,
+        value: 5,
+      });
+      markThreadDeleted(harness.db, harness.hub, { threadId: thread.id });
+
+      requestThreadStorageDeletion(harness.deps, thread, environment);
+      const failedDelete = await waitForQueuedCommand(
+        harness,
+        ({ command }) =>
+          command.type === "thread.storage.delete" &&
+          command.threadId === thread.id,
+      );
+      expect(getThread(harness.db, thread.id)).toMatchObject({
+        deletedAt: expect.any(Number),
+        storageDeletedAt: null,
+      });
+
+      await reportQueuedCommandError(harness, failedDelete, {
+        errorCode: "test_storage_delete_failure",
+        errorMessage: "Test storage delete failure",
+      });
+      await sleep(10);
+      expect(getThread(harness.db, thread.id)).toMatchObject({
+        storageDeletedAt: null,
+      });
+
+      requestThreadStorageDeletion(harness.deps, thread, environment);
+      const successfulDelete = await waitForQueuedCommand(
+        harness,
+        ({ command }) =>
+          command.type === "thread.storage.delete" &&
+          command.threadId === thread.id,
+      );
+      await reportQueuedCommandSuccess(harness, successfulDelete, {
+        providerCheckpointId: null,
+      });
+
+      expect(getThread(harness.db, thread.id)).toBeNull();
+    });
+  });
+
+  it("keeps attached storage pending when its environment is unavailable", async () => {
+    await withTestHarness(async (harness) => {
+      const { thread } = seedActiveThreadStopFixture({ harness, value: 6 });
+      markThreadDeleted(harness.db, harness.hub, { threadId: thread.id });
+
+      requestThreadStorageDeletion(harness.deps, thread, null);
+
+      expect(getThread(harness.db, thread.id)).toMatchObject({
+        deletedAt: expect.any(Number),
+        storageDeletedAt: null,
+      });
+      expect(
+        listQueuedThreadCommands(harness, "thread.storage.delete", thread.id),
+      ).toHaveLength(0);
+    });
+  });
+
   it("does not re-dispatch the stop after a live stop RPC failure", async () => {
     await withTestHarness(async (harness) => {
       const { environment, thread } = seedActiveThreadStopFixture({
@@ -145,6 +210,39 @@ describe("thread stop dispatch", () => {
       expect(
         threadEvents.filter((event) => event.type === "turn/completed"),
       ).toHaveLength(0);
+    });
+  });
+
+  it("settles a thread whose host never answers the stop", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedActiveThreadStopFixture({
+        harness,
+        value: 7,
+      });
+      seedTurnStarted(harness.deps, {
+        environmentId: environment.id,
+        threadId: thread.id,
+        turnId: "turn-stop-unanswered",
+      });
+      const rpc = vi
+        .spyOn(harness.hub, "requestHostOnlineRpc")
+        .mockRejectedValue(new HostOnlineRpcTimeoutError());
+
+      await stopThreadForCurrentState(harness.deps, thread, environment);
+
+      expect(getThread(harness.db, thread.id)).toMatchObject({
+        status: "idle",
+      });
+      expect(rpc).toHaveBeenCalledOnce();
+      const threadEvents = listEvents(harness.db, { threadId: thread.id });
+      expect(
+        threadEvents.filter(
+          (event) => event.type === "system/thread/interrupted",
+        ),
+      ).toHaveLength(1);
+      expect(
+        threadEvents.filter((event) => event.type === "turn/completed"),
+      ).toHaveLength(1);
     });
   });
 

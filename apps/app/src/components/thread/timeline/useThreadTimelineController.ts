@@ -1,4 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
+import {
+  useQueryClient,
+  type QueryObserverResult,
+} from "@tanstack/react-query";
 import type { ThreadTimelineResponse, TimelineRow } from "@bb/server-contract";
 import {
   areTimelinePaginationCursorsEqual,
@@ -6,12 +10,28 @@ import {
   mergeLoadedTimelineWithLatest,
   prependOlderTimelineRows,
   recoverLoadedTimelineAfterStaleCursor,
+  resolveLoadedTimelineSurfaceKey,
   type LoadedTimelineState,
 } from "@bb/client-core";
+import { hasThreadTimelineUnseenEvents } from "@/hooks/cache-owners/thread-timeline-unseen-events";
 import { useConnectionAwareQueryState } from "@/hooks/queries/connection-aware-query-state";
+import { threadTimelineQueryKey } from "@/hooks/queries/query-keys";
 import { isTransientReadError } from "@/hooks/queries/query-helpers";
 import { useThreadTimeline } from "@/hooks/queries/thread-queries";
 import { BbHttpError, sdk } from "@/lib/sdk";
+
+type TimelineQueryResultProp =
+  keyof QueryObserverResult<ThreadTimelineResponse>;
+
+const TIMELINE_CONTROLLER_PROPS_WITH_ROWS: TimelineQueryResultProp[] = [
+  "data",
+  "error",
+  "isLoading",
+  "isLoadingError",
+];
+
+export const TIMELINE_CONTROLLER_PROPS_WITHOUT_ROWS: TimelineQueryResultProp[] =
+  [...TIMELINE_CONTROLLER_PROPS_WITH_ROWS, "isFetching"];
 
 interface UseThreadTimelineControllerArgs {
   enabled?: boolean;
@@ -24,16 +44,31 @@ export interface UseThreadTimelineControllerResult {
   activeThinking: ThreadTimelineResponse["activeThinking"];
   activeWorkflows: ThreadTimelineResponse["activeWorkflows"];
   activeBackgroundCommands: ThreadTimelineResponse["activeBackgroundCommands"];
+  contextBoundarySeq: ThreadTimelineResponse["contextBoundarySeq"];
   contextWindowUsage: ThreadTimelineResponse["contextWindowUsage"];
   goal: ThreadTimelineResponse["goal"];
+  providerCommands: ThreadTimelineResponse["providerCommands"];
+  sessionOptions: ThreadTimelineResponse["sessionOptions"];
   modelFallback: ThreadTimelineResponse["modelFallback"];
   hasOlderTimelineRows: boolean;
+  isCatchingUpTimeline: boolean;
   isLoadingOlderTimelineRows: boolean;
   loadOlderTimelineRows: () => Promise<void>;
   pendingTodos: ThreadTimelineResponse["pendingTodos"];
   timelineError: Error | null;
   timelineLoading: boolean;
   timelineRows: TimelineRow[];
+}
+
+interface LoadedTimelineTracker {
+  latestTimeline: ThreadTimelineResponse | undefined;
+  loaded: LoadedTimelineState;
+}
+
+interface ReconcileLoadedTimelineArgs {
+  current: LoadedTimelineState;
+  latestTimeline: ThreadTimelineResponse | undefined;
+  surfaceKey: string;
 }
 
 function isStaleTimelinePaginationCursorError(error: Error): boolean {
@@ -44,52 +79,94 @@ function isStaleTimelinePaginationCursorError(error: Error): boolean {
   );
 }
 
+function buildEmptyLoadedTimelineState(
+  surfaceKey: string,
+): LoadedTimelineState {
+  return buildLoadedTimelineState({
+    latestWindowEndSequence: null,
+    latestRows: [],
+    olderCursor: null,
+    surfaceKey,
+  });
+}
+
+function reconcileLoadedTimeline({
+  current,
+  latestTimeline,
+  surfaceKey,
+}: ReconcileLoadedTimelineArgs): LoadedTimelineState {
+  if (!latestTimeline) {
+    return current.surfaceKey === surfaceKey
+      ? current
+      : buildEmptyLoadedTimelineState(surfaceKey);
+  }
+
+  return mergeLoadedTimelineWithLatest({
+    current,
+    latestTimeline,
+    surfaceKey,
+  });
+}
+
 export function useThreadTimelineController({
   enabled = true,
   surfaceKey: explicitSurfaceKey,
   threadId,
 }: UseThreadTimelineControllerArgs): UseThreadTimelineControllerResult {
+  const queryClient = useQueryClient();
+  const notifyOnChangeProps = useCallback((): TimelineQueryResultProp[] => {
+    if (hasThreadTimelineUnseenEvents(queryClient, threadId)) {
+      return TIMELINE_CONTROLLER_PROPS_WITHOUT_ROWS;
+    }
+    const cachedTimeline = queryClient.getQueryData<ThreadTimelineResponse>(
+      threadTimelineQueryKey(threadId),
+    );
+    return cachedTimeline !== undefined && cachedTimeline.rows.length > 0
+      ? TIMELINE_CONTROLLER_PROPS_WITH_ROWS
+      : TIMELINE_CONTROLLER_PROPS_WITHOUT_ROWS;
+  }, [queryClient, threadId]);
   const latestTimelineQuery = useThreadTimeline(threadId, {
     enabled,
+    notifyOnChangeProps,
     refetchOnMount: true,
   });
-  const surfaceKey = explicitSurfaceKey ?? threadId;
-  const [loadedTimeline, setLoadedTimeline] = useState<LoadedTimelineState>(
-    () =>
-      buildLoadedTimelineState({
-        latestWindowEndSequence: null,
-        latestRows: [],
-        olderCursor: null,
-        surfaceKey,
-      }),
-  );
-  const [isLoadingOlderTimelineRows, setIsLoadingOlderTimelineRows] =
-    useState(false);
   const latestTimeline = latestTimelineQuery.data;
-
-  useEffect(() => {
-    if (!latestTimeline) {
-      setLoadedTimeline((current) =>
-        current.surfaceKey === surfaceKey
-          ? current
-          : buildLoadedTimelineState({
-              latestWindowEndSequence: null,
-              latestRows: [],
-              olderCursor: null,
-              surfaceKey,
-            }),
-      );
-      return;
-    }
-
-    setLoadedTimeline((current) =>
-      mergeLoadedTimelineWithLatest({
-        current,
+  const surfaceKey = resolveLoadedTimelineSurfaceKey(
+    explicitSurfaceKey ?? threadId,
+    latestTimeline,
+  );
+  const [loadedTimelineTracker, setLoadedTimelineTracker] =
+    useState<LoadedTimelineTracker>(() => ({
+      latestTimeline,
+      loaded: reconcileLoadedTimeline({
+        current: buildEmptyLoadedTimelineState(surfaceKey),
         latestTimeline,
         surfaceKey,
       }),
-    );
-  }, [latestTimeline, surfaceKey]);
+    }));
+  let loadedTimeline = loadedTimelineTracker.loaded;
+  if (
+    loadedTimelineTracker.latestTimeline !== latestTimeline ||
+    loadedTimeline.surfaceKey !== surfaceKey
+  ) {
+    loadedTimeline = reconcileLoadedTimeline({
+      current: loadedTimelineTracker.loaded,
+      latestTimeline,
+      surfaceKey,
+    });
+    setLoadedTimelineTracker({ latestTimeline, loaded: loadedTimeline });
+  }
+  const updateLoadedTimeline = useCallback(
+    (update: (current: LoadedTimelineState) => LoadedTimelineState) => {
+      setLoadedTimelineTracker((current) => {
+        const loaded = update(current.loaded);
+        return loaded === current.loaded ? current : { ...current, loaded };
+      });
+    },
+    [],
+  );
+  const [isLoadingOlderTimelineRows, setIsLoadingOlderTimelineRows] =
+    useState(false);
   const refetchLatestTimeline = latestTimelineQuery.refetch;
 
   const nextOlderCursor =
@@ -112,21 +189,23 @@ export function useThreadTimelineController({
       const response = await sdk.threads.timeline({
         beforeAnchorId: nextOlderCursor.anchorId,
         beforeAnchorSeq: String(nextOlderCursor.anchorSeq),
+        deferContent: "true",
         threadId,
       });
       const olderRows = [...response.rows];
-      setLoadedTimeline((current) => {
-        if (current.surfaceKey !== surfaceKey) {
+      updateLoadedTimeline((current) => {
+        if (
+          current.surfaceKey !== surfaceKey ||
+          !areTimelinePaginationCursorsEqual({
+            left: current.olderCursor,
+            right: nextOlderCursor,
+          })
+        ) {
           return current;
         }
         return {
           ...current,
-          olderCursor: areTimelinePaginationCursorsEqual({
-            left: current.olderCursor,
-            right: nextOlderCursor,
-          })
-            ? response.timelinePage.olderCursor
-            : current.olderCursor,
+          olderCursor: response.timelinePage.olderCursor,
           rows: prependOlderTimelineRows({
             loadedRows: current.rows,
             olderRows,
@@ -144,7 +223,7 @@ export function useThreadTimelineController({
       const latestTimelineResult = await refetchLatestTimeline();
       const recoveredLatestTimeline =
         latestTimelineResult.data ?? latestTimeline;
-      setLoadedTimeline((current) => {
+      updateLoadedTimeline((current) => {
         if (current.surfaceKey !== surfaceKey) {
           return current;
         }
@@ -171,22 +250,29 @@ export function useThreadTimelineController({
     refetchLatestTimeline,
     surfaceKey,
     threadId,
+    updateLoadedTimeline,
   ]);
   const timelineRows =
     loadedTimeline.surfaceKey === surfaceKey && loadedTimeline.rows.length > 0
       ? loadedTimeline.rows
       : (latestTimeline?.rows ?? []);
+  const hasResolvedTimeline =
+    latestTimelineQuery.data !== undefined || timelineRows.length > 0;
   const timelineQueryState = useConnectionAwareQueryState({
-    hasResolvedData:
-      latestTimelineQuery.data !== undefined || timelineRows.length > 0,
+    hasResolvedData: hasResolvedTimeline,
     isFetching: latestTimelineQuery.isFetching,
     isLoadingError: latestTimelineQuery.isLoadingError,
     isRecoverableLoadingError: isTransientReadError(latestTimelineQuery.error),
   });
   const timelineLoading =
     latestTimelineQuery.isLoading ||
-    (timelineQueryState.status === "loading" && timelineRows.length === 0) ||
-    (latestTimelineQuery.isFetching && timelineRows.length === 0);
+    (!hasResolvedTimeline &&
+      (timelineQueryState.status === "loading" ||
+        latestTimelineQuery.isFetching));
+  const isCatchingUpTimeline =
+    enabled &&
+    hasThreadTimelineUnseenEvents(queryClient, threadId) &&
+    timelineRows.length > 0;
   const timelineError =
     timelineLoading || timelineQueryState.status !== "unavailable"
       ? null
@@ -197,10 +283,14 @@ export function useThreadTimelineController({
     activeThinking: latestTimeline?.activeThinking ?? null,
     activeWorkflows: latestTimeline?.activeWorkflows ?? [],
     activeBackgroundCommands: latestTimeline?.activeBackgroundCommands ?? [],
+    contextBoundarySeq: latestTimeline?.contextBoundarySeq ?? null,
     contextWindowUsage: latestTimeline?.contextWindowUsage,
     goal: latestTimeline?.goal ?? null,
+    providerCommands: latestTimeline?.providerCommands ?? null,
+    sessionOptions: latestTimeline?.sessionOptions ?? null,
     modelFallback: latestTimeline?.modelFallback ?? null,
     hasOlderTimelineRows,
+    isCatchingUpTimeline,
     isLoadingOlderTimelineRows,
     loadOlderTimelineRows,
     pendingTodos: latestTimeline?.pendingTodos ?? null,

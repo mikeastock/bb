@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { useProjects } from "./data.js";
 import {
@@ -16,8 +16,9 @@ import { DetailView } from "../views/detail/index.js";
 import { NewTaskDialog } from "../views/manage/new-task-dialog.js";
 import { NewProjectDialog } from "../views/manage/new-project-dialog.js";
 import { ManagePanel } from "../views/manage/manage-panel.js";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
+import { EmptyState } from "../components/empty-state.js";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
 import { TasksRefreshProvider } from "./refresh.js";
 
 const BOARD_MIN_WIDTH = 448;
@@ -39,27 +40,6 @@ function hasOpenOverlay(): boolean {
   );
 }
 
-function NoProjectsEmptyState({ onNewProject }: { onNewProject: () => void }) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
-      <div className="flex size-10 items-center justify-center rounded-md bg-secondary text-muted-foreground">
-        <Icon name="ListTodo" className="size-5" />
-      </div>
-      <div className="space-y-1">
-        <p className="text-sm font-medium">No projects yet</p>
-        <p className="text-sm text-muted-foreground">
-          Create a project to start tracking tasks and dispatching work to
-          agents.
-        </p>
-      </div>
-      <Button size="sm" onClick={onNewProject}>
-        <Icon name="Plus" className="size-3.5" />
-        New project
-      </Button>
-    </div>
-  );
-}
-
 function RouteOutlet({
   route,
   boardUsable,
@@ -75,7 +55,7 @@ function RouteOutlet({
     case "manage":
       return <ManagePanel />;
     case "task":
-      return <DetailView taskKey={route.taskKey} />;
+      return <TaskRouteView taskKey={route.taskKey} />;
     case "project":
       return route.view === "board" && boardUsable ? (
         <BoardView projectId={route.projectId} />
@@ -83,6 +63,28 @@ function RouteOutlet({
         <ListView projectId={route.projectId} />
       );
   }
+}
+
+function TaskRouteView({ taskKey }: { taskKey: string }) {
+  const navigation = useTasksNavigation();
+  const onCanonicalKey = useCallback(
+    (canonicalKey: string) => {
+      if (canonicalKey.toUpperCase() !== taskKey.toUpperCase()) {
+        navigation.go(
+          { kind: "task", taskKey: canonicalKey },
+          { replace: true },
+        );
+      }
+    },
+    [navigation, taskKey],
+  );
+  return (
+    <DetailView
+      key={taskKey}
+      taskKey={taskKey}
+      onCanonicalKey={onCanonicalKey}
+    />
+  );
 }
 
 function resolveRoute(route: TasksRoute): ResolvedTasksRoute {
@@ -126,6 +128,7 @@ function TasksAppShellContent({ subPath }: PluginNavPanelProps) {
   const lastBrowseRouteRef = useRef<TasksRoute | null>(null);
   useEffect(() => {
     if (route.kind !== "task") lastBrowseRouteRef.current = route;
+    // oxlint-disable-next-line react/exhaustive-deps
   }, [subPath]);
   const backFromTask = () =>
     navigation.go(lastBrowseRouteRef.current ?? { kind: "all" });
@@ -183,8 +186,16 @@ function TasksAppShellContent({ subPath }: PluginNavPanelProps) {
         />
         <div className="min-h-0 flex-1 overflow-auto">
           {noProjects && route.kind !== "task" && route.kind !== "manage" ? (
-            <NoProjectsEmptyState
-              onNewProject={() => setNewProjectOpen(true)}
+            <EmptyState
+              icon="ListTodo"
+              title="No projects yet"
+              description="Create a project to start tracking tasks and dispatching work to agents."
+              action={
+                <Button size="sm" onClick={() => setNewProjectOpen(true)}>
+                  <Icon name="Plus" className="size-3.5" />
+                  New project
+                </Button>
+              }
             />
           ) : (
             <RouteOutlet route={route} boardUsable={boardUsable} />

@@ -22,10 +22,18 @@ describe("@bb/templates", () => {
     expect(guide).toContain("bb automation update <automationId>");
     expect(guide).toContain("Partial updates to an existing");
     expect(guide).toContain("--env-json");
-    expect(guide).toContain("--reasoning <none|low|medium|high");
-    expect(guide).toContain("--service-tier default|fast|none");
+    expect(guide).toContain("--reasoning <level>");
+    expect(guide).toContain("--service-tier <tier>");
+    expect(guide).toContain("--clear-service-tier");
     expect(guide).toContain("--permission-mode <accept-edits|auto|full>");
     expect(guide).not.toContain("workspace-write|readonly");
+  });
+
+  it("documents project-aware thread references", () => {
+    const guide = renderTemplate("bbGuideThreads", {});
+
+    expect(guide).toContain("@thread:thr_abc123");
+    expect(guide).toContain("do not construct thread URLs manually");
   });
 
   it("renders agent thread messages without inline reply guidance", () => {
@@ -40,16 +48,6 @@ describe("@bb/templates", () => {
         "",
         "Please check the failing test.",
       ].join("\n"),
-    );
-  });
-
-  it("renders standardAgentAppendInstructions without user-question guidance", () => {
-    const rendered = renderTemplate("standardAgentAppendInstructions", {});
-
-    expect(rendered).toContain("You are working inside bb");
-    expect(rendered).toContain("agentic IDE");
-    expect(rendered).not.toContain(
-      "Ask the user a blocking question only when",
     );
   });
 

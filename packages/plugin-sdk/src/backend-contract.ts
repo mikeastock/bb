@@ -1,3 +1,5 @@
+import type { EnvironmentRemoval } from "@bb/domain";
+import type { MachineBootstrapApi } from "./machine-bootstrap.js";
 import type Database from "better-sqlite3";
 import type { Context } from "hono";
 import type * as z from "zod";
@@ -14,20 +16,29 @@ import type {
   ProviderRateLimitState,
   ReasoningLevel,
   ServiceTier,
+  ThreadCreateOrigin,
   ThreadQueuedMessage,
+  ThreadTurnInitiator,
+  WorkspaceProvisionType,
 } from "@bb/domain";
 import type { ProviderFork } from "@bb/domain/provider-fork";
-import type { BbSdk } from "@bb/sdk";
+import type {
+  BbSdk,
+  PluginThreadMetadataListArgs,
+  PluginThreadMetadataListResult,
+  ThreadPluginMetadataArgs,
+  ThreadPluginMetadataUpdateArgs,
+  ThreadPluginMetadataResult,
+} from "@bb/sdk";
 import type {
   ExecutionInputFieldSource,
-  StartedOnBehalfOf,
-  ThreadCreateOrigin,
   ThreadResponse,
+  TerminalSession,
 } from "@bb/server-contract";
-import type { JsonValue } from "./json-value.js";
+import type { JsonValue, ReadonlyJsonValue } from "./json-value.js";
 import type {
+  ExperimentalPluginRpcHandlersWithContext,
   PluginRpcContract,
-  PluginRpcHandlers,
   StandardSchemaV1,
 } from "./rpc-contract.js";
 import type {
@@ -86,10 +97,19 @@ export type PluginSettingDescriptor =
       default?: boolean;
     }
   | {
+      type: "number";
+      label: string;
+      description?: string;
+      experimental_schema?: StandardSchemaV1<number, number>;
+      default?: number;
+    }
+  | {
       type: "select";
       label: string;
       description?: string;
       options: string[];
+      /** Display labels keyed by option value; options without one show the value itself. */
+      experimental_optionLabels?: Record<string, string>;
       /** Synchronously validate without transforming a proposed value. */
       experimental_schema?: StandardSchemaV1<string, string>;
       default?: string;
@@ -105,13 +125,13 @@ export type PluginSettingDescriptor =
 
 export type PluginSettingDescriptors = Record<string, PluginSettingDescriptor>;
 
-export type PluginSettingValue = string | boolean;
+export type PluginSettingValue = string | number | boolean;
 
 /** `default` present → non-optional value; absent → `T | undefined`. */
 export type PluginSettingsValues<
   Ds extends Record<string, PluginSettingDescriptor>,
 > = {
-  [K in keyof Ds]: Ds[K] extends { default: string | boolean }
+  [K in keyof Ds]: Ds[K] extends { default: string | number | boolean }
     ? PluginSettingValueOf<Ds[K]>
     : PluginSettingValueOf<Ds[K]> | undefined;
 };
@@ -120,7 +140,9 @@ type PluginSettingValueOf<D extends PluginSettingDescriptor> = D extends {
   type: "boolean";
 }
   ? boolean
-  : string;
+  : D extends { type: "number" }
+    ? number
+    : string;
 
 export interface PluginSettingsHandle<
   Ds extends Record<string, PluginSettingDescriptor>,
@@ -248,6 +270,30 @@ export interface PluginTurnFailedEvent {
  * queued row GET /threads/:id/queued-messages serves.
  */
 export interface PluginThreadEventPayloads {
+  "experimental_environment.removed": { removal: EnvironmentRemoval };
+
+  /** Debounced per thread (at most once per second), with the latest sequence and current thread DTO. Reading history does not emit this event. */
+  "experimental_thread.events": { thread: ThreadResponse; sequence: number };
+  /**
+   * Fired after a thread moves to a new parent or loses its parent: a
+   * `threads.update` that changes `parentThreadId`, or core releasing a
+   * thread's unarchived children when it is archived. `thread` carries the
+   * new `parentThreadId`. Every thread below it moved with it and gets no
+   * event of its own. Experimental: see docs/api_to_audit.md.
+   */
+  "experimental_thread.parentChanged": {
+    thread: ThreadResponse;
+    previousParentThreadId: string | null;
+  };
+  /** Real accepted terminal input; excludes output, keepalives and input contents. */
+  "experimental_terminal.input": { terminal: TerminalSession };
+  /**
+   * Fired once after a machine is removed, whether a user removed it or its
+   * machine provider finished tearing it down. `host` is the record as it was
+   * when it was removed; `bb.sdk.hosts.get` answers 404 for it from now on, so
+   * this is the moment to drop anything the plugin keeps per host.
+   */
+  "experimental_host.deleted": { host: Host };
   /** Fired after a thread row is created. */
   "thread.created": { thread: ThreadResponse };
   /** Fired when a thread transitions into `active`. */
@@ -260,6 +306,14 @@ export interface PluginThreadEventPayloads {
   "thread.failed": { thread: ThreadResponse; error: string | null };
   /** Fired after a thread is archived (including cascade archives). */
   "thread.archived": { thread: ThreadResponse };
+  /**
+   * Fired after a thread comes back from the archive. Nothing is provisioned
+   * here: a provider that tore its environment down on archive is asked to
+   * provide one again when the thread next needs to run, with that
+   * environment in the ask's context. This is the moment to start warming
+   * one up ahead of that ask.
+   */
+  "thread.unarchived": { thread: ThreadResponse };
   /** Fired after a thread is soft-deleted. */
   "thread.deleted": { thread: ThreadResponse };
   /** Fired after a pending interaction row is committed. */
@@ -270,8 +324,8 @@ export interface PluginThreadEventPayloads {
   /**
    * Fired after a dispatch attempt is queued as a row — by a `message.dispatch`
    * hook's `wait` decision, by a `sendAt` in the future, or by a core wait (the
-   * thread is busy, its turn is still starting, provisioning, or awaiting an
-   * interaction).
+   * thread is busy, its turn is still starting, provisioning, stopping, or
+   * awaiting an interaction).
    *
    * Every listener sees every queued row, not just the ones it is holding: an
    * observer that only wants its own filters on
@@ -297,6 +351,16 @@ export interface PluginThreadEventPayloads {
    * that is at capacity instead of jumping the queue.
    */
   "turn.failed": PluginTurnFailedEvent;
+  /**
+   * Fired after a queued row is removed before it ever dispatched — the user
+   * deleted it from the queued card or `bb thread queue`. This is the only
+   * signal for that removal: a plugin holding external resources for a
+   * waiting message (a sandbox mid-provision, a reserved slot) releases them
+   * here. Rows that dispatch fire `message.dispatched` instead, and rows that
+   * vanish because their thread was archived or deleted fire the thread
+   * event, not this one.
+   */
+  "message.cancelled": { entry: ThreadQueuedMessage };
 }
 
 export type PluginThreadEventName = keyof PluginThreadEventPayloads;
@@ -304,6 +368,177 @@ export type PluginThreadEventName = keyof PluginThreadEventPayloads;
 export type PluginThreadEventHandler<E extends PluginThreadEventName> = (
   payload: PluginThreadEventPayloads[E],
 ) => void | Promise<void>;
+
+// ---------------------------------------------------------------------------
+// Environment providers: places a thread can run that a plugin provisions.
+// ---------------------------------------------------------------------------
+
+/**
+ * The facts this provider consumes, in one declaration. Every member is
+ * something core can evaluate before the thread exists and supply to
+ * `create`, so it is also the whole of what decides where the provider is
+ * offered, and the picker needs to know no provider by name. Every member
+ * defaults to false.
+ *
+ * - `projectCheckout` — the provider works from this project's directory on
+ *   that machine, git or not, so core refuses a machine with no checkout of
+ *   the project at create time and `context.projectCheckout` is non-null.
+ * - `gitCheckout` — that directory must also be a git repository with at
+ *   least one commit. Core inspects the selected machine and rejects an
+ *   invalid selection before creating the thread. Implies `projectCheckout`.
+ * - `gitRemote` — the provider clones the project itself, so an explicit
+ *   selection is rejected when the project has no git remote.
+ * - `projectless` — this provider serves only threads that have no project,
+ *   so it is offered for those and nowhere else. It cannot be combined with
+ *   `projectCheckout`, `gitCheckout` or `gitRemote`, which need a project.
+ */
+export interface PluginEnvironmentProviderRequirements {
+  projectCheckout?: boolean;
+  gitCheckout?: boolean;
+  gitRemote?: boolean;
+  projectless?: boolean;
+}
+
+/**
+ * What `validate` answers. `refuse` fails the create request with `message`
+ * as the caller's error, before a thread or an environment row exists.
+ */
+export type PluginEnvironmentValidateDecision =
+  | { action: "accept" }
+  | { action: "refuse"; message: string };
+
+/**
+ * Resource operations for one place a thread can run. Core persists progress,
+ * retries, cancellation and retirement. Operations must be idempotent for the
+ * supplied pathKey. Provider ids are unique across running plugins.
+ */
+export type PluginEnvironmentProviderDeclaration<
+  Requires extends PluginEnvironmentProviderRequirements =
+    PluginEnvironmentProviderRequirements,
+  Inputs extends
+    import("./environment-provider.js").PluginEnvironmentProviderInputsSchema =
+    import("./environment-provider.js").PluginEnvironmentProviderInputsSchema,
+> = import("./environment-provider.js").PluginEnvironmentProviderDefinition<
+  Requires,
+  Inputs
+>;
+
+export interface PluginEnvironments {
+  /**
+   * Offer a place threads can run. Registering an id this plugin already
+   * registered replaces it. Experimental: see docs/api_to_audit.md.
+   */
+  register<
+    const Requires extends PluginEnvironmentProviderRequirements,
+    const Inputs extends
+      import("./environment-provider.js").PluginEnvironmentProviderInputsSchema =
+      undefined,
+  >(
+    declaration:
+      | PluginEnvironmentProviderDeclaration<Requires, Inputs>
+      | {
+          id: string;
+          displayName: string;
+          description: string;
+          icon: string;
+          machineProviderId: string;
+          environmentProviderId: string;
+          create?: never;
+          remove?: never;
+        },
+  ): void;
+  /**
+   * Ask core to re-ask this plugin's waiting providers now instead of at their
+   * `sendAt`. Resolves on scheduling, exactly like
+   * `experimental_hooks.recheck`.
+   */
+  recheck(): Promise<void>;
+}
+
+export type PluginMachineValidateDecision =
+  | { action: "accept" }
+  | { action: "refuse"; message: string };
+
+export type PluginMachineProviderDeclaration<
+  Inputs extends
+    import("./machine-provider.js").PluginMachineProviderInputsSchema =
+    import("./machine-provider.js").PluginMachineProviderInputsSchema,
+> = import("./machine-provider.js").PluginMachineProviderDefinition<Inputs>;
+
+export interface ServerAccessGrant {
+  id: string;
+  serverUrl: string;
+  headers?: Record<string, string>;
+}
+
+export interface ServerAccessProviderDeclaration {
+  id: string;
+  displayName: string;
+  description: string;
+  availability():
+    | (import("./machine-provider.js").PluginMachineProviderAvailability & {
+        serverUrl?: string;
+      })
+    | Promise<
+        import("./machine-provider.js").PluginMachineProviderAvailability & {
+          serverUrl?: string;
+        }
+      >;
+  acquire(context: {
+    key: string;
+    hostId: string;
+    signal: AbortSignal;
+  }): Promise<ServerAccessGrant | { status: "failed"; message: string }>;
+  release(context: {
+    key: string;
+    hostId: string;
+    /** Null when acquisition was interrupted before a grant was returned. Reconcile using key and hostId. */
+    grantId: string | null;
+  }): Promise<void>;
+}
+
+export interface PluginServerAccess {
+  register(declaration: ServerAccessProviderDeclaration): void;
+  /**
+   * Notify connected clients that server access configuration changed.
+   * Call when access is gained or lost. Clients reload system configuration,
+   * which re-checks availability for Machines settings and creation banners.
+   */
+  recheck(): void;
+}
+
+export interface PluginMachines extends MachineBootstrapApi {
+  /** Read core’s current persisted provider resource, or null when the host or resource is absent. Available across plugins; resources must not contain credentials. */
+  getResource(hostId: string): Promise<JsonValue | null>;
+  register<
+    const Inputs extends
+      import("./machine-provider.js").PluginMachineProviderInputsSchema =
+      undefined,
+  >(
+    declaration: PluginMachineProviderDeclaration<Inputs>,
+  ): void;
+}
+
+/**
+ * Where a thread is going to run, as far as core knows at the checkpoint.
+ * Before provisioning attaches an environment this is the start intent the
+ * thread was created with; afterwards it is the environment itself.
+ */
+export type PluginDispatchEnvironmentIntent =
+  | { kind: "environment"; environmentId: string }
+  /** Ask a registered environment provider for the environment. */
+  | {
+      kind: "provider";
+      environmentProviderId: string;
+      machine:
+        | { type: "existing"; hostId: string }
+        | {
+            type: "new";
+            machineProviderId: string;
+            inputs: JsonValue | null;
+          };
+      inputs: JsonValue | null;
+    };
 
 // ---------------------------------------------------------------------------
 // Hooks: the questions core asks (plans/dispatch-queue-rework.md).
@@ -409,6 +644,13 @@ export interface MessageDispatchHookContext {
    * about to occupy. Null only when neither names a machine.
    */
   host: Host | null;
+  /**
+   * What kind of environment the thread will run in, so a policy can tell a
+   * worktree on this machine from a cloud sandbox from an attached directory
+   * before any of them exists. Null only for a thread with neither an
+   * environment nor a start intent.
+   */
+  environmentIntent: PluginDispatchEnvironmentIntent | null;
   input: PluginDispatchInput;
   requestedExecution: PluginDispatchExecution;
   /** Where each execution value came from. */
@@ -416,8 +658,26 @@ export interface MessageDispatchHookContext {
   /** Whether this attempt starts a turn or joins a running one. */
   attempt: PluginDispatchAttemptKind;
   /**
-   * The queued row this attempt is re-trying, or null when the attempt is
-   * inline and no row has ever existed for it.
+   * The author category shared by this dispatch's messages: `user`, `agent`,
+   * or `system`. `mixed` means the queued messages have different categories.
+   * Different agents still share the `agent` category; read `queuedMessages`
+   * for each message's author. `mixed` is a hook summary, not a turn initiator.
+   */
+  initiator: ThreadTurnInitiator | "mixed";
+  /**
+   * The thread that sent every message in this dispatch: a thread id, null
+   * when none of them has a sender, or the literal `"mixed"` when the rows
+   * disagree. A thread-start names its requesting thread; a message a human
+   * typed and a core-driven retry have no sender. Null therefore still means
+   * "nobody sent this" rather than "bb could not tell", so a handler may key
+   * a human-versus-agent policy on it; `queuedMessages` names each row's own
+   * sender. Thread ids are prefixed, so no id collides with `"mixed"`.
+   */
+  senderThreadId: string | "mixed" | null;
+  /**
+   * All queued rows this attempt is re-trying, in dispatch order. Empty for
+   * an inline attempt. Each row retains its own content, author, and origin; `input`
+   * contains their combined input, and the hook decides for the whole group.
    *
    * This is how a hook tells a fresh send from a re-attempt of something it
    * already decided about — the replacement for the old
@@ -425,11 +685,26 @@ export interface MessageDispatchHookContext {
    * should treat the two identically; a hook that logs should not
    * double-count.
    */
-  queuedMessage: ThreadQueuedMessage | null;
-  /** How the dispatch was requested; null for internal/core-driven sends. */
-  origin: ThreadCreateOrigin | null;
-  originPluginId: string | null;
-  startedOnBehalfOf: StartedOnBehalfOf | null;
+  queuedMessages: ThreadQueuedMessage[];
+  /**
+   * Opaque JSON supplied by a plugin through the composer's
+   * `submit`, paired with that plugin's id. Null for ordinary
+   * submissions and queued re-attempts. Core does not persist or interpret
+   * the data.
+   */
+  experimental_submission: {
+    pluginId: string;
+    data: JsonValue;
+  } | null;
+  /**
+   * How the dispatch was requested; null for internal/core-driven sends, which
+   * includes every follow-up, steer and retry. Persisted with the queued row,
+   * so a drained re-attempt reads what its first attempt read. For a grouped
+   * dispatch, each field is its shared value or `"mixed"` when rows differ,
+   * including a value versus null. Each queued row exposes its own origin.
+   */
+  origin: ThreadCreateOrigin | "mixed" | null;
+  originPluginId: string | "mixed" | null;
   parentThreadId: string | null;
 }
 
@@ -537,6 +812,35 @@ export type PluginHttpHandler = (
   context: Context,
 ) => Response | Promise<Response>;
 
+export interface ExperimentalPluginWebSocket {
+  send(data: string | Uint8Array): void;
+  close(code?: number, reason?: string): void;
+  readonly readyState: number;
+}
+
+export interface ExperimentalPluginWebSocketContext {
+  request: Request;
+  url: URL;
+  headers: Headers;
+}
+
+export interface ExperimentalPluginWebSocketHandlers {
+  onOpen?(socket: ExperimentalPluginWebSocket): void | Promise<void>;
+  onMessage?(
+    socket: ExperimentalPluginWebSocket,
+    data: string | Uint8Array,
+  ): void | Promise<void>;
+  onClose?(
+    socket: ExperimentalPluginWebSocket,
+    event: { code: number; reason: string },
+  ): void | Promise<void>;
+  onError?(socket: ExperimentalPluginWebSocket, error: Error): void;
+}
+
+export type ExperimentalPluginWebSocketHandler = (
+  context: ExperimentalPluginWebSocketContext,
+) => ExperimentalPluginWebSocketHandlers;
+
 export interface PluginHttp {
   /**
    * Register an HTTP route, mounted at
@@ -553,6 +857,17 @@ export interface PluginHttp {
     handler: PluginHttpHandler,
     opts?: { auth?: PluginHttpAuthMode },
   ): void;
+
+  /**
+   * Register a WebSocket route in the same `/http/` namespace as `route`.
+   * A GET request upgrades only when it carries `Upgrade: websocket`.
+   * Auth modes and exact-path matching are identical to HTTP routes.
+   */
+  experimental_websocket(
+    path: string,
+    handler: ExperimentalPluginWebSocketHandler,
+    opts?: { auth?: PluginHttpAuthMode },
+  ): void;
 }
 
 export interface PluginRpc {
@@ -562,11 +877,17 @@ export interface PluginRpc {
    * `/api/v1/plugins/<id>/rpc/<method>` with "local" auth semantics. The
    * host validates input before invocation and output before strict JSON
    * serialization. The response is `{ ok: true, result }` or
-   * `{ ok: false, error: { code, message, issues? } }`.
+   * `{ ok: false, error: { code, message, issues? } }`. Each handler gets
+   * the call's context as its second argument; `experimental_caller` names
+   * the plugin that called through `bb.sdk.plugins.callRpc`, or `client`.
    */
   register<Contract extends PluginRpcContract>(
     contract: Contract,
-    handlers: PluginRpcHandlers<Contract>,
+    handlers: ExperimentalPluginRpcHandlersWithContext<Contract>,
+    options?: {
+      experimental_discoverable?: boolean;
+      experimental_description?: string;
+    },
   ): void;
 }
 
@@ -641,13 +962,46 @@ export type PluginInteractionResult =
   | { outcome: "submitted"; value: JsonValue }
   | { outcome: "cancelled"; reason: PluginInteractionCancelReason };
 
+/**
+ * What a submitted form leaves in the thread timeline, chosen by the plugin.
+ * bb never stores the form's payload or the submitted value; it stores only
+ * this description, so a plugin decides what the transcript keeps.
+ */
+export interface PluginInteractionDescription {
+  /** Row title once submitted; defaults to the presentation's completed label. */
+  title?: string;
+  /** Short Markdown for the expanded row. */
+  detail?: string;
+  /**
+   * Persisted with the row and handed to this plugin's
+   * `experimental_timelineRenderer` registered for `"<pluginId>/<rendererId>"`.
+   * Omit anything the transcript must not keep.
+   */
+  payload?: JsonValue;
+}
+
 export interface PluginInteractionRequest {
   threadId: string;
   rendererId: string;
   title: string;
   payload: JsonValue;
-  /** Defaults to ten minutes; capped at one hour. */
+  /** Defaults to ten minutes; capped at seven days. */
   timeoutMs?: number;
+  /**
+   * How the form reads as a timeline row while it waits and once it settles,
+   * in the same shape as a native tool's presentation. bb fills what is left
+   * out: "Waiting for <title>" / "Submitted <title>" and the plugin's glyph.
+   */
+  presentation?: PluginRowPresentation;
+  /**
+   * Called once with the submitted value, before the waiting `requestInput`
+   * promise resolves; never for a cancellation, which bb titles itself. Its
+   * return is persisted on the row. A throw or a slow return leaves the row
+   * with its completed label and nothing more.
+   */
+  describeSubmission?(
+    value: JsonValue,
+  ): PluginInteractionDescription | Promise<PluginInteractionDescription>;
 }
 
 export interface PluginCliResult {
@@ -688,6 +1042,15 @@ export interface PluginCliRegistration {
   /** Subcommand metadata rendered in help and the plugin-commands skill
    * without executing plugin code. Parsing argv is plugin-owned. */
   commands?: PluginCliCommandInfo[];
+  /**
+   * Set when `run` answers `--help` / `-h` itself, at every level, without
+   * executing a command. The `bb` CLI then forwards help requests to the
+   * plugin instead of printing the one-line `usage` from `commands`.
+   * `defineCli` sets it. Leave it unset for a hand-written `run`:
+   * the host cannot know that such a parser will not act on the other
+   * arguments.
+   */
+  rendersHelp?: boolean;
   run(
     argv: string[],
     ctx: PluginCliContext,
@@ -721,32 +1084,39 @@ export type PluginAgentToolResult =
 export interface PluginAgentToolContext {
   threadId: string;
   projectId: string;
-  /** The tool-call request's abort signal (aborts if the daemon round-trip
-   * is torn down mid-call). */
+  /**
+   * Aborts when the tool-call request is cancelled, the thread is stopped or
+   * deleted, or this plugin is disposed. Opening a form with `bb.ui.requestInput`
+   * detaches the call from its request: the agent receives a waiting notice,
+   * and request cancellation no longer aborts this signal. The tool's eventual
+   * result is delivered as a system message (success steers a running turn or
+   * starts a new one; an `isError` result only steers). Thread stop/delete and
+   * plugin disposal still abort the signal after detachment.
+   */
   signal: AbortSignal;
 }
 
 /**
- * The row title of a plugin tool call while it is pending and once it
+ * The title of a plugin-owned timeline row while it is pending and once it
  * settled. Each label is capped at 80 characters and rendered as plain text.
  */
-export interface PluginAgentToolLabels {
-  /** Label shown while the tool call is pending. */
+export interface PluginRowLabels {
+  /** Label shown while the row is pending. */
   pending: string;
-  /** Label shown after the tool call completes successfully. */
+  /** Label shown after the row completes successfully. */
   completed: string;
 }
 
 /**
- * How calls to a native plugin tool read as a timeline row (grammar v3). Every
- * field is optional at registration: the server fills what the plugin leaves
- * out (a generic `Running <name>` / `Ran <name>` label; the plugin's branding
- * glyph, then `Toolbox`) and hands one complete presentation to the provider
- * bridge with the tool definition.
+ * How something a plugin owns reads as a timeline row (grammar v3): a native
+ * tool's calls, or the row a `bb.ui.requestInput` form leaves behind. Every
+ * field is optional: the server fills what the plugin leaves out (a generic
+ * label; the plugin's branding glyph, then `Toolbox`) and hands one complete
+ * presentation to whatever renders the row.
  */
-export interface PluginAgentToolPresentation {
-  /** Row title while the call is pending and once it settled. */
-  label?: PluginAgentToolLabels;
+export interface PluginRowPresentation {
+  /** Row title while the row is pending and once it settled. */
+  label?: PluginRowLabels;
   /**
    * A named host glyph (`{ glyph: "Workflow" }`), or one of this plugin's
    * own declared icons by its namespaced glyph (`{ glyph: "<pluginId>/<name>" }`,
@@ -780,11 +1150,18 @@ export interface PluginAgentToolRegistrationBase {
    * plugin's branding glyph. Approval, error, and interruption states keep
    * BB's standard rendering. See docs/api_to_audit.md.
    */
-  presentation?: PluginAgentToolPresentation;
+  presentation?: PluginRowPresentation;
 }
 
 /** Stable, plain-data context resolved by the server for one agent session. */
 export interface PluginAgentConfigurationContext {
+  /**
+   * The thread's metadata stored under this plugin's id, or `{}` when absent,
+   * as a deep-frozen snapshot for this configure call. Any API client, another
+   * plugin, or the thread's own agent can write it; treat values as untrusted,
+   * and quote or escape any value you put into returned instructions.
+   */
+  readonly pluginMetadata: { readonly [key: string]: ReadonlyJsonValue };
   thread: {
     id: string;
     title: string | null;
@@ -801,8 +1178,9 @@ export interface PluginAgentConfigurationContext {
     id: string;
     name: string | null;
     path: string | null;
-    workspaceProvisionType: "unmanaged" | "managed-worktree" | "personal";
     branchName: string | null;
+    /** @deprecated Use environment provider identity and capabilities instead. */
+    workspaceProvisionType: WorkspaceProvisionType | null;
   };
   host: {
     id: string;
@@ -944,7 +1322,7 @@ export interface PluginProviderCapabilities {
  * Provider copy core surfaces render from per-provider tables today (usage
  * banners, sign-in hints, the mobile picker, the agent guide). Declared once
  * here so no core surface keys copy on a provider id. Mirrors
- * `ProviderStrings` in `@bb/domain`, which is the client projection.
+ * `providerStringsSchema` in `@bb/domain`, which is the client projection.
  */
 export interface PluginProviderStrings {
   /** How to sign in on the host ("Run `claude` on the machine to sign in."). */
@@ -1018,6 +1396,9 @@ export interface PluginProviderOptionsContext {
 /** See {@link PluginProviderDeclaration.models}. */
 export type PluginProviderModelCatalogScope = "host" | "workspace";
 
+/** See {@link PluginProviderDeclaration.completedTurnDisplay}. */
+export type PluginProviderCompletedTurnDisplay = "collapse" | "flat";
+
 /**
  * One cold-cache fallback model. The provider's live `model/list` result is
  * the only real model source; this list stands in only while no probe has
@@ -1029,13 +1410,17 @@ export interface PluginProviderFallbackModel {
   /** Picker display name ("Opus 5 (1M)"). */
   displayName: string;
   description: string;
-  /** Reasoning levels this model supports, lowest to highest. Non-empty. */
+  /** Reasoning levels this model supports, lowest to highest. Non-empty.
+   * `reasoningEffort` is a standard ladder entry or any provider-specific id
+   * the bridge accepts back as `reasoningLevel`; `label` names a
+   * provider-specific id in the picker. */
   supportedReasoningEfforts: readonly {
-    reasoningEffort: PluginProviderReasoningLevel;
+    reasoningEffort: PluginProviderReasoningLevel | (string & {});
+    label?: string;
     description: string;
   }[];
   /** Must be one of `supportedReasoningEfforts`. */
-  defaultReasoningEffort: PluginProviderReasoningLevel;
+  defaultReasoningEffort: PluginProviderReasoningLevel | (string & {});
   /** Exactly one entry in the list is the default. */
   isDefault: boolean;
 }
@@ -1130,6 +1515,16 @@ export interface PluginProviderDeclaration {
   /** Composer actions this provider supports. No duplicates; may be empty
    * (the universal skills typeahead is implicit). */
   composerActions: readonly PluginProviderComposerAction[];
+  /**
+   * How the thread timeline shows this provider's turns once they finish.
+   * `"collapse"` (the default) folds a finished turn's work into one
+   * "Worked for" row and leaves the final answer visible. `"flat"` keeps
+   * every row of a finished turn visible, as it was while the turn ran. This
+   * is only the provider's default: the user can choose either display for
+   * each provider in Settings → Providers or with
+   * `bb settings completed-turns`, and that choice wins.
+   */
+  completedTurnDisplay?: PluginProviderCompletedTurnDisplay;
   // -------------------------------------------------------------------------
   // Target-state declaration fields (docs/provider-plugin-api.md §1). Each is
   // validated and carried on the normalized declaration; WS2a projects them
@@ -1139,8 +1534,10 @@ export interface PluginProviderDeclaration {
   /** Provider copy for core surfaces ({@link PluginProviderStrings}). */
   strings?: PluginProviderStrings;
   /** Service tiers this provider accepts, as picker options. Non-empty when
-   * present, unique ids. The coarse `capabilities.supportsServiceTier` stays
-   * until WS2a stabilizes. */
+   * present, unique ids. Ids are open: `"default"` is the provider's standard
+   * tier and every other id is passed to the bridge as `serviceTier`. A
+   * `model/list` entry narrows the list with `supportedServiceTiers`. The
+   * coarse `capabilities.supportsServiceTier` stays until WS2a stabilizes. */
   serviceTiers?: readonly PluginProviderOptionDescriptor[];
   /** Reasoning levels as picker options with labels, beside the coarse
    * `capabilities.reasoningLevels` ladder (ids only). Non-empty when present,
@@ -1329,6 +1726,44 @@ export interface PluginProviders {
   register(declaration: PluginProviderDeclaration): {
     dispose(): void;
   };
+  experimental_contributeEnv(
+    providerId: string,
+    resolve: (
+      context: ExperimentalPluginProviderEnvContext,
+    ) =>
+      | readonly ExperimentalPluginProviderEnvEntry[]
+      | Promise<readonly ExperimentalPluginProviderEnvEntry[]>,
+  ): void;
+  experimental_contributeEnvHealth(
+    providerId: string,
+    resolve: (
+      context: ExperimentalPluginProviderEnvHealthContext,
+    ) =>
+      | ExperimentalPluginProviderEnvHealth
+      | null
+      | Promise<ExperimentalPluginProviderEnvHealth | null>,
+  ): void;
+}
+
+export interface ExperimentalPluginProviderEnvContext {
+  threadId: string;
+  projectId: string;
+  hostId: string;
+}
+
+export interface ExperimentalPluginProviderEnvEntry {
+  name: string;
+  value: string | { serverPath: string };
+  reason: string;
+}
+
+export interface ExperimentalPluginProviderEnvHealthContext {
+  hostId: string;
+}
+
+export interface ExperimentalPluginProviderEnvHealth {
+  label: string;
+  statusMessage: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,8 +1787,20 @@ export interface PluginMentionItem {
   id: string;
   title: string;
   subtitle?: string;
+  /**
+   * BB icon name: a built-in name, or a name the plugin's app bundle
+   * registered with `app.experimental_icons.register()`. Resolved names take
+   * precedence over plugin branding in menu rows, composer pills, and sent
+   * messages. Omitted or unknown names fall back to plugin branding, then
+   * the generic plugin icon.
+   */
   icon?: string;
 }
+
+/** Agent-only image context resolved with a plugin mention. */
+export type ExperimentalPluginMentionImage =
+  | { type: "image"; url: string; context?: string }
+  | { type: "localImage"; path: string; context?: string };
 
 export interface PluginMentionProviderRegistration {
   /** Unique within this plugin: [a-zA-Z0-9_-]+ (no ":" — the host composes
@@ -1381,11 +1828,26 @@ export interface PluginMentionProviderRegistration {
    * message as an agent-visible (user-hidden) prompt input. Throwing blocks
    * the send with a visible error.
    */
-  resolve(itemId: string): { context: string } | Promise<{ context: string }>;
+  resolve(itemId: string):
+    | {
+        context: string;
+        experimental_images?: readonly ExperimentalPluginMentionImage[];
+      }
+    | Promise<{
+        context: string;
+        experimental_images?: readonly ExperimentalPluginMentionImage[];
+      }>;
 }
 
 export interface PluginUi {
-  /** Block until the app submits or cancels a plugin-owned composer form. */
+  /**
+   * Block until the user submits or cancels this plugin's form in the
+   * thread composer. Inside a native tool's `execute`, calling this answers
+   * the tool call at once with a waiting notice and the eventual return value
+   * reaches the agent as a message; see {@link PluginAgentToolContext.signal}.
+   * The form leaves a timeline row described by `presentation` and
+   * `describeSubmission`.
+   */
   requestInput(
     request: PluginInteractionRequest,
     options?: { signal?: AbortSignal },
@@ -1449,37 +1911,84 @@ export interface PluginServerApi {
 // AI services.
 // ---------------------------------------------------------------------------
 
-/**
- * What a plugin's AI service does. `inference` answers bb's server-side helper
- * completions (thread titles, commit messages: a prompt and a JSON Schema in,
- * a structured value out); `voice` transcribes recorded speech.
- */
-export type PluginAiServiceKind = "inference" | "voice";
+/** Options for one `complete` call. */
+export interface PluginAiCompleteOptions {
+  /**
+   * Aborted when bb stops waiting: the task timed out (5 seconds for titles
+   * and commit messages) or the request was cancelled. Pass it to `fetch`.
+   */
+  readonly signal: AbortSignal;
+}
+
+/** Options for one `transcribe` call. */
+export interface PluginAiTranscribeOptions {
+  /** Aborted when bb stops waiting (10 seconds) or the request was cancelled. */
+  readonly signal: AbortSignal;
+  /**
+   * Vocabulary the speaker is likely to use (names, identifiers), for
+   * services that accept a transcription prompt; `null` when there is none.
+   */
+  readonly hint: string | null;
+}
 
 /**
- * An AI service a plugin offers from its `bb.host` entry, which implements
- * `experimental_aiServicesHostContract` (`@get-bb/plugin-sdk/ai-services`).
- * The user selects it with `BB_INFERENCE` / `BB_TRANSCRIPTION` set to
- * `<id>/<model>`; core calls the plugin's host entry on the primary host with
- * the `id` on every request, so one entry can serve several services.
+ * Whether a service can answer right now. `message` is shown to the user
+ * beside the service ("Sign in to your bb account") and should say how to
+ * make it ready.
+ */
+export type PluginAiServiceStatus =
+  | { readonly ready: true }
+  | { readonly ready: false; readonly message: string };
+
+/**
+ * An AI service bb can use for its helper tasks: thread titles and commit
+ * messages (`complete`) and voice input (`transcribe`). The user picks a
+ * service per task in Settings → AI services or with
+ * `bb settings ai-services set`. The functions run in the plugin's server
+ * process; a plugin that needs host-local state (a login file, a local model)
+ * reaches its own `bb.host` entry through `bb.hosts.experimental_client`.
+ *
+ * bb owns the prompts and cleans up replies (think blocks, quotes, labels,
+ * extra lines), so a service returns the model's text as-is. The plugin owns
+ * everything behind the function: which model, which API, any retries.
+ * Failure is a rejected promise.
  */
 export interface PluginAiServiceDeclaration {
-  /** The `<serviceId>` segment of the user's setting; stable, lowercase. */
+  /**
+   * Stable, lowercase id, unique within this plugin. bb identifies a service
+   * by plugin id and service id, so another plugin may use the same id.
+   * `automatic` and `off` are reserved.
+   */
   readonly id: string;
-  /** Shown beside the id wherever the setting's options are listed. */
+  /** Shown in the picker; 1-64 characters. */
   readonly displayName: string;
-  /** Which kinds this service answers; a kind it lacks is not offered. */
-  readonly kinds: readonly PluginAiServiceKind[];
+  /**
+   * Answer one prompt with plain text. Offered for thread titles and commit
+   * messages. Declare `complete`, `transcribe`, or both.
+   */
+  readonly complete?: (
+    prompt: string,
+    options: PluginAiCompleteOptions,
+  ) => Promise<string>;
+  /** Transcribe recorded speech to text. Offered for voice input. */
+  readonly transcribe?: (
+    audio: File,
+    options: PluginAiTranscribeOptions,
+  ) => Promise<string>;
+  /**
+   * Report whether the service can answer. bb calls it for the picker's
+   * status line and to decide whether Automatic skips the service and
+   * whether the microphone shows; results are cached for a few seconds.
+   * Omit it when the service is always ready.
+   */
+  readonly status?: () => Promise<PluginAiServiceStatus>;
 }
 
 export interface PluginAiServices {
   /**
    * Register an AI service. Call during the factory; the registration lands
-   * when the plugin load commits and is removed on reload or disable. The
-   * plugin must declare a `bb.host` entry; registering without one fails the
-   * load. A declared entry that fails to build fails the load on the build
-   * error after the factory, with any provider the factory declared listed
-   * as unavailable. Throws on an id another live plugin already serves.
+   * when the plugin load commits and is removed on reload or disable. Throws
+   * when this plugin already registered the id.
    */
   register(declaration: PluginAiServiceDeclaration): { dispose(): void };
 }
@@ -1542,6 +2051,37 @@ export interface PluginStatusApi {
 }
 
 /**
+ * The BB SDK bound to one plugin (`bb.sdk`). `threads.getPluginMetadata`,
+ * `threads.experimental_listPluginMetadata` and `threads.updatePluginMetadata`
+ * default `pluginId` to that plugin's id. An
+ * explicit `pluginId` must be a plugin id (lowercase letters, digits, and
+ * dashes) or the request fails with HTTP 400. A `pluginMetadata` seed or a
+ * `set` that is over 256 KiB on its own rejects before any request is sent. A
+ * patch whose merged namespace would exceed 256 KiB fails with HTTP 413 and
+ * leaves the namespace unchanged.
+ */
+export type PluginBbSdk = Omit<BbSdk, "threads"> & {
+  threads: Omit<
+    BbSdk["threads"],
+    "getPluginMetadata" | "updatePluginMetadata" | "experimental_listPluginMetadata"
+  > & {
+    getPluginMetadata(
+      args: Omit<ThreadPluginMetadataArgs, "pluginId"> & { pluginId?: string },
+    ): Promise<ThreadPluginMetadataResult>;
+    experimental_listPluginMetadata(
+      args: Omit<PluginThreadMetadataListArgs, "pluginId"> & {
+        pluginId?: string;
+      },
+    ): Promise<PluginThreadMetadataListResult>;
+    updatePluginMetadata(
+      args: Omit<ThreadPluginMetadataUpdateArgs, "pluginId"> & {
+        pluginId?: string;
+      },
+    ): Promise<ThreadPluginMetadataResult>;
+  };
+};
+
+/**
  * The API object handed to a plugin's factory (design §4). Implemented by
  * the BB server; this contract is what plugin `server.ts` files compile
  * against.
@@ -1583,6 +2123,15 @@ export interface BbPluginApi {
    * reason, or refuse.
    */
   readonly experimental_hooks: PluginHooks;
+  /**
+   * Environment targets: places a thread can run that this plugin
+   * provisions (plans/plugin-environment-providers.md). Experimental: see
+   * docs/api_to_audit.md.
+   */
+  readonly experimental_environments: PluginEnvironments;
+  /** Machine providers provision execution machines. Experimental: see docs/api_to_audit.md. */
+  readonly experimental_machines: PluginMachines;
+  readonly experimental_serverAccess: PluginServerAccess;
   /** Plugin-reported status (needs-configuration). */
   readonly status: PluginStatusApi;
   /** Read-only facts about the running server (loopback base URL). */
@@ -1590,8 +2139,8 @@ export interface BbPluginApi {
   /** Server-to-daemon host control-plane declarations. */
   readonly hosts: PluginHosts;
   /**
-   * AI services this plugin serves from its `bb.host` entry (helper
-   * inference, voice transcription). See `@get-bb/plugin-sdk/ai-services`.
+   * AI services this plugin offers for bb's helper tasks: thread titles,
+   * commit messages, and voice input.
    */
   readonly experimental_aiServices: PluginAiServices;
   /**
@@ -1600,13 +2149,25 @@ export interface BbPluginApi {
    * server binds it before loading plugins, so it is available from the
    * moment factories run there — but isolated harnesses may not, so prefer
    * using it from handlers, services, and timers for portability.
-   * `threads.spawn` defaults `origin` to "plugin" and `originPluginId` to
-   * this plugin's id so spawned threads are attributed automatically.
+   * `threads.spawn` and `threads.fork` default `origin` to "plugin" and, for
+   * that origin, `originPluginId` to this plugin's id unless you set them.
+   * Seeding `pluginMetadata` always attributes the new thread to this plugin,
+   * overriding an explicit `origin` or `originPluginId`.
    */
-  readonly sdk: BbSdk;
+  readonly sdk: PluginBbSdk;
   /**
    * Register cleanup to run on reload/disable/shutdown. Hooks run LIFO.
    * The sanctioned place to clear timers and close connections.
    */
   onDispose(hook: () => void | Promise<void>): void;
+  /**
+   * Run a handler once, right after this plugin is installed and its server
+   * entry has loaded: for example to pick its own sidebar slots with
+   * `bb.sdk.system.uiPreferences`. It does not run on update, reload,
+   * enable, or server restart, nor for bb's bundled plugins; reinstalling
+   * after removal runs it again. Register it while the entry loads. A
+   * handler that throws is logged and the install still succeeds; the
+   * install waits at most 30 seconds for handlers to finish.
+   */
+  onInstall(handler: () => void | Promise<void>): void;
 }

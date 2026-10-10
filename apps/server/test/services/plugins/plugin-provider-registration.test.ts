@@ -1,14 +1,16 @@
+import { setPluginEnvironmentProviderBridge } from "../../../src/services/plugins/plugin-environment-provider-registry.js";
+import { systemEnvironmentProvidersResponseSchema } from "@bb/server-contract";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listSystemProviderInfos } from "../../../src/services/system/execution-options.js";
-import { resolveCreateThreadExecutionDefaults } from "../../../src/services/threads/thread-default-policy.js";
 import { withTestHarness } from "../../helpers/test-app.js";
 
 async function writePlugin(
   dir: string,
   options: {
+    icons?: Record<string, string>;
     bridgeSource?: string;
     name: string;
     serverSource: string;
@@ -26,7 +28,12 @@ async function writePlugin(
       bb: {
         name: "Provider fixture",
         description: "Provider registration plugin fixture.",
-        branding: { icon: "Zap" },
+        branding: {
+          icon: "Zap",
+          ...(options.icons === undefined
+            ? {}
+            : { experimental_icons: options.icons }),
+        },
         server: "./server.ts",
         ...(withBridge ? { host: "./bridge.ts" } : {}),
       },
@@ -73,6 +80,7 @@ describe("bb.providers.register (server)", () => {
   });
 
   afterEach(async () => {
+    setPluginEnvironmentProviderBridge(undefined);
     await rm(workDir, { recursive: true, force: true });
   });
 
@@ -109,6 +117,7 @@ describe("bb.providers.register (server)", () => {
           },
           composerActions: [
             { kind: "skills", trigger: "/" },
+            { kind: "skills", trigger: "$" },
             {
               kind: "plan",
               command: { trigger: "/", name: "plan", trailingText: " " },
@@ -190,27 +199,6 @@ describe("bb.providers.register (server)", () => {
     });
   });
 
-  it("makes the registered provider usable by thread policy end to end", async () => {
-    await withTestHarness(async (harness) => {
-      const rootDir = await writePlugin(workDir, {
-        name: "bb-plugin-policy-agent",
-        serverSource: REGISTER_PROVIDER_SOURCE("policy-agent"),
-      });
-      const entry = await harness.pluginService.installPath(rootDir);
-      expect(entry.status).toBe("running");
-      const registry = harness.deps.providerRegistry;
-
-      const resolved = resolveCreateThreadExecutionDefaults(registry, {
-        requestedProviderId: "policy-agent",
-        storedDefaults: null,
-      });
-      expect(resolved.providerId).toBe("policy-agent");
-      expect(
-        registry.getSupportedPermissionModes("policy-agent"),
-      ).not.toBeNull();
-    });
-  });
-
   it("re-registers wholesale on reload instead of colliding with itself", async () => {
     await withTestHarness(async (harness) => {
       const rootDir = await writePlugin(workDir, {
@@ -233,6 +221,109 @@ describe("bb.providers.register (server)", () => {
       expect(listed).toHaveLength(1);
     });
   });
+
+  it.each(["Terminal", "./icons/agent.svg"])(
+    "uses the unknown-folder fallback for legacy compositions with machine icon %s",
+    async (icon) => {
+      await withTestHarness(async (harness) => {
+        const rootDir = await writePlugin(workDir, {
+          name: "bb-plugin-legacy-environments",
+          withBridge: false,
+          serverSource: `export default function(bb) {
+          bb.experimental_machines.register({
+            id: "legacy-machine", displayName: "Legacy machine", description: "Create a test machine.", icon: ${JSON.stringify(icon)},
+            create: async () => ({ status: "failed", message: "unused" }),
+            reconcileCleanup: async () => ({ status: "removed" }), remove: async () => ({ status: "removed" })
+          });
+          bb.experimental_environments.register({
+            id: "legacy-workspace", displayName: "Legacy workspace",
+            create: async () => ({ status: "failed", message: "unused" }), remove: async () => ({ status: "removed" })
+          });
+          bb.experimental_environments.register({
+            id: "legacy-composition", displayName: "Legacy composition",
+            machineProviderId: "legacy-machine", environmentProviderId: "legacy-workspace"
+          });
+        }`,
+        });
+        const svg =
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><path d="M0 0h4v4z"/></svg>';
+        await mkdir(join(rootDir, "icons"), { recursive: true });
+        await writeFile(join(rootDir, "icons/agent.svg"), svg);
+        const entry = await harness.pluginService.installPath(rootDir);
+        expect(entry.status, entry.statusDetail ?? "").toBe("running");
+        setPluginEnvironmentProviderBridge(
+          harness.pluginService.environmentProviders,
+        );
+        const response = await harness.app.request(
+          "/api/v1/system/environment-providers",
+        );
+        expect(response.status).toBe(200);
+        const { providers } = systemEnvironmentProvidersResponseSchema.parse(
+          await response.json(),
+        );
+        expect(
+          providers.find((provider) => provider.id === "legacy-workspace"),
+        ).toMatchObject({ description: null, icon: null, logoUrl: null });
+        const composition = providers.find(
+          (provider) => provider.id === "legacy-composition",
+        );
+        expect(composition).toMatchObject({
+          description: null,
+          icon: "FolderUnknown",
+          logoUrl: null,
+        });
+      });
+    },
+  );
+
+  it.each(["./icons/agent.svg", "marked-environment/mark"])(
+    "serves environment provider icon %s with a hashed logo URL",
+    async (icon) => {
+      await withTestHarness(async (harness) => {
+        const rootDir = await writePlugin(workDir, {
+          name: "bb-plugin-marked-environment",
+          withBridge: false,
+          icons: { mark: "./icons/agent.svg" },
+          serverSource: `export default function plugin(bb) { bb.experimental_environments.register({ id: "marked-environment", displayName: "Marked", description: "Prepare a marked workspace.", icon: ${JSON.stringify(icon)}, create: async () => ({ status: "failed", message: "waiting" }), remove: async () => ({ status: "removed" }) }); }`,
+        });
+        const svg =
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><path d="M0 0h4v4z"/></svg>';
+        await mkdir(join(rootDir, "icons"), { recursive: true });
+        await writeFile(join(rootDir, "icons/agent.svg"), svg);
+        const entry = await harness.pluginService.installPath(rootDir);
+        expect(entry.status, entry.statusDetail ?? "").toBe("running");
+        setPluginEnvironmentProviderBridge(
+          harness.pluginService.environmentProviders,
+        );
+        const response = await harness.app.request(
+          "http://127.0.0.1:3334/api/v1/system/environment-providers",
+        );
+        const { providers } = systemEnvironmentProvidersResponseSchema.parse(
+          await response.json(),
+        );
+        const provider = providers.find(
+          (provider) => provider.id === "marked-environment",
+        );
+        expect(provider).toMatchObject({
+          description: "Prepare a marked workspace.",
+          icon,
+        });
+        expect(provider?.logoUrl).toContain(
+          "environment%3Amarked-environment/logo?h=",
+        );
+        if (provider?.logoUrl == null) throw new Error("Missing logo URL");
+        const logo = await harness.app.request(
+          `http://127.0.0.1:3334${provider.logoUrl}`,
+        );
+        expect(logo.status).toBe(200);
+        expect(logo.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(logo.headers.get("cache-control")).toBe(
+          "public, max-age=31536000, immutable",
+        );
+        expect(await logo.text()).toBe(svg);
+      });
+    },
+  );
 
   it("serves a path-shaped icon through the provider logo route with untrusted-image headers", async () => {
     await withTestHarness(async (harness) => {

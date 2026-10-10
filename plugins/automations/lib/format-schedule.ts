@@ -1,6 +1,8 @@
 import { toString as cronstrueToString } from "cronstrue";
 import type { AutomationTrigger } from "../src/rpc-types";
 
+export const PERSONAL_PROJECT_ID = "proj_personal";
+
 const SCHEDULE_RUN_FORMATTER = new Intl.DateTimeFormat(undefined, {
   month: "short",
   day: "numeric",
@@ -69,12 +71,16 @@ function formatCronCadence(cron: string): string {
       /\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/g,
       (day) => DAY_ABBREVIATION[day] ?? day,
     )
+    .replace(
+      /\bbetween (\d{1,2}(?::\d{2})?[AP]M) and (\d{1,2}(?::\d{2})?[AP]M)\b/g,
+      "$1-$2",
+    )
     .replace(/ through /g, "-")
     .replace(/,? only on /g, " ")
     .replace(/,? and /g, ", ")
     .replace(/\bminutes?\b/g, "min")
     .replace(/\bseconds?\b/g, "sec")
-    .replace(/([AP]M),\s+/g, "$1 ")
+    .replace(/([AP]M),(?!\s+\d{1,2}(?::\d{2})?[AP]M\b)\s+/g, "$1 ")
     .trim();
 }
 

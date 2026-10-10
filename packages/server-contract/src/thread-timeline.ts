@@ -83,6 +83,13 @@ export const timelineConversationAttachmentsSchema = z.object({
   imageUrls: z.array(z.string()),
   localImagePaths: z.array(z.string()),
   localFilePaths: z.array(z.string()),
+  localFileDetails: z.array(
+    z.object({
+      path: z.string(),
+      name: z.string(),
+      sizeBytes: z.number().int().nonnegative().nullable(),
+    }),
+  ),
 });
 export type TimelineConversationAttachments = z.infer<
   typeof timelineConversationAttachmentsSchema
@@ -108,6 +115,7 @@ export type TimelineConversationTurnRequest = z.infer<
 
 const timelineConversationRowBaseSchema = timelineRowBaseSchema.extend({
   kind: z.literal("conversation"),
+  messageSeq: z.number().int(),
   text: z.string(),
   attachments: timelineConversationAttachmentsSchema.nullable(),
 });
@@ -142,6 +150,7 @@ export type TimelineConversationRow = z.infer<
 
 export const timelineSystemOperationKindValues = [
   "generic",
+  "reasoning",
   "compaction",
   "context-clear",
   "parent-change",
@@ -157,16 +166,8 @@ export const timelineSystemOperationKindSchema = z.enum(
 export type TimelineSystemOperationKind = z.infer<
   typeof timelineSystemOperationKindSchema
 >;
-const timelineGenericSystemOperationKindSchema = z.enum([
-  "generic",
-  "compaction",
-  "context-clear",
-  "thread-provisioning",
-  "thread-interrupted",
-  "provider-unhandled",
-  "warning",
-  "deprecation",
-] as const);
+const timelineGenericSystemOperationKindSchema =
+  timelineSystemOperationKindSchema.exclude(["parent-change"]);
 
 export const timelineParentChangeActionValues = [
   "assign",
@@ -185,6 +186,10 @@ export const timelineParentChangeSchema = z.object({
   nextParentThreadTitle: z.string().nullable(),
 });
 export type TimelineParentChange = z.infer<typeof timelineParentChangeSchema>;
+
+const timelineContentDeferredField = {
+  contentDeferred: z.literal(true).optional(),
+};
 
 const timelineSystemRowBaseSchema = timelineRowBaseSchema.extend({
   kind: z.literal("system"),
@@ -205,7 +210,9 @@ export const timelineGenericOperationSystemRowSchema =
   timelineSystemRowBaseSchema.extend({
     systemKind: z.literal("operation"),
     operationKind: timelineGenericSystemOperationKindSchema,
+    reasoningId: z.string().optional(),
     completedAt: z.number().nullable(),
+    ...timelineContentDeferredField,
   });
 
 export const timelineParentChangeSystemRowSchema =
@@ -267,8 +274,14 @@ const timelineRowPresentationField = {
 };
 
 export const timelineOutputPreviewSchema = z.object({
+  experimental_fullOutputAvailability: z.enum([
+    "available",
+    "detail-limit",
+    "retention-expired",
+  ]),
   totalChars: z.number().int().nonnegative(),
 });
+export type TimelineOutputPreview = z.infer<typeof timelineOutputPreviewSchema>;
 
 export const timelineCommandWorkRowSchema = timelineWorkRowBaseSchema.extend({
   workKind: z.literal("command"),
@@ -283,6 +296,7 @@ export const timelineCommandWorkRowSchema = timelineWorkRowBaseSchema.extend({
   approvalStatus: timelineApprovalStatusSchema,
   activityIntents: z.array(timelineActivityIntentSchema),
   ...timelineRowPresentationField,
+  ...timelineContentDeferredField,
 });
 export type TimelineCommandWorkRow = z.infer<
   typeof timelineCommandWorkRowSchema
@@ -298,6 +312,7 @@ export const timelineToolWorkRowSchema = timelineWorkRowBaseSchema.extend({
   completedAt: z.number().nullable(),
   approvalStatus: timelineApprovalStatusSchema,
   ...timelineRowPresentationField,
+  ...timelineContentDeferredField,
 });
 export type TimelineToolWorkRow = z.infer<typeof timelineToolWorkRowSchema>;
 
@@ -310,6 +325,7 @@ export const timelineFileChangeWorkRowSchema = timelineWorkRowBaseSchema.extend(
     stderr: z.string().nullable(),
     approvalStatus: timelineApprovalStatusSchema,
     ...timelineRowPresentationField,
+    ...timelineContentDeferredField,
   },
 );
 export type TimelineFileChangeWorkRow = z.infer<
@@ -349,6 +365,21 @@ export const timelineImageViewWorkRowSchema = timelineWorkRowBaseSchema.extend({
 });
 export type TimelineImageViewWorkRow = z.infer<
   typeof timelineImageViewWorkRowSchema
+>;
+
+export const timelineImageGenerationWorkRowSchema =
+  timelineWorkRowBaseSchema.extend({
+    workKind: z.literal("image-generation"),
+    callId: z.string(),
+    prompt: z.string().nullable(),
+    path: z.string().nullable(),
+    error: z.string().nullable(),
+    transparentBackground: z.boolean(),
+    completedAt: z.number().nullable(),
+    ...timelineRowPresentationField,
+  });
+export type TimelineImageGenerationWorkRow = z.infer<
+  typeof timelineImageGenerationWorkRowSchema
 >;
 
 export const timelineFileReadWorkRowSchema = timelineWorkRowBaseSchema.extend({
@@ -463,6 +494,25 @@ export type TimelineApprovalWorkRow = z.infer<
   typeof timelineApprovalWorkRowSchema
 >;
 
+export const timelineFormLifecycleValues = [
+  "pending",
+  "submitted",
+  "cancelled",
+] as const;
+
+export const timelineFormWorkRowSchema = timelineWorkRowBaseSchema.extend({
+  workKind: z.literal("form"),
+  interactionId: z.string(),
+  pluginId: z.string(),
+  rendererId: z.string(),
+  title: z.string(),
+  lifecycle: z.enum(timelineFormLifecycleValues),
+  statusReason: z.string().nullable(),
+  presentation: timelineRowPresentationSchema,
+  payload: jsonValueSchema.nullable(),
+});
+export type TimelineFormWorkRow = z.infer<typeof timelineFormWorkRowSchema>;
+
 export const timelineQuestionWorkRowSchema = timelineWorkRowBaseSchema.extend({
   workKind: z.literal("question"),
   interactionId: z.string(),
@@ -485,7 +535,7 @@ export interface TimelineDelegationWorkRow extends TimelineWorkRowBase {
   description: string | null;
   output: string;
   completedAt: number | null;
-  childRows: TimelineRow[];
+  childRows: TimelineRow[] | null;
   presentation?: TimelineRowPresentation;
 }
 
@@ -500,7 +550,7 @@ export const timelineDelegationWorkRowSchema: z.ZodType<TimelineDelegationWorkRo
     description: z.string().nullable(),
     output: z.string(),
     completedAt: z.number().nullable(),
-    childRows: z.array(z.lazy(() => timelineRowSchema)),
+    childRows: z.array(z.lazy(() => timelineRowSchema)).nullable(),
     ...timelineRowPresentationField,
   });
 
@@ -529,6 +579,7 @@ export type TimelineWorkRow =
   | TimelineFileChangeWorkRow
   | TimelineWebSearchWorkRow
   | TimelineWebFetchWorkRow
+  | TimelineImageGenerationWorkRow
   | TimelineImageViewWorkRow
   | TimelineFileReadWorkRow
   | TimelineSearchWorkRow
@@ -536,6 +587,7 @@ export type TimelineWorkRow =
   | TimelineExtensionWorkRow
   | TimelineApprovalWorkRow
   | TimelineQuestionWorkRow
+  | TimelineFormWorkRow
   | TimelineDelegationWorkRow
   | TimelineWorkflowWorkRow;
 
@@ -545,6 +597,7 @@ export const timelineWorkRowSchema: z.ZodType<TimelineWorkRow> = z.union([
   timelineFileChangeWorkRowSchema,
   timelineWebSearchWorkRowSchema,
   timelineWebFetchWorkRowSchema,
+  timelineImageGenerationWorkRowSchema,
   timelineImageViewWorkRowSchema,
   timelineFileReadWorkRowSchema,
   timelineSearchWorkRowSchema,
@@ -552,6 +605,7 @@ export const timelineWorkRowSchema: z.ZodType<TimelineWorkRow> = z.union([
   timelineExtensionWorkRowSchema,
   timelineApprovalWorkRowSchema,
   timelineQuestionWorkRowSchema,
+  timelineFormWorkRowSchema,
   timelineDelegationWorkRowSchema,
   timelineWorkflowWorkRowSchema,
 ]);

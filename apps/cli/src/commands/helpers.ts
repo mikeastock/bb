@@ -1,14 +1,10 @@
 import { createInterface } from "node:readline/promises";
 import {
-  PERSONAL_PROJECT_ID,
   reasoningLevelSchema,
   reasoningLevelValues,
   type ReasoningLevel,
 } from "@bb/domain";
-import type {
-  CommitActionResponse,
-  SquashMergeActionResponse,
-} from "@bb/server-contract";
+import { noteJsonPayloadWritten } from "../cli-error-output.js";
 import type { ResolvedId } from "../context-env.js";
 
 export {
@@ -26,34 +22,18 @@ export interface JsonOutputOptions {
 export function outputJson(opts: JsonOutputOptions, data: unknown): boolean {
   if (!opts.json) return false;
   console.log(JSON.stringify(data, null, 2));
+  noteJsonPayloadWritten();
   return true;
 }
 
-export function printContextLabel(
-  resolved: ResolvedId,
-  kind: "Thread" | "Project",
-  envVar: string,
-  opts: JsonOutputOptions,
-): void {
-  if (opts.json) return;
-  if (resolved.source === "env") {
-    const displayId =
-      kind === "Project" && resolved.id === PERSONAL_PROJECT_ID
-        ? "-"
-        : resolved.id;
-    console.error(`${kind} ${displayId} (from ${envVar})`);
-  }
+export function collectOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
 }
 
-export function printEnvironmentGitOperationResult(
-  result: CommitActionResponse | SquashMergeActionResponse,
-): void {
-  const flags = [
-    ...(result.action === "commit"
-      ? ["committed"]
-      : [result.merged ? "merged" : "noop"]),
-  ];
-  console.log(`${result.message} [${flags.join(", ")}]`);
+export function printThreadContextLabel(resolved: ResolvedId): void {
+  if (resolved.source === "env") {
+    console.error(`Thread ${resolved.id} (from BB_THREAD_ID)`);
+  }
 }
 
 export async function confirmDestructiveAction(
@@ -121,7 +101,7 @@ export function parseReasoningLevel(
     return parsed.data;
   }
   throw new Error(
-    `Invalid reasoning level '${value}'. Expected ${joinValues(REASONING_LEVELS)}.`,
+    `Invalid reasoning level '${value}'. Expected a level id the model lists, such as ${joinValues(REASONING_LEVELS)}.`,
   );
 }
 

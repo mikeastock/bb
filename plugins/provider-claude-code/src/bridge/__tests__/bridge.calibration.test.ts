@@ -8,12 +8,11 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type {
-  PendingInteractionResolution,
-  PromptInput,
-  ThreadEvent,
-} from "@bb/domain";
-import { BRIDGE_INBOUND_REQUEST_METHODS } from "@bb/provider-bridge-protocol";
+import {
+  BRIDGE_INBOUND_REQUEST_METHODS,
+  type PendingInteractionResolution,
+  type PromptInput,
+} from "@get-bb/plugin-sdk/provider-bridge";
 
 const { forkSessionMock, queryMock } = vi.hoisted(() => ({
   forkSessionMock: vi.fn(),
@@ -34,7 +33,10 @@ import {
   experimental_describeCalibrationEvents as describeCalibrationEvents,
   experimental_normalizeCalibrationEvents as normalizeCalibrationEvents,
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
-import type { BridgeJsonRpcTestHarness } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import type {
+  BridgeJsonRpcTestHarness,
+  ThreadEvent,
+} from "@get-bb/plugin-sdk/provider-bridge/testing";
 
 const THREAD_ID = "thr_calibration_1";
 const TOOL_USE_ID = "toolu_01AbCdEfGhIjKlMnOpQrStUv";
@@ -449,17 +451,22 @@ function lastTurnId(events: readonly ThreadEvent[]): string | undefined {
 }
 
 const GOLDEN_EVENT_STREAM: string[] = [
+  "thread/contextWindowUsage/updated",
   "turn/started",
   "turn/input/accepted",
   "item/started:agentMessage",
   "item/agentMessage/delta",
+  "thread/contextWindowUsage/updated",
   "item/completed:agentMessage",
+  "thread/contextWindowUsage/updated",
   "item/started:commandExecution",
   "item/completed:commandExecution",
   "item/started:reasoning",
   "item/reasoning/textDelta",
+  "thread/contextWindowUsage/updated",
   "item/completed:reasoning",
   "turn/input/accepted",
+  "thread/contextWindowUsage/updated",
   "item/completed:agentMessage",
   "thread/contextWindowUsage/updated",
   "thread/tokenUsage/updated",
@@ -468,6 +475,7 @@ const GOLDEN_EVENT_STREAM: string[] = [
   "turn/input/accepted",
   "item/started:agentMessage",
   "item/agentMessage/delta",
+  "thread/contextWindowUsage/updated",
   "item/completed:agentMessage",
   "thread/contextWindowUsage/updated",
   "thread/tokenUsage/updated",
@@ -476,6 +484,7 @@ const GOLDEN_EVENT_STREAM: string[] = [
   "turn/input/accepted",
   "item/started:agentMessage",
   "item/agentMessage/delta",
+  "thread/contextWindowUsage/updated",
   "item/completed:agentMessage",
   "thread/contextWindowUsage/updated",
   "thread/tokenUsage/updated",

@@ -1,43 +1,33 @@
-import { Toaster, type ToasterProps } from "sonner";
-import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
-import { usePreferredTheme } from "@/hooks/useTheme";
+import { useEffect, useSyncExternalStore } from "react";
+import { defineSplit } from "@/lib/define-split";
+import { queueSplitPreload } from "@/lib/split-prefetch";
+import {
+  isToasterRequested,
+  markToasterUnavailable,
+  requestToaster,
+  subscribeToasterRequest,
+} from "./ui/app-toast-runtime";
 
-const COMPACT_TOAST_TOP_OFFSET =
-  "calc(env(safe-area-inset-top) + var(--bb-app-chrome-row-height) + 16px)";
-
-function withCompactTopOffset(
-  offset: ToasterProps["offset"],
-): ToasterProps["offset"] {
-  if (typeof offset === "object") {
-    return { ...offset, top: COMPACT_TOAST_TOP_OFFSET };
-  }
-  return {
-    top: COMPACT_TOAST_TOP_OFFSET,
-    right: offset,
-    bottom: offset,
-    left: offset,
-  };
+function ToasterUnavailable() {
+  useEffect(() => markToasterUnavailable(), []);
+  return null;
 }
 
-export function AppToaster({
-  position = "bottom-right",
-  offset,
-  mobileOffset,
-  ...props
-}: ToasterProps) {
-  const theme = usePreferredTheme();
-  const isCompactViewport = useIsCompactViewport();
-  return (
-    <Toaster
-      theme={theme}
-      position={isCompactViewport ? "top-center" : position}
-      {...props}
-      offset={isCompactViewport ? withCompactTopOffset(offset) : offset}
-      mobileOffset={
-        isCompactViewport
-          ? withCompactTopOffset(mobileOffset)
-          : mobileOffset
-      }
-    />
+const AppToasterSplit = defineSplit({
+  id: "app-toaster",
+  load: () =>
+    import("./AppToasterView").then((module) => module.AppToasterView),
+  loading: () => null,
+  error: ToasterUnavailable,
+  tier: "intent",
+});
+
+queueSplitPreload(async () => requestToaster());
+
+export function AppToaster() {
+  const requested = useSyncExternalStore(
+    subscribeToasterRequest,
+    isToasterRequested,
   );
+  return requested ? <AppToasterSplit /> : null;
 }

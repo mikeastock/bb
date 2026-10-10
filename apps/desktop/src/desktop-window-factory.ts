@@ -1,4 +1,4 @@
-import type { BrowserWindowConstructorOptions } from "electron";
+import type { BrowserWindowConstructorOptions, Event } from "electron";
 import {
   MIN_WINDOW_HEIGHT,
   MIN_WINDOW_WIDTH,
@@ -15,6 +15,7 @@ import {
   type PersistBrowserWindowStateSnapshot,
   type StatefulBrowserWindow,
 } from "./window-state.js";
+import { resolveDesktopExternalUrl } from "./desktop-external-url.js";
 import type { DesktopContextMenuWebContents } from "./desktop-context-menu.js";
 
 type DesktopWindowIcon = BrowserWindowConstructorOptions["icon"];
@@ -43,8 +44,12 @@ export interface DesktopWindowOpenDevToolsOptions {
 
 export interface DesktopWindowWebContents extends DesktopContextMenuWebContents {
   id: number;
+  on(...args: Parameters<DesktopContextMenuWebContents["on"]>): void;
+  on(
+    eventName: "did-change-theme-color",
+    listener: (event: Event, color: string | null) => void,
+  ): void;
   openDevTools(options: DesktopWindowOpenDevToolsOptions): void;
-  send(channel: string, payload: unknown): void;
   setWindowOpenHandler(handler: DesktopWindowOpenHandler): void;
   setZoomFactor(factor: number): void;
 }
@@ -52,7 +57,6 @@ export interface DesktopWindowWebContents extends DesktopContextMenuWebContents 
 export interface DesktopBrowserWindow extends StatefulBrowserWindow {
   readonly id: number;
   focus(): void;
-  isFocused(): boolean;
   isMinimized(): boolean;
   loadURL(url: string): Promise<void>;
   maximize(): void;
@@ -63,6 +67,7 @@ export interface DesktopBrowserWindow extends StatefulBrowserWindow {
   once(eventName: "ready-to-show", listener: () => void): void;
   restore(): void;
   setFullScreen(isFullScreen: boolean): void;
+  setBackgroundColor(color: string): void;
   show(): void;
   webContents: DesktopWindowWebContents;
 }
@@ -84,6 +89,7 @@ interface CreateDesktopWindowFactoryArgs {
   isMac: boolean;
   isLinuxFrameless: boolean;
   isQuitting(): boolean;
+  shouldUseDarkColors(): boolean;
   openExternalUrl(args: OpenExternalUrlArgs): void;
   preloadPath: string;
   userDataPath: string;
@@ -106,9 +112,6 @@ export interface DesktopWindowFactory {
   createWindow(args: CreateDesktopWindowArgs): Promise<DesktopBrowserWindow>;
   focusFirstWindow(): boolean;
   hasOpenWindows(): boolean;
-  sendToFocusedWindow(channel: string, payload: unknown): boolean;
-  sendToFirstWindow(channel: string, payload: unknown): boolean;
-  loadUrlInFirstWindow(args: LoadDesktopWindowsUrlArgs): Promise<boolean>;
   loadUrl(args: LoadDesktopWindowsUrlArgs): Promise<void>;
   openDevTools(): void;
   persistOpenWindows(): Promise<void>;
@@ -130,6 +133,7 @@ interface LoadUrlIntoWindowArgs {
 }
 
 interface CreateWindowOptionsArgs {
+  backgroundColor: string;
   bounds: WindowBounds;
   icon: DesktopWindowIcon;
   isLinuxTransparent: boolean;
@@ -165,6 +169,7 @@ function createWindowOptions(
   args: CreateWindowOptionsArgs,
 ): BrowserWindowConstructorOptions {
   return {
+    backgroundColor: args.backgroundColor,
     ...(args.isLinuxFrameless ? { frame: false } : {}),
     ...(args.isLinuxTransparent
       ? { backgroundColor: "#00000000", transparent: true }
@@ -175,7 +180,7 @@ function createWindowOptions(
           titleBarStyle: "hiddenInset" as const,
           trafficLightPosition: MACOS_TRAFFIC_LIGHT_POSITION,
         }
-      : {}),
+      : { autoHideMenuBar: true }),
     height: args.bounds.height,
     icon: args.icon,
     minHeight: MIN_WINDOW_HEIGHT,
@@ -233,6 +238,7 @@ export function createDesktopWindowFactory(
       });
       const browserWindow = args.browserWindowCreator.create(
         createWindowOptions({
+          backgroundColor: args.shouldUseDarkColors() ? "#151515" : "#ffffff",
           bounds: restoredState.bounds,
           icon: args.icon,
           isLinuxTransparent: args.isLinuxTransparent,
@@ -241,6 +247,16 @@ export function createDesktopWindowFactory(
           preloadPath: args.preloadPath,
         }),
       );
+      if (!args.isLinuxTransparent) {
+        browserWindow.webContents.on(
+          "did-change-theme-color",
+          (_event, color) => {
+            if (color !== null) {
+              browserWindow.setBackgroundColor(color);
+            }
+          },
+        );
+      }
       browserWindow.webContents.session.setSpellCheckerEnabled(true);
 
       activeWindows.set(stateKey, browserWindow);
@@ -265,7 +281,10 @@ export function createDesktopWindowFactory(
         }
       });
       browserWindow.webContents.setWindowOpenHandler((details) => {
-        args.openExternalUrl({ url: details.url });
+        const url = resolveDesktopExternalUrl(details.url);
+        if (url !== null) {
+          args.openExternalUrl({ url });
+        }
         return { action: "deny" };
       });
 
@@ -333,46 +352,6 @@ export function createDesktopWindowFactory(
     return false;
   }
 
-  async function loadUrlInFirstWindow(
-    loadArgs: LoadDesktopWindowsUrlArgs,
-  ): Promise<boolean> {
-    for (const browserWindow of activeWindows.values()) {
-      if (browserWindow.isMinimized()) {
-        browserWindow.restore();
-      }
-      await loadUrlIntoWindow({
-        browserWindow,
-        url: loadArgs.url,
-      });
-      browserWindow.focus();
-      return true;
-    }
-    return false;
-  }
-
-  function sendToFirstWindow(channel: string, payload: unknown): boolean {
-    for (const browserWindow of activeWindows.values()) {
-      if (browserWindow.isMinimized()) {
-        browserWindow.restore();
-      }
-      browserWindow.webContents.send(channel, payload);
-      browserWindow.focus();
-      return true;
-    }
-    return false;
-  }
-
-  function sendToFocusedWindow(channel: string, payload: unknown): boolean {
-    for (const browserWindow of activeWindows.values()) {
-      if (!browserWindow.isFocused()) {
-        continue;
-      }
-      browserWindow.webContents.send(channel, payload);
-      return true;
-    }
-    return sendToFirstWindow(channel, payload);
-  }
-
   function openDevTools(): void {
     for (const browserWindow of activeWindows.values()) {
       browserWindow.webContents.openDevTools({ mode: "detach" });
@@ -397,9 +376,6 @@ export function createDesktopWindowFactory(
     hasOpenWindows() {
       return activeWindows.size > 0;
     },
-    sendToFocusedWindow,
-    sendToFirstWindow,
-    loadUrlInFirstWindow,
     loadUrl,
     openDevTools,
     persistOpenWindows,

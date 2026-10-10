@@ -19,33 +19,6 @@ async function importFreshLogger() {
   return import("../src/index.js");
 }
 
-async function importFreshLoggerWithPinoTransportSpy() {
-  vi.resetModules();
-
-  const actual = await vi.importActual<{ default: typeof import("pino") }>(
-    "pino",
-  );
-  const transportSpy = vi.fn(actual.default.transport);
-  const mockedPino = Object.assign(
-    ((...args: Parameters<typeof actual.default>) =>
-      actual.default(...args)) as typeof actual.default,
-    actual.default,
-    {
-      transport: transportSpy,
-    },
-  );
-
-  vi.doMock("pino", () => ({
-    default: mockedPino,
-  }));
-
-  const loggerModule = await import("../src/index.js");
-  return {
-    ...loggerModule,
-    transportSpy,
-  };
-}
-
 interface SubprocessLoggerResult {
   exitCode: number | null;
   stderr: string;
@@ -163,7 +136,6 @@ function readComponentLogLines(
 }
 
 afterEach(() => {
-  vi.doUnmock("pino");
   vi.resetModules();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -177,49 +149,6 @@ afterAll(async () => {
 });
 
 describe("createLogger", () => {
-  it("writes structured JSON to the component log file", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger } = await importFreshLogger();
-    const logger = createLogger({ component: "server" });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.info({ requestId: "req_1" }, "booted");
-    await waitFor(() => readComponentLogLines(logDir, "server").length === 1);
-
-    const entries = readComponentLogLines(logDir, "server");
-    expect(entries[0]).toMatchObject({
-      component: "server",
-      level: 30,
-      msg: "booted",
-      requestId: "req_1",
-    });
-  });
-
-  it("keeps parent context on child loggers", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger } = await importFreshLogger();
-    const logger = createLogger({ component: "host-daemon" });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.child({ threadId: "thr_123" }).info("turn started");
-    await waitFor(
-      () => readComponentLogLines(logDir, "host-daemon").length === 1,
-    );
-
-    const entries = readComponentLogLines(logDir, "host-daemon");
-    expect(entries[0]).toMatchObject({
-      component: "host-daemon",
-      threadId: "thr_123",
-      msg: "turn started",
-    });
-  });
-
   it("rotates files when the active log exceeds the configured size", async () => {
     const dataDir = createTempDir();
     vi.stubEnv("NODE_ENV", "production");
@@ -269,34 +198,6 @@ describe("createLogger", () => {
     });
   });
 
-  it("uses a direct file destination when stream mode is requested", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger, transportSpy } =
-      await importFreshLoggerWithPinoTransportSpy();
-    const logger = createLogger({
-      component: "host-daemon",
-      transportMode: "stream",
-    });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.info({ requestId: "req_2" }, "sandbox booted");
-    await waitFor(
-      () => readComponentLogLines(logDir, "host-daemon").length === 1,
-    );
-
-    expect(transportSpy).not.toHaveBeenCalled();
-    const entries = readComponentLogLines(logDir, "host-daemon");
-    expect(entries[0]).toMatchObject({
-      component: "host-daemon",
-      level: 30,
-      msg: "sandbox booted",
-      requestId: "req_2",
-    });
-  });
-
   it("uses an explicit data directory when provided", async () => {
     const envDataDir = createTempDir();
     const explicitDataDir = createTempDir();
@@ -307,7 +208,6 @@ describe("createLogger", () => {
     const logger = createLogger({
       component: "host-daemon",
       dataDir: explicitDataDir,
-      transportMode: "stream",
     });
 
     logger.info({ requestId: "req_explicit" }, "explicit data dir");

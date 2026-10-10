@@ -3,11 +3,13 @@ import {
   definePluginApp,
   experimental_Diff as Diff,
   experimental_FileLink as FileLink,
-  UrlLink as UrlLink,
+  experimental_copyToClipboard,
+  UrlLink,
   useBbNavigate,
   useRealtime,
   useRpc,
   type PluginNavPanelProps,
+  type PluginRpcResult,
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import {
@@ -23,9 +25,9 @@ import {
 } from "./app-logic.js";
 import type { githubRpcContract } from "./server.js";
 import { toast } from "sonner";
-import { Badge } from "@bb/shared-ui/badge";
-import { Button } from "@bb/shared-ui/button";
-import { DelayedLoading } from "@bb/shared-ui/delayed-loading";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -34,105 +36,36 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
-import { Input } from "@bb/shared-ui/input";
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@bb/shared-ui/select";
-import { Skeleton } from "@bb/shared-ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@bb/shared-ui/tabs";
-import { Textarea } from "@bb/shared-ui/textarea";
-import { EmptyState } from "@/components/empty-state";
-import { Markdown } from "@/components/markdown-lite";
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { EmptyState } from "./components/empty-state.js";
+import { Markdown } from "./components/markdown-lite.js";
 
-interface IssueComment {
-  author: string;
-  body: string;
-  createdAt: string;
-}
-
-interface IssueDetail extends Omit<Item, "kind"> {
-  comments: IssueComment[];
-}
-
-interface PullCheck {
-  name: string;
-  status: "success" | "failure" | "pending" | "neutral";
-  url: string;
-}
-
-interface PullReview {
-  author: string;
-  state: string;
-  body: string;
-  createdAt: string;
-}
-
-interface ReviewThread {
-  path: string;
-  line: number | null;
-  diffHunk: string;
-  comments: IssueComment[];
-}
-
-interface PullFile {
-  path: string;
-  status: string;
-  additions: number;
-  deletions: number;
-  patch: string | null;
-}
-
-interface PullDetail {
-  repo: string;
-  number: number;
-  title: string;
-  state: string;
-  author: string;
-  body: string;
-  url: string;
-  createdAt: string;
-  updatedAt: string;
-  baseRefName: string;
-  headRefName: string;
-  additions: number;
-  deletions: number;
-  changedFiles: number;
-  labels: string[];
-  assignees: string[];
-  reviewDecision: string;
-  mergeStateStatus: string;
-  reviewRequests: string[];
-  checks: PullCheck[];
-  comments: IssueComment[];
-  reviews: PullReview[];
-  reviewThreads: ReviewThread[];
-  files: PullFile[];
-}
-
-interface RepoInfo {
-  repo: string;
-  projectId: string | null;
-}
-
-interface ThreadLink {
-  kind: "issue" | "pr";
-  repo: string;
-  number: number;
-  threadId: string;
-  createdAt: string;
-}
-
-type LinksMap = Record<string, ThreadLink[]>;
-
-function asItems(result: unknown): Item[] {
-  const items = (result as { items?: unknown })?.items;
-  return Array.isArray(items) ? (items as Item[]) : [];
-}
+type IssueDetail = PluginRpcResult<
+  (typeof githubRpcContract)["getIssue"]
+>["issue"];
+type PullDetail = PluginRpcResult<
+  (typeof githubRpcContract)["getPull"]
+>["pull"];
+type PullCheck = PullDetail["checks"][number];
+type ReviewThread = PullDetail["reviewThreads"][number];
+type PullFile = PullDetail["files"][number];
+type Status = PluginRpcResult<(typeof githubRpcContract)["status"]>;
+type RepoInfo = Status["repos"][number];
+type LinksMap = PluginRpcResult<
+  (typeof githubRpcContract)["listLinks"]
+>["links"];
+type ThreadLink = LinksMap[string][number];
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -175,7 +108,7 @@ function useItems(kind: "issue" | "pr"): {
   });
   const refetch = useCallback(() => {
     rpc.call("listItems", { kind }).then(
-      (result) => setState({ items: asItems(result), error: null }),
+      (result) => setState({ items: result.items, error: null }),
       (error: unknown) => setState({ items: null, error: errorText(error) }),
     );
   }, [rpc, kind]);
@@ -191,10 +124,7 @@ function useLinks(): LinksMap {
   const [links, setLinks] = useState<LinksMap>({});
   const refetch = useCallback(() => {
     rpc.call("listLinks").then(
-      (result) => {
-        const map = (result as { links?: unknown })?.links;
-        if (map !== null && typeof map === "object") setLinks(map as LinksMap);
-      },
+      (result) => setLinks(result.links),
       () => {},
     );
   }, [rpc]);
@@ -222,10 +152,7 @@ function useSpawn(): {
       rpc
         .call(method, { repo, number })
         .then((result) => {
-          const threadId = (result as { threadId?: unknown })?.threadId;
-          if (typeof threadId !== "string")
-            throw new Error("malformed spawn result");
-          navigate.toThread(threadId);
+          navigate.toThread(result.threadId);
         })
         .catch((error: unknown) => toast.error(errorText(error)))
         .finally(() => setSpawningKey(null));
@@ -244,11 +171,8 @@ function useViewer(): string | null {
     if (viewerLogin !== null) return;
     rpc.call("viewer").then(
       (result) => {
-        const value = (result as { login?: unknown })?.login;
-        if (typeof value === "string" && value.length > 0) {
-          viewerLogin = value;
-          setLogin(value);
-        }
+        viewerLogin = result.login;
+        setLogin(result.login);
       },
       () => {},
     );
@@ -501,7 +425,6 @@ function FilterBar({
 
   return (
     <div className="relative">
-      {}
       <input
         ref={inputRef}
         value={value}
@@ -705,9 +628,11 @@ function RowMenu({ item }: { item: Item }) {
         </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
-            navigator.clipboard.writeText(item.url).then(
-              () => toast.success("Link copied"),
-              () => toast.error("Could not copy the link"),
+            void experimental_copyToClipboard({ text: item.url }).then(
+              (copied) => {
+                if (copied) toast.success("Link copied");
+                else toast.error("Could not copy the link");
+              },
             );
           }}
         >
@@ -918,10 +843,7 @@ function AssigneePicker({
   const load = useCallback(() => {
     if (users !== null) return;
     rpc.call("assignableUsers", { repo }).then(
-      (result) => {
-        const list = (result as { users?: unknown })?.users;
-        setUsers(Array.isArray(list) ? list.map(String) : []);
-      },
+      (result) => setUsers(result.users),
       (error: unknown) => setLoadError(errorText(error)),
     );
   }, [rpc, repo, users]);
@@ -992,10 +914,7 @@ function LabelPicker({
   const load = useCallback(() => {
     if (available !== null) return;
     rpc.call("repositoryLabels", { repo }).then(
-      (result) => {
-        const list = (result as { labels?: unknown })?.labels;
-        setAvailable(Array.isArray(list) ? list.map(String) : []);
-      },
+      (result) => setAvailable(result.labels),
       (error: unknown) => setLoadError(errorText(error)),
     );
   }, [rpc, repo, available]);
@@ -1067,9 +986,7 @@ function IssueDetailView({
   const load = useCallback(() => {
     rpc.call("getIssue", { repo, number }).then(
       (result) => {
-        const issue = (result as { issue?: IssueDetail })?.issue;
-        if (issue === undefined) throw new Error("malformed getIssue result");
-        setDetail(issue);
+        setDetail(result.issue);
         setError(null);
       },
       (err: unknown) => setError(errorText(err)),
@@ -1151,7 +1068,7 @@ function IssueDetailView({
 
   const issueLinks = links[`issue:${repo}#${number}`];
   return (
-    <div className="flex flex-col gap-4">
+    <div className="@container/github-detail flex flex-col gap-4">
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
           ← Issues
@@ -1181,7 +1098,7 @@ function IssueDetailView({
         </Button>
       </div>
 
-      <div className="flex flex-col gap-6 lg:flex-row">
+      <div className="flex flex-col gap-6 @min-[56rem]/github-detail:flex-row">
         <div className="flex min-w-0 flex-1 flex-col gap-4">
           <div className="overflow-hidden rounded-lg border border-border bg-card">
             <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
@@ -1244,7 +1161,7 @@ function IssueDetailView({
           </div>
         </div>
 
-        <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+        <aside className="flex w-full shrink-0 flex-col gap-5 @min-[56rem]/github-detail:w-56">
           <div className="flex flex-col gap-2">
             <SidebarHeading>Status</SidebarHeading>
             <Select
@@ -1706,9 +1623,7 @@ function PullDetailView({
   const load = useCallback(() => {
     rpc.call("getPull", { repo, number }).then(
       (result) => {
-        const detail = (result as { pull?: PullDetail })?.pull;
-        if (detail === undefined) throw new Error("malformed getPull result");
-        setPull(detail);
+        setPull(result.pull);
         setError(null);
       },
       (err: unknown) => setError(errorText(err)),
@@ -1775,7 +1690,7 @@ function PullDetailView({
   );
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="@container/github-detail flex flex-col gap-4">
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         {onBack !== undefined ? (
           <Button
@@ -1839,9 +1754,9 @@ function PullDetailView({
       {compact ? (
         mainColumn
       ) : (
-        <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="flex flex-col gap-6 @min-[56rem]/github-detail:flex-row">
           {mainColumn}
-          <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+          <aside className="flex w-full shrink-0 flex-col gap-5 @min-[56rem]/github-detail:w-56">
             <div className="flex flex-col gap-1">
               <SidebarHeading>Reviewers</SidebarHeading>
               <PullReviewersList pull={pull} />
@@ -1906,7 +1821,7 @@ function PullPickerList({
     return <EmptyState message="No open pull requests in the tracked repos." />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
+    <div className="@container/github-picker overflow-hidden rounded-lg border border-border bg-card">
       <div className="divide-y divide-border">
         {open.map((item) => (
           <button
@@ -1921,7 +1836,7 @@ function PullPickerList({
             <span className="min-w-0 flex-1 truncate text-sm text-foreground">
               {item.title}
             </span>
-            <span className="hidden shrink-0 text-xs text-muted-foreground sm:block">
+            <span className="hidden shrink-0 text-xs text-muted-foreground @min-[32rem]/github-picker:block">
               {item.repo}
             </span>
           </button>
@@ -1945,29 +1860,7 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
     rpc.call("pullForThread", { threadId }).then(
       (result) => {
         if (cancelled) return;
-        const pull = (
-          result as {
-            pull?: {
-              repo?: unknown;
-              number?: unknown;
-              environmentId?: unknown;
-            } | null;
-          }
-        )?.pull;
-        if (
-          pull &&
-          typeof pull.repo === "string" &&
-          typeof pull.number === "number"
-        ) {
-          setSelected({
-            repo: pull.repo,
-            number: pull.number,
-            environmentId:
-              typeof pull.environmentId === "string"
-                ? pull.environmentId
-                : null,
-          });
-        }
+        if (result.pull !== null) setSelected(result.pull);
         setResolved(true);
       },
       () => {
@@ -2028,9 +1921,8 @@ function NewIssueForm({
     rpc
       .call("createIssue", { repo, title, body })
       .then((result) => {
-        const number = (result as { number?: unknown })?.number;
         toast.success("Issue created");
-        onCreated(repo, typeof number === "number" ? number : null);
+        onCreated(repo, result.number);
       })
       .catch((err: unknown) => toast.error(errorText(err)))
       .finally(() => setCreating(false));
@@ -2078,20 +1970,12 @@ function NewIssueForm({
   );
 }
 
-interface Status {
-  ghOk: boolean;
-  ghState: "ready" | "needs_configuration" | "unavailable";
-  ghError: string | null;
-  repos: RepoInfo[];
-  lastSyncedAt: string | null;
-}
-
 function useStatus(): { status: Status | null; refetch: () => void } {
   const rpc = useRpc<typeof githubRpcContract>();
   const [status, setStatus] = useState<Status | null>(null);
   const refetch = useCallback(() => {
     rpc.call("status").then(
-      (result) => setStatus(result as Status),
+      (result) => setStatus(result),
       () => {},
     );
   }, [rpc]);
@@ -2117,7 +2001,7 @@ function PanelHeader() {
   }, [rpc]);
   return (
     <>
-      <span className="hidden text-xs text-muted-foreground sm:inline">
+      <span className="hidden text-xs text-muted-foreground @min-[40rem]/page-header:inline">
         {failed ? (
           "Sync failed — check `gh auth status`"
         ) : status === null ? (
@@ -2137,13 +2021,13 @@ function PanelHeader() {
       <Button
         size="sm"
         variant="outline"
-        className="size-8 gap-1.5 px-0 sm:h-8 sm:w-auto sm:px-3"
+        className="size-8 gap-1.5 px-0 @min-[32rem]/page-header:h-8 @min-[32rem]/page-header:w-auto @min-[32rem]/page-header:px-3"
         disabled={syncing}
         onClick={refresh}
         aria-label={syncing ? "Syncing GitHub data" : "Refresh GitHub data"}
       >
         <RefreshIcon className={syncing ? "animate-spin" : undefined} />
-        <span className="hidden sm:inline">
+        <span className="hidden @min-[32rem]/page-header:inline">
           {syncing ? "Syncing…" : "Refresh"}
         </span>
       </Button>
@@ -2336,9 +2220,7 @@ function GithubPanelBody({
         query={query}
         setQuery={setQuery}
         repos={status?.repos ?? []}
-        onOpenItem={(repo, number) =>
-          openItem(kind === "pr" ? "pr" : "issue", repo, number)
-        }
+        onOpenItem={(repo, number) => openItem(kind, repo, number)}
       />
     </div>
   );

@@ -48,7 +48,13 @@ export function PluginNewThreadComposer({
   };
   const composerKey = draftKey ?? pluginId ?? "default";
   const handleSubmit = async (request: NewThreadRequest) => {
-    await onSubmit(request);
+    await onSubmit({
+      ...request,
+      executionInputSources: {
+        ...request.executionInputSources,
+        providerId: "explicit",
+      },
+    });
   };
 
   return (
@@ -74,6 +80,7 @@ export function PluginNewThreadComposer({
           {renderPromptBox({
             placeholder,
             allowNoProject: true,
+            mentionMenuPlacement: layout === "contained" ? "top" : "bottom",
           })}
         </div>
       )}

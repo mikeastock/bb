@@ -21,13 +21,13 @@ vi.mock("./thread-detail/SplitThreadArea", () => ({
   },
 }));
 
-vi.mock("./RootComposeView", () => ({
+vi.mock("./LegacyProjectComposeRedirect", () => ({
   LegacyProjectComposeRedirect: () => <div>legacy redirect</div>,
 }));
 
 vi.mock("./ToolsView", () => ({
-  ToolsView: ({ pluginId }: { pluginId?: string }) => (
-    <output data-testid="tools-view">{pluginId ?? "overview"}</output>
+  PluginsView: ({ detailKey }: { detailKey?: string }) => (
+    <output data-testid="tools-view">{detailKey ?? "overview"}</output>
   ),
 }));
 
@@ -72,9 +72,9 @@ describe("SplitWorkspaceRoute", () => {
     expect(workspaceLifecycle).toEqual({ mounts: 1, unmounts: 0 });
   });
 
-  it("passes the plugin id from the full-window detail URL to ToolsView", async () => {
+  it("passes the plugin id from the full-window detail URL to PluginsView", async () => {
     render(
-      <MemoryRouter initialEntries={["/extensions/plugins/github"]}>
+      <MemoryRouter initialEntries={["/plugins/github"]}>
         <Routes>
           <Route
             path="*"

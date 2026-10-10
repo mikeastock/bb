@@ -102,7 +102,6 @@ interface QueuedAnimationFrames {
 
 interface RenderLayoutArgs {
   collapseActive?: boolean;
-  compactPresentation?: "shelf" | "full";
   isCompactViewport: boolean;
   onClose?: () => void;
   isFocusedHosted?: boolean;
@@ -172,7 +171,6 @@ function renderLayout(args: RenderLayoutArgs) {
           }
           renderPanel={renderArgs.renderPanel}
           composerHost={null}
-          compactPresentation={renderArgs.compactPresentation ?? "shelf"}
         />
       </CompactViewportOverrideProvider>,
       renderArgs.isFocusedHosted,
@@ -332,6 +330,9 @@ describe("SecondaryPanelLayout", () => {
     const mainContent = screen.getByTestId("main-content");
     expect(panelGroup.style.getPropertyValue("--panel-collapse-duration")).toBe(
       "220ms",
+    );
+    expect(mainContent.parentElement?.className).toContain(
+      "motion-reduce:transition-none",
     );
 
     view.rerenderWith({ resetKey: "plugin-page-b" });
@@ -674,6 +675,24 @@ describe("SecondaryPanelLayout", () => {
 });
 
 describe("compact sidebar and right panel", () => {
+  it("keeps a newly requested panel open while the sidebar is dismissing", () => {
+    const onClose = vi.fn();
+    const view = renderLayout({
+      isCompactViewport: true,
+      onClose,
+      open: false,
+      renderPanel: createPanelRenderer(),
+      resetKey: "thread-1",
+    });
+    act(() => setCompactSidebarDrawerShowing(true));
+    view.rerenderWith({ open: true });
+    act(() => setCompactSidebarDrawerShowing(false));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByTestId("responsive-drawer-shell").dataset.open).toBe(
+      "true",
+    );
+  });
+
   it("closes the right panel when the sidebar drawer opens so only one shelf is engaged", () => {
     const onClose = vi.fn();
     renderLayout({

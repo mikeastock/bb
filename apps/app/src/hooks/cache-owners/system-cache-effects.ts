@@ -1,4 +1,9 @@
 import type { QueryKey } from "@tanstack/react-query";
+import type { Environment, Host } from "@bb/domain";
+import type {
+  SystemConfigResponse,
+  SystemProviderCatalogEntry,
+} from "@bb/server-contract";
 import {
   allEnvironmentDiffFilesQueryKeyPrefix,
   allEnvironmentDiffPatchQueryKeyPrefix,
@@ -7,9 +12,12 @@ import {
   allEnvironmentQueryKeyPrefix,
   allEnvironmentWorkStatusQueryKeyPrefix,
   allHostQueryKeyPrefix,
+  allMachineEnvironmentQueryKeyPrefix,
   allProjectPathsQueryKeyPrefix,
   allSystemExecutionOptionsQueryKeyPrefix,
+  allSystemMachineProvidersQueryKeyPrefix,
   allSystemProvidersQueryKeyPrefix,
+  allSystemThemesQueryKeyPrefix,
   allTerminalsQueryKeyPrefix,
   allThreadConversationOutlineQueryKeyPrefix,
   allThreadDetailBootstrapQueryKeyPrefix,
@@ -23,11 +31,14 @@ import {
   allThreadStoragePathsQueryKeyPrefix,
   allThreadTimelineQueryKeyPrefix,
   allThreadTimelineTurnSummaryDetailsQueryKeyPrefix,
+  environmentQueryKey,
   hostPathExistenceQueryKeyPrefix,
   hostsQueryKey,
   projectsQueryKey,
+  serverMoveStatusQueryKey,
   sidebarNavigationQueryKey,
   systemConfigQueryKey,
+  systemProviderCatalogQueryKey,
   threadPromptHistoryQueryKeyPrefix,
   threadSearchQueryKeyPrefix,
   threadsQueryKey,
@@ -36,6 +47,8 @@ import { allThreadDefaultExecutionOptionsQueryKeyPrefix } from "../queries/threa
 import type { QueryClientArg } from "../cache-effect-types";
 import { clearCachedModelCatalogs } from "@/lib/model-catalog-cache";
 import { bumpAllDiffPatchEvictionGenerations } from "./environment-diff-patch-cache-owner";
+import { invalidateAppUpdateStatus } from "./app-update-cache-owner";
+import { invalidatePluginList } from "./plugin-cache-owner";
 import { invalidateSystemVersion } from "./system-version-cache-owner";
 import {
   invalidateQueryKeys,
@@ -64,6 +77,7 @@ export function invalidateRealtimeQueriesAfterServerReconnect({
     );
   }
   invalidateSystemVersion({ queryClient });
+  invalidateAppUpdateStatus({ queryClient });
   bumpAllDiffPatchEvictionGenerations();
   queryClient.removeQueries({
     queryKey: allEnvironmentDiffPatchQueryKeyPrefix(),
@@ -97,8 +111,50 @@ export function invalidateRealtimeQueriesFetchedBeforeInitialConnect({
   }
 }
 
+export function refetchActiveRealtimeQueriesOnResume({
+  queryClient,
+}: QueryClientArg): void {
+  for (const queryKey of [
+    allThreadTimelineQueryKeyPrefix(),
+    allThreadQueryKeyPrefix(),
+    sidebarNavigationQueryKey(),
+  ]) {
+    void queryClient.refetchQueries(
+      { queryKey, type: "active" },
+      { cancelRefetch: false },
+    );
+  }
+}
+
 export function invalidateSystemConfig({ queryClient }: QueryClientArg): void {
-  queryClient.invalidateQueries({ queryKey: systemConfigQueryKey() });
+  invalidateQueryKeys({
+    queryClient,
+    queryKeys: [systemConfigQueryKey(), allSystemThemesQueryKeyPrefix()],
+  });
+}
+
+export function invalidateMachineEnvironment({
+  queryClient,
+}: QueryClientArg): void {
+  invalidateQueryKeys({
+    queryClient,
+    queryKeys: [allMachineEnvironmentQueryKeyPrefix()],
+  });
+}
+
+export async function applyProviderAvailabilityChange({
+  queryClient,
+  catalog,
+}: QueryClientArg & { catalog: SystemProviderCatalogEntry[] }): Promise<void> {
+  queryClient.setQueryData(systemProviderCatalogQueryKey(), catalog);
+  await Promise.all([
+    invalidateSystemProviders({ queryClient }),
+    queryClient.invalidateQueries({
+      queryKey: allSystemExecutionOptionsQueryKeyPrefix(),
+    }),
+    queryClient.invalidateQueries({ queryKey: systemConfigQueryKey() }),
+    invalidatePluginList({ queryClient }),
+  ]);
 }
 
 export function invalidateSystemProviders({
@@ -109,24 +165,45 @@ export function invalidateSystemProviders({
   });
 }
 
+export function invalidateMachineProviders({
+  queryClient,
+}: QueryClientArg): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: allSystemMachineProvidersQueryKeyPrefix(),
+  });
+}
+
 export function invalidateSystemExecutionOptions({
   hostId,
   queryClient,
 }: SystemExecutionOptionsInvalidationArgs): Promise<void> {
+  const primaryHostId =
+    queryClient.getQueryData<SystemConfigResponse>(systemConfigQueryKey())
+      ?.primaryHostId ?? null;
   return queryClient.invalidateQueries({
     queryKey: allSystemExecutionOptionsQueryKeyPrefix(),
-    predicate: (query) =>
-      query.queryKey[2] === hostId || query.queryKey[2] === null,
+    predicate: (query) => {
+      const [, environmentId, routedHostId] = query.queryKey;
+      if (typeof routedHostId === "string") return routedHostId === hostId;
+      if (typeof environmentId === "string") {
+        const environment = queryClient.getQueryData<Environment>(
+          environmentQueryKey(environmentId),
+        );
+        return environment === undefined || environment.hostId === hostId;
+      }
+      return primaryHostId === null || primaryHostId === hostId;
+    },
   });
 }
 
 export function invalidateGeneralSettingsDependencies({
+  includeSystemConfig,
   queryClient,
-}: QueryClientArg): void {
+}: QueryClientArg & { includeSystemConfig: boolean }): void {
   invalidateQueryKeys({
     queryClient,
     queryKeys: [
-      systemConfigQueryKey(),
+      ...(includeSystemConfig ? [systemConfigQueryKey()] : []),
       allThreadTimelineQueryKeyPrefix(),
       allThreadTimelineTurnSummaryDetailsQueryKeyPrefix(),
     ],
@@ -174,5 +251,15 @@ function getServerReconnectInvalidationQueryKeys(): QueryKey[] {
     hostPathExistenceQueryKeyPrefix(),
     allSystemProvidersQueryKeyPrefix(),
     allSystemExecutionOptionsQueryKeyPrefix(),
+    serverMoveStatusQueryKey(),
   ];
+}
+
+export function applyHostRenameResult({
+  host,
+  queryClient,
+}: QueryClientArg & { host: Host }): void {
+  queryClient.setQueryData<Host[]>(hostsQueryKey(), (hosts) =>
+    hosts?.map((current) => (current.id === host.id ? host : current)),
+  );
 }

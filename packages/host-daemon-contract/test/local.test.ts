@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   HOST_DAEMON_PROTOCOL_VERSION,
   PATHS_EXIST_MAX_PATHS,
+  hostAuthStateSchema,
   hostPlatformSchema,
   pathsExistRequestSchema,
   pathsExistResponseSchema,
@@ -11,15 +12,35 @@ import {
   statusResponseSchema,
 } from "../src/index.js";
 
+describe("hostAuthStateSchema", () => {
+  it("persists host identity without a host type", () => {
+    expect(
+      hostAuthStateSchema.parse({
+        hostId: "host_modal",
+        hostKey: "secret",
+      }),
+    ).toEqual({
+      hostId: "host_modal",
+      hostKey: "secret",
+    });
+  });
+});
+
 describe("hostPlatformSchema", () => {
   it("accepts the supported platform values", () => {
-    for (const value of ["darwin", "linux", "wsl", "unknown"] as const) {
+    for (const value of [
+      "darwin",
+      "linux",
+      "wsl",
+      "win32",
+      "unknown",
+    ] as const) {
       expect(hostPlatformSchema.parse(value)).toBe(value);
     }
   });
 
   it("rejects other strings", () => {
-    expect(() => hostPlatformSchema.parse("win32")).toThrow();
+    expect(() => hostPlatformSchema.parse("freebsd")).toThrow();
     expect(() => hostPlatformSchema.parse("")).toThrow();
   });
 });

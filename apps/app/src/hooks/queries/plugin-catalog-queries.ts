@@ -1,18 +1,17 @@
+import type { PluginMarketplaceCategory } from "@bb/domain";
 import type {
-  InstalledPlugin,
   PluginApplyUpdateResult as SdkPluginApplyUpdateResult,
   PluginCatalogAuthor,
   PluginCatalogCollection,
   PluginCatalogCollectionMembership,
-  PluginCatalogInstallPlan,
-  PluginCatalogResolvedSource,
   PluginCatalogSearchResult as SdkPluginCatalogSearchResult,
   PluginMarketplace,
   PluginMarketplaceRefreshResult,
   PluginSourceDetail as SdkPluginSourceDetail,
   PluginUpdateCheckEntry,
 } from "@bb/server-contract";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { invalidatePluginList } from "../cache-owners/plugin-cache-owner";
 import { createPluginsClient } from "./plugin-client";
 import { toEpochMs } from "./plugin-settings-queries";
 import {
@@ -20,6 +19,7 @@ import {
   pluginCatalogSearchQueryKey,
   pluginMarketplacesQueryKey,
   pluginSourceQueryKey,
+  pluginUpdateCheckQueryKey,
 } from "./query-keys";
 
 type FetchLike = typeof fetch;
@@ -79,38 +79,13 @@ export function usePluginSource(
   });
 }
 
-export async function installPlugin(
-  fetchImpl: FetchLike,
-  source: string,
-): Promise<InstalledPlugin> {
-  return createPluginsClient(fetchImpl).install({ source });
-}
-
-export async function installCatalogPlugin(
-  fetchImpl: FetchLike,
-  args: {
-    entryId: string;
-    marketplace?: string;
-    confirmedSource?: PluginCatalogResolvedSource;
-  },
-): Promise<InstalledPlugin> {
-  return createPluginsClient(fetchImpl).catalog.install(args);
-}
-
-async function fetchCatalogInstallPlan(
-  fetchImpl: FetchLike,
-  args: { entryId: string; marketplace?: string },
-): Promise<PluginCatalogInstallPlan> {
-  return createPluginsClient(fetchImpl).catalog.installPlan(args);
-}
-
 export function useCatalogInstallPlan(
   args: { entryId: string; marketplace?: string } | null,
 ) {
   const request = args ?? { entryId: "" };
   return useQuery({
     queryKey: pluginCatalogInstallPlanQueryKey(request),
-    queryFn: () => fetchCatalogInstallPlan(fetch, request),
+    queryFn: () => createPluginsClient(fetch).catalog.installPlan(request),
     enabled: args !== null,
     staleTime: 0,
     gcTime: 0,
@@ -195,6 +170,30 @@ export async function checkPluginUpdates(
   return results.map(toUpdatesEntry);
 }
 
+export function usePluginUpdateCheck(
+  pluginId: string | null,
+  options: { enabled: boolean },
+) {
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: pluginUpdateCheckQueryKey(pluginId),
+    queryFn: async () => {
+      const results = await checkPluginUpdates(
+        fetch,
+        pluginId === null ? {} : { id: pluginId },
+      );
+      await invalidatePluginList({ queryClient });
+      return results;
+    },
+    enabled: options.enabled,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    retry: false,
+  });
+}
+
 export interface PluginUpdateResult {
   applied: boolean;
   outcome: SdkPluginApplyUpdateResult["outcome"];
@@ -228,6 +227,7 @@ export interface PluginCatalogSearchEntry {
   categoryId?: string;
   category?: string;
   screenshots: string[];
+  overview?: string;
   collections: PluginCatalogCollectionMembership[];
   publishedAt?: string;
   source: string;
@@ -239,6 +239,8 @@ export interface PluginCatalogSearchEntry {
   official: boolean;
   author: PluginCatalogAuthor | null;
   installed: boolean;
+  installedByDefault: boolean;
+  conflictingInstallSource: string | null;
   installs: number | null;
   compatible: boolean;
   incompatibleReason: string | null;
@@ -258,6 +260,7 @@ function toPluginCatalogSearchEntry(
     ...(data.categoryId === undefined ? {} : { categoryId: data.categoryId }),
     ...(data.category === undefined ? {} : { category: data.category }),
     screenshots: data.screenshots,
+    ...(data.overview === undefined ? {} : { overview: data.overview }),
     collections: data.collections,
     ...(data.publishedAt === undefined
       ? {}
@@ -271,6 +274,8 @@ function toPluginCatalogSearchEntry(
     official: data.official,
     author: data.author,
     installed: data.installed,
+    installedByDefault: data.installedByDefault,
+    conflictingInstallSource: data.conflictingInstallSource,
     installs: data.installs,
     compatible: data.compatible,
     incompatibleReason: data.incompatibleReason ?? null,
@@ -280,13 +285,14 @@ function toPluginCatalogSearchEntry(
 export interface PluginCatalogSearchData {
   entries: PluginCatalogSearchEntry[];
   collections: PluginCatalogCollection[];
+  categories: PluginMarketplaceCategory[];
 }
 
 export async function searchPluginCatalog(
   fetchImpl: FetchLike,
   query: string,
 ): Promise<PluginCatalogSearchData> {
-  const { results, collections } = await createPluginsClient(
+  const { results, collections, categories } = await createPluginsClient(
     fetchImpl,
   ).catalog.search({
     query,
@@ -294,6 +300,7 @@ export async function searchPluginCatalog(
   return {
     entries: results.map(toPluginCatalogSearchEntry),
     collections,
+    categories,
   };
 }
 

@@ -2,7 +2,6 @@ import { useState, type ReactNode } from "react";
 import type { PromptTextMention, ThreadListEntry } from "@bb/domain";
 import {
   NewThreadPromptBoxUI,
-  type NewThreadBranchConfig,
   type NewThreadEnvironmentConfig,
   type NewThreadModeConfig,
   type NewThreadProjectConfig,
@@ -13,7 +12,6 @@ import {
   HOST_IDS,
   PROJECT_IDS,
   PROJECT_NAMES,
-  STORY_BRANCH_OPTIONS,
   STORY_CLAUDE_CODE_PROVIDER_ID,
   STORY_CURSOR_PROVIDER_ID,
   STORY_PROVIDERS_BY_ID,
@@ -28,6 +26,7 @@ import {
 } from "../../.ladle/story-fixtures";
 import { RootComposeCompactHome } from "./RootComposeCompactHome";
 import { RootComposeMobileRecents } from "./RootComposeMobileRecents";
+import { ThreadActionsProvider } from "@/components/thread/ThreadActionsProvider";
 
 export const projectNamesById = new Map<string, string>([
   [PROJECT_IDS.bb, PROJECT_NAMES.bb],
@@ -64,7 +63,7 @@ export const HOME_THREADS: ThreadListEntry[] = [
     titleFallback: "Reduce style recalculation",
     status: "starting",
     latestAttentionAt: 860,
-    runtime: { displayStatus: "starting", hostReconnectGraceExpiresAt: null },
+    runtime: { displayStatus: "starting" },
   }),
   makeThreadListEntry({
     id: "thr_home_automations",
@@ -114,25 +113,9 @@ const noop = () => {};
 
 const storyEnvironment: NewThreadEnvironmentConfig = {
   value: `host:${HOST_IDS.local}:local`,
-  onChange: noop,
   sources: STORY_PROJECT_SOURCES,
   host: makeHost({ id: HOST_IDS.local }),
   isLocal: true,
-};
-
-const storyBranch: NewThreadBranchConfig = {
-  value: null,
-  currentBranch: "main",
-  isNew: false,
-  options: STORY_BRANCH_OPTIONS,
-  loading: false,
-  currentOptionLabel: "Current: main",
-  placeholder: "Current checkout",
-  triggerLabel: "Current (main)",
-  triggerTitle: "Current: main",
-  onChange: noop,
-  onClear: noop,
-  onCreate: noop,
 };
 
 const storyWorktree: NewThreadWorktreeConfig = {
@@ -149,7 +132,6 @@ const storyProject: NewThreadProjectConfig = {
 
 const storyModeConfig = {
   environment: storyEnvironment,
-  branch: storyBranch,
   worktree: storyWorktree,
   permission: {
     value: "auto",
@@ -177,12 +159,17 @@ export function MobileRecentsVisibilityStyle() {
   );
 }
 
-export function StoryComposer() {
-  const [value, setValue] = useState("");
+export function StoryComposer({
+  initialValue = "",
+}: {
+  initialValue?: string;
+}) {
+  const [value, setValue] = useState(initialValue);
   const [mentionRanges, setMentionRanges] = useState<PromptTextMention[]>([]);
   return (
     <ModelPickerStoryQueryProvider>
       <NewThreadPromptBoxUI
+        mentionMenuPlacement="top"
         id="story-compact-home-composer"
         value={value}
         mentionRanges={mentionRanges}
@@ -210,32 +197,44 @@ export function StoryComposer() {
 
 export function HomeRecents({ threads }: { threads: ThreadListEntry[] }) {
   return (
-    <RootComposeMobileRecents
-      highlightedThreadId={null}
-      projectNamesById={projectNamesById}
-      providersById={STORY_PROVIDERS_BY_ID}
-      showCreatingRow={false}
-      threads={threads}
-    />
+    <ThreadActionsProvider>
+      <RootComposeMobileRecents
+        highlightedThreadId={null}
+        projectNamesById={projectNamesById}
+        providersById={STORY_PROVIDERS_BY_ID}
+        showCreatingRow={false}
+        threads={threads}
+      />
+    </ThreadActionsProvider>
   );
 }
 
 export function CompactHomePage({
   threads = HOME_THREADS,
+  composerValue,
 }: {
   threads?: ThreadListEntry[];
+  composerValue?: string;
 }) {
   return (
-    <RootComposeCompactHome composer={<StoryComposer />}>
+    <RootComposeCompactHome
+      composer={<StoryComposer initialValue={composerValue} />}
+    >
       <HomeRecents threads={threads} />
     </RootComposeCompactHome>
   );
 }
 
-export function PhoneFrame({ children }: { children: ReactNode }) {
+export function PhoneFrame({
+  children,
+  heightClass = "h-[852px]",
+}: {
+  children: ReactNode;
+  heightClass?: string;
+}) {
   return (
     <div
-      className={`${MOBILE_RECENTS_VISIBILITY_CLASS} flex h-[852px] w-[393px] min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-background`}
+      className={`${MOBILE_RECENTS_VISIBILITY_CLASS} flex ${heightClass} w-[393px] min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-background`}
     >
       <MobileRecentsVisibilityStyle />
       {children}

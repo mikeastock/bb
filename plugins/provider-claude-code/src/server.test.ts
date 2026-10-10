@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PluginProviderOptionsContext } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import claudeCodePlugin from "../server.js";
 
@@ -16,7 +17,7 @@ function loadClaudeCodePlugin() {
 
 function providerOptions(
   declaration: ReturnType<typeof loadClaudeCodePlugin>["declaration"],
-  settings: Readonly<Record<string, string | boolean | undefined>>,
+  settings: PluginProviderOptionsContext["settings"],
 ) {
   const deriveProviderOptions = declaration.deriveProviderOptions;
   if (deriveProviderOptions === undefined) {
@@ -32,24 +33,28 @@ function providerOptions(
 }
 
 describe("the Claude Code provider settings", () => {
-  it("keeps idle query release off by default and derives an explicit opt-in", () => {
+  it.each(["chromeEnabled", "disable1MContext"])(
+    "keeps %s off by default and derives an explicit opt-in",
+    (key) => {
+      const { declaration, host } = loadClaudeCodePlugin();
+
+      expect(host.harness.registrations.settingsDescriptors[key]).toMatchObject(
+        { type: "boolean", default: false },
+      );
+      expect(providerOptions(declaration, {})[key]).toBe(false);
+      expect(providerOptions(declaration, { [key]: true })[key]).toBe(true);
+    },
+  );
+
+  it("keeps the Claude Code sandbox on by default and derives an explicit opt-out", () => {
     const { declaration, host } = loadClaudeCodePlugin();
 
     expect(
-      host.harness.registrations.settingsDescriptors.idleQueryReleaseEnabled,
-    ).toEqual({
-      type: "boolean",
-      label: "Release idle Claude processes",
-      description:
-        "Close a quiescent Claude Code process after 30 seconds and resume it on the next turn.",
-      default: false,
-    });
-    expect(providerOptions(declaration, {}).idleQueryReleaseEnabled).toBe(
-      false,
-    );
+      host.harness.registrations.settingsDescriptors.sandboxEnabled,
+    ).toMatchObject({ type: "boolean", default: true });
+    expect(providerOptions(declaration, {}).sandboxEnabled).toBe(true);
     expect(
-      providerOptions(declaration, { idleQueryReleaseEnabled: true })
-        .idleQueryReleaseEnabled,
-    ).toBe(true);
+      providerOptions(declaration, { sandboxEnabled: false }).sandboxEnabled,
+    ).toBe(false);
   });
 });

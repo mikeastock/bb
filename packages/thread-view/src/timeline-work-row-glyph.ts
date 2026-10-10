@@ -21,6 +21,7 @@ export type TimelineWorkRowGlyph =
   | "Globe"
   | "ListTodo"
   | "Lock"
+  | "Palette"
   | "Puzzle"
   | "Search"
   | "Terminal"
@@ -101,6 +102,8 @@ function fallbackGlyphForWorkRow(
       return "Search";
     case "web-fetch":
       return "Globe";
+    case "image-generation":
+      return "Palette";
     case "image-view":
       return "File";
     case "delegation":
@@ -117,6 +120,8 @@ function fallbackGlyphForWorkRow(
       return "Lock";
     case "question":
       return "CircleQuestion";
+    case "form":
+      return "Puzzle";
     default:
       return assertNever(row);
   }

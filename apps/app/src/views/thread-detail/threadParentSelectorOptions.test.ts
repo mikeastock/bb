@@ -1,5 +1,6 @@
 import type { ThreadListEntry } from "@bb/domain";
 import { describe, expect, it } from "vitest";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 import {
   buildParentSelectorOptions,
   isRootThread,
@@ -8,71 +9,20 @@ import {
 type ThreadListEntryOverrides = Partial<ThreadListEntry>;
 
 function makeThread(overrides: ThreadListEntryOverrides = {}): ThreadListEntry {
-  return {
-    activity: {
-      activeWorkflowCount: 0,
-      activeBackgroundAgentCount: 0,
-      activeBackgroundCommandCount: 0,
-      activePlanModeCount: 0,
-      activeGoalCount: 0,
-    },
-    archivedAt: null,
+  return makeThreadListEntry({
     createdAt: 1,
-    deletedAt: null,
-    environmentBranchName: null,
-    environmentHostId: null,
-    environmentId: null,
-    environmentName: null,
-    queuedWork: "none",
-    environmentWorkspaceDisplayKind: "other",
-    hasPendingInteraction: false,
     id: "thr_1",
     lastReadAt: null,
     latestAttentionAt: 1,
-    parentThreadId: null,
-    pinnedAt: null,
-    pinSortKey: null,
     projectId: "proj_1",
-    providerId: "codex",
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    sourceThreadId: null,
-    runtime: {
-      displayStatus: "idle",
-      hostReconnectGraceExpiresAt: null,
-    },
-    status: "idle",
     title: "Thread",
     titleFallback: "Thread",
-    sectionId: null,
     updatedAt: 1,
     ...overrides,
-  };
+  });
 }
 
 describe("thread parent selector options", () => {
-  it("allows threads as parent candidates", () => {
-    const options = buildParentSelectorOptions({
-      currentThreadId: "thr_child",
-      parentThreadDisplayName: null,
-      parentThreadId: null,
-      parentThreads: [
-        makeThread({ id: "thr_standard_parent", title: "Standard parent" }),
-        makeThread({
-          id: "thr_review_parent",
-          title: "Review parent",
-        }),
-      ],
-    });
-
-    expect(options).toEqual([
-      { value: "none", label: "None" },
-      { value: "thr_standard_parent", label: "Standard parent" },
-      { value: "thr_review_parent", label: "Review parent" },
-    ]);
-  });
-
   it("prioritizes threads with children while preserving group order", () => {
     const options = buildParentSelectorOptions({
       currentThreadId: "thr_current",

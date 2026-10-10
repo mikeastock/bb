@@ -43,7 +43,12 @@ export function isValidGitBranchName(name: GitBranchNameCandidate) {
 export const gitBranchNameSchema = z
   .string()
   .refine(isValidGitBranchName, { message: "Invalid git branch name" });
-export type GitBranchName = z.infer<typeof gitBranchNameSchema>;
+
+export const gitBranchSelectionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("named"), name: gitBranchNameSchema }),
+  z.object({ kind: z.literal("default") }),
+]);
+export type GitBranchSelection = z.infer<typeof gitBranchSelectionSchema>;
 
 export const gitCheckoutRefSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -112,6 +117,7 @@ export type DefaultBranchRelation = z.infer<typeof defaultBranchRelationSchema>;
 export const gitSourceInspectionSchema = z.object({
   checkout: gitCheckoutRefSchema,
   defaultBranch: z.string().min(1).nullable(),
+  isWorktree: z.boolean(),
   defaultBranchRelation: defaultBranchRelationSchema.nullable(),
   hasUncommittedChanges: z.boolean(),
   operation: workspaceGitOperationSchema,
@@ -130,4 +136,3 @@ export const gitBranchOptionsSchema = z.object({
 export const projectSourceCheckoutSchema = gitSourceInspectionSchema.extend(
   gitBranchOptionsSchema.shape,
 );
-export type ProjectSourceCheckout = z.infer<typeof projectSourceCheckoutSchema>;

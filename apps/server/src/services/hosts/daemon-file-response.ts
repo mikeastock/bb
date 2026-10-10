@@ -5,8 +5,9 @@ import { ApiError } from "../../errors.js";
 const OCTET_STREAM_MIME_TYPE = "application/octet-stream";
 const REVALIDATE_CACHE_CONTROL = "private, no-cache";
 
+type HostReadFileResult = HostDaemonOnlineRpcResultByType["host.read_file"];
 export type DaemonFileReadResult =
-  | HostDaemonOnlineRpcResultByType["host.read_file"]
+  | HostReadFileResult
   | HostDaemonOnlineRpcResultByType["host.read_file_relative"];
 
 interface CreateDaemonFileContentResponseOptions {
@@ -29,10 +30,17 @@ export function requestMatchesEntityTag(
   if (trimmed === "*") {
     return true;
   }
-  return trimmed
-    .split(",")
-    .map((tag) => tag.trim().replace(/^W\//u, ""))
-    .includes(entityTag);
+  const opaque = (tag: string): string => tag.trim().replace(/^W\//u, "");
+  return trimmed.split(",").map(opaque).includes(opaque(entityTag));
+}
+
+export function requireDaemonFileContentResult(
+  result: HostReadFileResult,
+): Exclude<HostReadFileResult, { notModified: true }> {
+  if ("notModified" in result) {
+    throw new Error("Unconditional daemon file read returned not modified");
+  }
+  return result;
 }
 
 function buildFileContentHeaders(
@@ -54,6 +62,9 @@ function buildFileContentHeaders(
 }
 
 function decodeDaemonFileContent(result: DaemonFileReadResult): ArrayBuffer {
+  if ("notModified" in result) {
+    throw new Error("Cannot decode a not-modified daemon file result");
+  }
   const bytes =
     result.contentEncoding === "utf8"
       ? Buffer.from(result.content, "utf8")
@@ -68,6 +79,7 @@ export function createDaemonFileContentResponse(
 ): Response {
   const headers = buildFileContentHeaders(result, options);
   if (
+    "notModified" in result ||
     requestMatchesEntityTag(options.ifNoneMatch, daemonFileEntityTag(result))
   ) {
     return new Response(null, { status: 304, headers });

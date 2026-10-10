@@ -3,6 +3,7 @@ import type { TerminalSession } from "@bb/server-contract";
 import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
 import { ThreadTerminalContent } from "./ThreadTerminalContent";
 import type { ThreadTerminalController } from "./useThreadTerminalController";
+import { makeTerminalSession } from "@/test/fixtures/terminal-sessions";
 
 export default {
   title: "terminal/Content",
@@ -10,37 +11,31 @@ export default {
 
 const THREAD_ID = "thr_terminal_story";
 
-const BASE_TERMINAL_SESSION: TerminalSession = {
+const BASE_TERMINAL_SESSION: TerminalSession = makeTerminalSession({
   id: "term_story_1",
   threadId: THREAD_ID,
   environmentId: "env_terminal_story",
   hostId: "host_terminal_story",
   title: "Terminal 1",
   initialCwd: "/Users/michael/project",
-  cols: 100,
-  rows: 30,
-  status: "running",
-  exitCode: null,
-  closeReason: null,
   createdAt: 1,
   updatedAt: 1,
-  lastUserInputAt: null,
-};
+});
 
 const RUNNING_SESSION: TerminalSession = {
   ...BASE_TERMINAL_SESSION,
   status: "running",
 };
 
-const DISCONNECTED_SESSION: TerminalSession = {
-  ...BASE_TERMINAL_SESSION,
-  status: "disconnected",
-  updatedAt: 2,
-};
-
 const STARTING_SESSION: TerminalSession = {
   ...BASE_TERMINAL_SESSION,
   status: "starting",
+  updatedAt: 2,
+};
+
+const DISCONNECTED_SESSION: TerminalSession = {
+  ...BASE_TERMINAL_SESSION,
+  status: "disconnected",
   updatedAt: 2,
 };
 
@@ -54,11 +49,8 @@ const EXITED_SESSION: TerminalSession = {
 
 interface MakeControllerArgs {
   activeSession: TerminalSession | null;
-  canCreateTerminal: boolean;
   hasTerminalQueryError: boolean;
-  isCreateTerminalPending: boolean;
   isPanelOpen: boolean;
-  shouldRetainActiveTerminalView?: boolean;
   terminalBodyMessage: string;
 }
 
@@ -67,36 +59,23 @@ interface TerminalContentStageProps {
   controller: ThreadTerminalController;
 }
 
-function noopAction(): void {}
-
-function noopTerminalIdAction(_terminalId: string): void {}
-
 function noopSessionChange(_session: TerminalSession): void {}
 
 function noopTitleChange(_title: string): void {}
 
 function makeController({
   activeSession,
-  canCreateTerminal,
   hasTerminalQueryError,
-  isCreateTerminalPending,
   isPanelOpen,
-  shouldRetainActiveTerminalView = false,
   terminalBodyMessage,
 }: MakeControllerArgs): ThreadTerminalController {
   return {
     activeSession,
-    canCreateTerminal,
     handleActiveTerminalSessionChange: noopSessionChange,
     handleActiveTerminalTitleChange: noopTitleChange,
-    handleActiveTerminalUserInput: noopAction,
-    handleCreateTerminal: noopAction,
-    handleSelectTerminal: noopTerminalIdAction,
     hasTerminalQueryError,
-    isCreateTerminalPending,
     isPanelOpen,
     shouldMountTerminalView: isPanelOpen,
-    shouldRetainActiveTerminalView,
     terminalBodyMessage,
   };
 }
@@ -106,60 +85,34 @@ function terminalController(
 ): ThreadTerminalController {
   return makeController({
     activeSession,
-    canCreateTerminal: true,
     hasTerminalQueryError: false,
-    isCreateTerminalPending: false,
     isPanelOpen: true,
     terminalBodyMessage: "No terminals",
   });
 }
 
-const disconnectedController = terminalController(DISCONNECTED_SESSION);
-
-const disconnectedUnavailableController = makeController({
-  activeSession: DISCONNECTED_SESSION,
-  canCreateTerminal: false,
-  hasTerminalQueryError: false,
-  isCreateTerminalPending: false,
-  isPanelOpen: true,
-  terminalBodyMessage: "No terminals",
-});
-
 const startingController = terminalController(STARTING_SESSION);
 const exitedController = terminalController(EXITED_SESSION);
+const disconnectedController = terminalController(DISCONNECTED_SESSION);
+const reconnectingController = terminalController(RUNNING_SESSION);
 
 const emptyController = makeController({
   activeSession: null,
-  canCreateTerminal: true,
   hasTerminalQueryError: false,
-  isCreateTerminalPending: false,
   isPanelOpen: true,
   terminalBodyMessage: "No terminals",
-});
-
-const startingEmptyController = makeController({
-  activeSession: null,
-  canCreateTerminal: true,
-  hasTerminalQueryError: false,
-  isCreateTerminalPending: true,
-  isPanelOpen: true,
-  terminalBodyMessage: "Starting terminal...",
 });
 
 const loadingController = makeController({
   activeSession: null,
-  canCreateTerminal: true,
   hasTerminalQueryError: false,
-  isCreateTerminalPending: false,
   isPanelOpen: true,
   terminalBodyMessage: "Starting terminal...",
 });
 
 const queryErrorController = makeController({
   activeSession: null,
-  canCreateTerminal: true,
   hasTerminalQueryError: true,
-  isCreateTerminalPending: false,
   isPanelOpen: true,
   terminalBodyMessage: "No terminals",
 });
@@ -193,15 +146,6 @@ function RunningTerminalPreview() {
 export function Overview() {
   return (
     <StoryCard labelWidth="190px">
-      <StoryRow label="disconnected" hint="Replacement available.">
-        <TerminalContentStage controller={disconnectedController} />
-      </StoryRow>
-      <StoryRow
-        label="disconnected, unavailable"
-        hint="No replacement available."
-      >
-        <TerminalContentStage controller={disconnectedUnavailableController} />
-      </StoryRow>
       <StoryRow label="starting" hint="Session exists but is not running yet.">
         <TerminalContentStage controller={startingController} />
       </StoryRow>
@@ -211,11 +155,20 @@ export function Overview() {
       >
         <TerminalContentStage controller={exitedController} />
       </StoryRow>
+      <StoryRow
+        label="disconnected"
+        hint="Host dropped; the session is held for reattach."
+      >
+        <TerminalContentStage controller={disconnectedController} />
+      </StoryRow>
+      <StoryRow
+        label="reconnecting"
+        hint="Socket is unreachable for over a second."
+      >
+        <TerminalContentStage controller={reconnectingController} />
+      </StoryRow>
       <StoryRow label="empty" hint="Right panel tab with no visible sessions.">
         <TerminalContentStage controller={emptyController} />
-      </StoryRow>
-      <StoryRow label="starting empty" hint="Create mutation is in flight.">
-        <TerminalContentStage controller={startingEmptyController} />
       </StoryRow>
       <StoryRow label="loading" hint="Initial terminal list query is loading.">
         <TerminalContentStage controller={loadingController} />

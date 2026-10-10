@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -9,14 +15,19 @@ import type { PluginPendingInteractionProps } from "@get-bb/plugin-sdk";
 import {
   resetPluginSlotStoreForTest,
   setPluginSlotRegistrations,
-  type PluginRegistrationSet,
 } from "@/lib/plugin-slots";
 import {
   resetPluginLogoStoreForTest,
   setPluginLogoUrls,
 } from "@/lib/plugin-logos";
+import {
+  markPluginFrontendsSettled,
+  resetPluginFrontendBootStateForTest,
+} from "@/lib/plugin-frontend-boot-state";
 import { resetAllCrashedPluginSlotsForTest } from "../../plugin/PluginSlotMount";
-import { ThreadPendingInteractionBanner } from "./ThreadPendingInteractionBanner";
+import { ThreadPendingInteractionBanners } from "./ThreadPendingInteractionBanner";
+import { makePluginRegistrationSet as registrationSet } from "@/test/fixtures/plugins";
+import { BottomAnchorContext } from "@/components/ui/bottom-anchored-scroll-body";
 
 const mocks = vi.hoisted(() => ({
   resolveMutateAsync: vi.fn(async () => ({})),
@@ -40,6 +51,11 @@ vi.mock(
 vi.mock("@/hooks/mutations/thread-interaction-mutations", () => ({
   useResolveThreadPendingInteraction: () => ({
     mutateAsync: mocks.resolveMutateAsync,
+    isPending: false,
+    error: null,
+  }),
+  useCancelThreadPendingInteraction: () => ({
+    mutate: vi.fn(),
     isPending: false,
     error: null,
   }),
@@ -123,32 +139,51 @@ const pluginRequest: PluginPendingInteraction = {
   payload: { kind: "plugin", title: "Add secrets", data: { fields: ["KEY"] } },
 };
 
-function registrationSet(
-  overrides: Partial<PluginRegistrationSet>,
-): PluginRegistrationSet {
-  return {
-    homepageSections: [],
-    settingsSections: [],
-    navPanels: [],
-    threadPanelActions: [],
-    sidebarFooterActions: [],
-    fileOpeners: [],
-    messageDirectives: [],
-    ...overrides,
-  };
+const commandApproval: PendingInteraction = {
+  ...planReview,
+  id: "pint_cmd",
+  providerId: "acp-cursor",
+  payload: {
+    kind: "approval",
+    reason: "Not in allowlist: bash",
+    availableDecisions: ["allow_once", "allow_for_session", "deny"],
+    subject: {
+      kind: "command",
+      itemId: "call_cmd",
+      command:
+        "`python3 -m unittest discover -s tests 2>&1 | tail -20\necho '=== bash -n ==='\nbash -n install.sh && echo OK\necho '=== watcher untouched ==='\ngit diff --stat -- watcher.py\necho '=== live flag ==='`",
+      cwd: "/home/user/immortal-agents",
+      actions: [
+        {
+          type: "unknown",
+          command:
+            "`python3 -m unittest discover -s tests 2>&1 | tail -20\necho '=== bash -n ==='\nbash -n install.sh && echo OK\necho '=== watcher untouched ==='\ngit diff --stat -- watcher.py\necho '=== live flag ==='`",
+        },
+      ],
+      sessionGrant: null,
+    },
+  },
+};
+
+function bannerElement(interaction: PendingInteraction) {
+  return (
+    <ThreadPendingInteractionBanners
+      interactions={[interaction]}
+      threadId="thr_1"
+    />
+  );
 }
 
 function renderBanner(interaction: PendingInteraction) {
   return render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter>
-        <ThreadPendingInteractionBanner
-          interaction={interaction}
-          threadId="thr_1"
-        />
-      </MemoryRouter>
+      <MemoryRouter>{bannerElement(interaction)}</MemoryRouter>
     </QueryClientProvider>,
   );
+}
+
+function isHidden(element: HTMLElement): boolean {
+  return element.closest("[hidden]") !== null;
 }
 
 afterEach(() => {
@@ -156,6 +191,7 @@ afterEach(() => {
   resetPluginSlotStoreForTest();
   resetPluginLogoStoreForTest();
   resetAllCrashedPluginSlotsForTest();
+  resetPluginFrontendBootStateForTest();
   mocks.resolveMutateAsync.mockClear();
   mocks.stopMutateAsync.mockClear();
 });
@@ -163,7 +199,7 @@ afterEach(() => {
 describe("ThreadPendingInteractionBanner tool-use approval", () => {
   it("renders the ask from the subject's presentation with the permission decisions", () => {
     renderBanner(toolUseApproval);
-    expect(screen.getByText("Creating issue")).toBeTruthy();
+    expect(screen.getAllByText("Creating issue").length).toBeGreaterThan(0);
     const ask = screen.getByTestId("tool-use-ask");
     expect(ask.textContent).toContain("get-bb/bb#42");
     expect(ask.textContent).toContain("Tool: mcp__github__create_issue");
@@ -235,14 +271,16 @@ describe("ThreadPendingInteractionBanner tool-use approval", () => {
 });
 
 describe("ThreadPendingInteractionBanner request family", () => {
-  it("renders a plan review as a request with plan-verdict actions, resolved through today's approval", () => {
+  it("opens a plan review with visible plan-verdict actions without approving it automatically", () => {
     renderBanner(planReview);
-    expect(screen.getByText("Ready to code?")).toBeTruthy();
+    expect(screen.getAllByText("Ready to code?").length).toBeGreaterThan(0);
+    expect(isHidden(screen.getByTestId("plan-review-request"))).toBe(false);
     expect(screen.getByTestId("plan-review-request").textContent).toContain(
       "Read labels from the declaration",
     );
     expect(screen.getByText("/tmp/plans/picker.md")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(mocks.resolveMutateAsync).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
     expect(mocks.resolveMutateAsync).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -259,9 +297,35 @@ describe("ThreadPendingInteractionBanner request family", () => {
     );
   });
 
+  it("allows collapsing a plan review and opens the next plan request independently", () => {
+    const client = new QueryClient();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>{bannerElement(planReview)}</MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    expect(screen.queryByRole("button", { name: "Approve plan" })).toBeNull();
+    expect(mocks.resolveMutateAsync).not.toHaveBeenCalled();
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          {bannerElement({ ...planReview, id: "pint_plan_next" })}
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("button", { name: "Approve plan" })).toBeTruthy();
+    expect(isHidden(screen.getByTestId("plan-review-request"))).toBe(false);
+    expect(mocks.resolveMutateAsync).not.toHaveBeenCalled();
+  });
+
   it("renders a plugin request through the plugin's pendingInteraction slot, keyed by <pluginId>/<kind>", () => {
     function SecretForm({ interaction }: PluginPendingInteractionProps) {
-      return <div data-testid="secret-form">{interaction.title}</div>;
+      return (
+        <div data-testid="secret-form">
+          {interaction.title}:{JSON.stringify(interaction.payload)}
+        </div>
+      );
     }
     setPluginSlotRegistrations(
       "secrets",
@@ -274,7 +338,9 @@ describe("ThreadPendingInteractionBanner request family", () => {
     expect(banner.getAttribute("data-request-kind")).toBe(
       "secrets/secret-request",
     );
-    expect(screen.getByTestId("secret-form").textContent).toBe("Add secrets");
+    expect(screen.getByTestId("secret-form").textContent).toBe(
+      'Add secrets:{"fields":["KEY"]}',
+    );
   });
 
   it("renders a provider's plugin-defined request through the same slot, with the form's data", () => {
@@ -300,10 +366,11 @@ describe("ThreadPendingInteractionBanner request family", () => {
     expect(screen.getByTestId("secret-form").textContent).toBe(
       'Add a token:{"fields":["TOKEN"]}',
     );
-    expect(screen.getByText(/The agent asks through/)).toBeTruthy();
+    expect(screen.getByText(/Asked by the agent through/)).toBeTruthy();
   });
 
   it("backs out of a provider's request by stopping the turn, never by cancelling", () => {
+    markPluginFrontendsSettled();
     renderBanner(providerPluginRequest);
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
@@ -332,5 +399,359 @@ describe("ThreadPendingInteractionBanner presentation detail images", () => {
     const ask = screen.getByTestId("tool-use-ask");
     expect(container.querySelector("img")).toBeNull();
     expect(ask.textContent).toContain("[Image: pixel]");
+  });
+});
+
+describe("ThreadPendingInteractionBanner collapsed strip", () => {
+  it("fits native and plugin interaction shells in the remaining footer space", () => {
+    const observers = new Set<() => void>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        constructor(callback: () => void) {
+          this.callback = callback;
+          observers.add(callback);
+        }
+        observe() {}
+        disconnect() {
+          observers.delete(this.callback);
+        }
+      },
+    );
+    try {
+      const scrollElement = document.createElement("div");
+      Object.defineProperty(scrollElement, "clientHeight", { value: 600 });
+      const question: PendingInteraction = {
+        ...planReview,
+        id: "pint_height_question",
+        resolution: null,
+        payload: {
+          kind: "user_question",
+          questions: [
+            {
+              id: "path",
+              prompt: "Which path?",
+              multiSelect: false,
+              allowFreeText: true,
+              options: [],
+            },
+          ],
+        },
+      };
+      const { container } = render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <BottomAnchorContext.Provider
+              value={{
+                getScrollElement: () => scrollElement,
+                isAtBottom: true,
+                scrollToBottom: () => {},
+                scrollElementIntoView: () => {},
+                scrollElementIntoViewClampedToMaxScroll: () => {},
+                captureScrollAnchor: () => {},
+                holdContentPosition: () => {},
+              }}
+            >
+              <div data-scroll-footer="">
+                {bannerElement(question)}
+                {bannerElement(pluginRequest)}
+              </div>
+            </BottomAnchorContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      const native = screen.getByTestId("user-question-banner");
+      const plugin = screen.getByTestId("plugin-interaction-shell");
+      const footer = container.querySelector("[data-scroll-footer]");
+      if (!footer) throw new Error("Missing footer");
+      Object.defineProperty(footer, "offsetHeight", {
+        configurable: true,
+        value: 1000,
+      });
+      for (const shell of [native, plugin]) {
+        Object.defineProperty(shell, "offsetHeight", {
+          configurable: true,
+          value: 400,
+        });
+      }
+      act(() => {
+        for (const observer of observers) observer();
+      });
+      expect(native.style.maxHeight).toBe("200px");
+      expect(plugin.style.maxHeight).toBe("200px");
+      const toggle = plugin.querySelector('button[aria-expanded="true"]');
+      if (!toggle) throw new Error("Missing disclosure");
+      fireEvent.click(toggle);
+      Object.defineProperty(plugin, "offsetHeight", { value: 100 });
+      Object.defineProperty(footer, "offsetHeight", { value: 700 });
+      act(() => {
+        for (const observer of observers) observer();
+      });
+      expect(plugin.style.maxHeight).toBe("");
+      expect(native.style.maxHeight).toBe("300px");
+      for (const footerHeight of [980, 1000]) {
+        Object.defineProperty(footer, "offsetHeight", { value: footerHeight });
+        act(() => {
+          for (const observer of observers) observer();
+        });
+        expect(native.style.maxHeight).toBe("160px");
+      }
+      fireEvent.click(toggle);
+      act(() => {
+        for (const observer of observers) observer();
+      });
+      expect(native.style.maxHeight).toBe("160px");
+      expect(plugin.style.maxHeight).toBe("160px");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("arrives open with the decisions and collapses to only the label", () => {
+    renderBanner(commandApproval);
+    const banner = screen.getByTestId("approval-banner");
+    expect(banner.hasAttribute("data-expanded")).toBe(true);
+    expect(banner.textContent).toContain("Not in allowlist: bash");
+    expect(banner.textContent).toContain(
+      "python3 -m unittest discover -s tests 2>&1 | tail -20",
+    );
+    expect(isHidden(screen.getByTestId("command-preview"))).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    expect(banner.hasAttribute("data-expanded")).toBe(false);
+    expect(isHidden(screen.getByTestId("command-preview"))).toBe(true);
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(mocks.resolveMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        interactionId: "pint_cmd",
+        resolution: { decision: "allow_once", grantedPermissions: null },
+      }),
+    );
+  });
+
+  it("shows a four-line preview and never repeats the command as an action line", () => {
+    renderBanner(commandApproval);
+    const banner = screen.getByTestId("approval-banner");
+    expect(banner.hasAttribute("data-expanded")).toBe(true);
+    expect(screen.getByText("Approval needed")).toBeTruthy();
+    const preview = screen.getByTestId("command-preview");
+    const pre = preview.querySelector("pre");
+    expect(pre?.textContent).toContain("bash -n install.sh && echo OK");
+    expect(pre?.textContent).toContain("echo '=== watcher untouched ==='");
+    expect(pre?.textContent).not.toContain("git diff --stat -- watcher.py");
+    expect(preview.textContent).not.toContain("Action:");
+    expect(preview.textContent).toContain("/home/user/immortal-agents");
+    fireEvent.click(screen.getByRole("button", { name: "Show 2 more lines" }));
+    expect(preview.querySelector("pre")?.textContent).toContain(
+      "git diff --stat -- watcher.py",
+    );
+    expect(screen.getByRole("button", { name: "Show less" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    expect(banner.hasAttribute("data-expanded")).toBe(false);
+  });
+
+  it("toggles through the title without submitting an approval", () => {
+    renderBanner(commandApproval);
+    const title = screen.getByRole("button", {
+      name: "Approval needed",
+    });
+    title.focus();
+    fireEvent.click(title);
+    const collapsedTitle = screen.getByRole("button", {
+      name: "Approval needed",
+    });
+    expect(collapsedTitle.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(collapsedTitle);
+    fireEvent.click(collapsedTitle);
+    expect(
+      screen
+        .getByRole("button", { name: "Approval needed" })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+    expect(mocks.resolveMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("keeps focus on the disclosure button across toggles so Escape works right after opening", () => {
+    renderBanner(commandApproval);
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    const show = screen.getByRole("button", { name: "Show details" });
+    show.focus();
+    fireEvent.click(show);
+    const hide = screen.getByRole("button", { name: "Hide details" });
+    expect(document.activeElement).toBe(hide);
+    fireEvent.keyDown(hide, { key: "Escape" });
+    expect(
+      screen.getByTestId("approval-banner").hasAttribute("data-expanded"),
+    ).toBe(false);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Show details" }),
+    );
+  });
+
+  it("collapses on Escape while open and reopens when a different request arrives", () => {
+    const client = new QueryClient();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>{bannerElement(commandApproval)}</MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Deny" }), {
+      key: "Escape",
+    });
+    expect(
+      screen.getByTestId("approval-banner").hasAttribute("data-expanded"),
+    ).toBe(false);
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          {bannerElement({ ...commandApproval, id: "pint_cmd_next" })}
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(
+      screen.getByTestId("approval-banner").hasAttribute("data-expanded"),
+    ).toBe(true);
+  });
+
+  it("links to the source thread while open", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ThreadPendingInteractionBanners
+            interactions={[commandApproval]}
+            sourceThread={{
+              href: "/threads/thr_child",
+              title: "Install tools",
+            }}
+            threadId="thr_child"
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(
+      screen
+        .getByRole("link", { name: "From Install tools" })
+        .getAttribute("href"),
+    ).toBe("/threads/thr_child");
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    expect(
+      screen.queryByRole("link", { name: "From Install tools" }),
+    ).toBeNull();
+  });
+
+  it("renders a user question open by default and keeps draft answers across collapse", () => {
+    const question: PendingInteraction = {
+      ...planReview,
+      id: "pint_question",
+      resolution: null,
+      payload: {
+        kind: "user_question",
+        questions: [
+          {
+            id: "path",
+            prompt: "Which path should I take?",
+            shortLabel: "Path",
+            multiSelect: false,
+            allowFreeText: false,
+            options: [{ value: "a", label: "A", description: "Option A" }],
+          },
+        ],
+      },
+    };
+    renderBanner(question);
+    const banner = screen.getByTestId("user-question-banner");
+    expect(banner.hasAttribute("data-expanded")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "AOption A" }));
+    expect(
+      screen
+        .getByRole("button", { name: "AOption A" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Hide details" }));
+    expect(banner.hasAttribute("data-expanded")).toBe(false);
+    expect(
+      isHidden(screen.getByRole("button", { name: "AOption A", hidden: true })),
+    ).toBe(true);
+    expect(banner.textContent).toContain("Which path should I take?");
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(
+      screen
+        .getByRole("button", { name: "AOption A" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Submit answer" }));
+    expect(mocks.resolveMutateAsync).toHaveBeenCalledWith({
+      threadId: "thr_1",
+      interactionId: "pint_question",
+      resolution: {
+        kind: "user_answer",
+        answers: { path: { selected: ["a"] } },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(mocks.stopMutateAsync).toHaveBeenCalledWith("thr_1");
+  });
+});
+
+describe("ThreadPendingInteractionBanners", () => {
+  function questionCard(id: string, prompt: string): PendingInteraction {
+    return {
+      id,
+      threadId: "thr_1",
+      turnId: "turn_1",
+      providerId: "claude-code",
+      providerThreadId: "pt_1",
+      providerRequestId: id,
+      status: "pending",
+      statusReason: null,
+      createdAt: 1,
+      resolvedAt: null,
+      resolution: null,
+      payload: {
+        kind: "user_question",
+        questions: [
+          {
+            id: "path",
+            prompt,
+            multiSelect: false,
+            allowFreeText: true,
+            options: [],
+          },
+        ],
+      },
+    };
+  }
+
+  function cards(interactions: PendingInteraction[]) {
+    return (
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ThreadPendingInteractionBanners
+            interactions={interactions}
+            threadId="thr_1"
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+  }
+
+  function expandedStates(): boolean[] {
+    return screen
+      .getAllByTestId("user-question-banner")
+      .map((banner) => banner.hasAttribute("data-expanded"));
+  }
+
+  it("expands the next card once the cards above it are answered", () => {
+    const first = questionCard("pint_first", "First?");
+    const second = questionCard("pint_second", "Second?");
+    const view = render(cards([first, second]));
+
+    expect(expandedStates()).toEqual([true, false]);
+
+    view.rerender(cards([second]));
+
+    expect(expandedStates()).toEqual([true]);
   });
 });

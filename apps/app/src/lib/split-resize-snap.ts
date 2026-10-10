@@ -1,3 +1,4 @@
+import { splitWidthLimits } from "@/lib/split-layout/sizing";
 import { clampSplitPairFraction } from "@/lib/split-layout";
 
 export type SplitResizeAxis = "x" | "y";
@@ -27,6 +28,42 @@ export interface SplitResizeSnapSession {
 export interface SplitResizeGridTarget {
   boundaryIndex: number;
   childCount: number;
+}
+
+interface SplitResizeFlexPair {
+  apply: (fraction: number) => void;
+  restore: () => void;
+}
+
+export function createSplitResizeFlexPair(
+  previous: HTMLElement,
+  next: HTMLElement,
+  ownerWindow: Window = window,
+): SplitResizeFlexPair {
+  const previousGrow = Number.parseFloat(
+    ownerWindow.getComputedStyle(previous).flexGrow,
+  );
+  const nextGrow = Number.parseFloat(
+    ownerWindow.getComputedStyle(next).flexGrow,
+  );
+  const total =
+    Number.isFinite(previousGrow) &&
+    Number.isFinite(nextGrow) &&
+    previousGrow + nextGrow > 0
+      ? previousGrow + nextGrow
+      : 1;
+  const previousFlex = previous.style.flex;
+  const nextFlex = next.style.flex;
+  return {
+    apply: (fraction) => {
+      previous.style.flex = `${total * fraction} 1 0px`;
+      next.style.flex = `${total * (1 - fraction)} 1 0px`;
+    },
+    restore: () => {
+      previous.style.flex = previousFlex;
+      next.style.flex = nextFlex;
+    },
+  };
 }
 
 function createGuide(
@@ -99,6 +136,8 @@ export function createSplitResizeSnapSession(
   const grid = divider.closest<HTMLElement>("[data-split-resize-grid-root]");
   const gridRect = grid?.getBoundingClientRect() ?? null;
   const extent = axisExtent(divider.getBoundingClientRect(), axis);
+  const usesPanelWidthLimits =
+    axis === "x" && divider.matches("[data-panel-resize-snap-handle]");
   const gridCoordinate =
     gridRect === null
       ? null
@@ -129,24 +168,32 @@ export function createSplitResizeSnapSession(
     clear,
     resolve: ({ end, pointer, start }) => {
       const span = end - start;
-      const unsnappedFraction = clampSplitPairFraction(
-        span > 0 ? (pointer - start) / span : 0.5,
+      const contentSpan = span - extent;
+      const panelLimits = usesPanelWidthLimits
+        ? splitWidthLimits(contentSpan)
+        : null;
+      const clamp = (fraction: number) =>
+        panelLimits === null
+          ? clampSplitPairFraction(fraction)
+          : Math.min(panelLimits.max, Math.max(panelLimits.min, fraction));
+      const unsnappedFraction = clamp(
+        contentSpan > 0 ? (pointer - start - extent / 2) / contentSpan : 0.5,
       );
       const previousPointer = lastPointer;
       lastPointer = pointer;
-      const contentSpan = span - extent;
       if (gridCoordinate === null || contentSpan <= 0) {
         releasePending = false;
         snapped = false;
         hideGuide();
         return {
-          coordinate: start + span * unsnappedFraction,
+          coordinate:
+            start + Math.max(0, contentSpan) * unsnappedFraction + extent / 2,
           fraction: unsnappedFraction,
           snapped: false,
         };
       }
 
-      const fraction = clampSplitPairFraction(
+      const fraction = clamp(
         (gridCoordinate - start - extent / 2) / contentSpan,
       );
       const coordinate = start + contentSpan * fraction + extent / 2;
@@ -194,7 +241,8 @@ export function createSplitResizeSnapSession(
         snapped = false;
         hideGuide();
         return {
-          coordinate: start + span * unsnappedFraction,
+          coordinate:
+            start + Math.max(0, contentSpan) * unsnappedFraction + extent / 2,
           fraction: unsnappedFraction,
           snapped: false,
         };

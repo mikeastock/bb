@@ -5,18 +5,21 @@ import type {
   ThreadEvent,
 } from "@bb/domain";
 import { PROVIDER_FORK_VALUES } from "@bb/domain";
-import { pendingInteractionPayloadSchema } from "@bb/domain";
 import {
   BRIDGE_INBOUND_REQUEST_METHODS,
   BRIDGE_NOTIFICATION_METHODS,
   BRIDGE_REQUEST_METHODS,
   bridgeCapabilitiesSchema,
+  errorNotificationSchema,
   initializeResultSchema,
+  interactionRequestParamsSchema,
   negotiateGrammarVersion,
   PROVIDER_BRIDGE_PROTOCOL_VERSION,
   THREAD_DELTA_NOTIFICATION_METHOD,
   providerRecoveryNotificationSchema,
+  sessionReplacedNotificationSchema,
   threadDeltaNotificationParamsSchema,
+  threadIdentityNotificationSchema,
   type BridgeCapabilities,
 } from "@bb/provider-bridge-protocol";
 import {
@@ -71,17 +74,21 @@ export interface BridgeProtocolAdapter {
   ): ProviderInteractiveResponse;
 }
 
-export type BridgeEnforcedCapabilities = Omit<
+export type BridgeEnforcedCapabilities = Pick<
   ProviderCapabilities,
-  "modelCatalogScope"
+  | "supportsServiceTier"
+  | "permissionModes"
+  | "supportsFork"
+  | "supportsThreadArchive"
+  | "supportsThreadRename"
 >;
 
-interface BridgeAdapterCapabilities extends Omit<
+type BridgeAdapterCapabilities = Omit<
   BridgeEnforcedCapabilities,
-  "supportsFork" | "supportsSessionRewind"
-> {
+  "supportsFork"
+> & {
   fork: ProviderFork;
-}
+};
 
 interface BridgeProtocolAdapterOptions {
   id: string;
@@ -89,39 +96,6 @@ interface BridgeProtocolAdapterOptions {
   process: { command: string; args: string[]; env?: Record<string, string> };
   staticProviderOptions?: Record<string, unknown>;
 }
-
-const threadIdentityNotificationParamsSchema = z
-  .object({
-    threadId: z.string().min(1),
-    providerThreadId: z.string().min(1),
-    sessionRestorable: z.boolean().optional(),
-  })
-  .passthrough();
-
-const sessionReplacedNotificationParamsSchema = z
-  .object({
-    threadId: z.string().min(1),
-    providerThreadId: z.string().min(1).nullable(),
-    reason: z.string().min(1),
-    contextLost: z.boolean().default(false),
-  })
-  .passthrough();
-
-const errorNotificationParamsSchema = z
-  .object({
-    threadId: z.string().min(1).optional(),
-    providerThreadId: z.string().min(1).optional(),
-    message: z.string().min(1),
-  })
-  .passthrough();
-
-const interactionRequestParamsSchema = z.object({
-  providerThreadId: z.string().min(1),
-  threadId: z.string().min(1).optional(),
-  turnId: z.union([z.string().min(1), z.null()]),
-  payload: pendingInteractionPayloadSchema,
-  providerNativeIds: z.boolean().optional(),
-});
 
 const providerNativeIdsParamsSchema = z
   .object({ providerNativeIds: z.boolean().optional() })
@@ -136,6 +110,7 @@ function toBridgeWireOptions(
     serviceTier,
     reasoningLevel,
     promptMode,
+    sessionOptions,
     instructions,
     envVars,
     permissionMode,
@@ -152,6 +127,7 @@ function toBridgeWireOptions(
     ...(serviceTier !== undefined ? { serviceTier } : {}),
     ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
     ...(promptMode !== undefined ? { promptMode } : {}),
+    ...(sessionOptions !== undefined ? { sessionOptions } : {}),
     ...(instructions !== undefined ? { instructions } : {}),
     ...(envVars !== undefined ? { envVars } : {}),
     permissionMode,
@@ -170,7 +146,6 @@ export function createBridgeProtocolAdapter(
   const capabilities: BridgeEnforcedCapabilities = {
     ...declaredCapabilities,
     supportsFork: declaredFork !== "none",
-    supportsSessionRewind: declaredFork === "checkpoint",
   };
   function effectiveFork(): ProviderFork {
     return PROVIDER_FORK_VALUES.indexOf(handshake.fork) <
@@ -190,6 +165,33 @@ export function createBridgeProtocolAdapter(
     return { kind: "noop", reason: `${capability} not advertised` };
   }
 
+  function cwdAndStaticProviderOptions(cwd: string | undefined) {
+    return {
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(options.staticProviderOptions !== undefined
+        ? { providerOptions: options.staticProviderOptions }
+        : {}),
+    };
+  }
+
+  function sessionConstructionParams(
+    command: Extract<
+      AdapterCommand,
+      { type: "thread/start" | "thread/resume" | "thread/fork" }
+    >,
+  ) {
+    return {
+      options: toBridgeWireOptions(
+        command.options,
+        options.staticProviderOptions,
+      ),
+      ...(command.dynamicTools !== undefined
+        ? { dynamicTools: command.dynamicTools }
+        : {}),
+      instructionMode: command.instructionMode,
+    };
+  }
+
   const adapter: BridgeProtocolAdapter = {
     id: options.id,
     capabilities,
@@ -204,12 +206,7 @@ export function createBridgeProtocolAdapter(
           return {
             kind: "request",
             method: BRIDGE_REQUEST_METHODS.modelList,
-            params: {
-              ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-              ...(options.staticProviderOptions !== undefined
-                ? { providerOptions: options.staticProviderOptions }
-                : {}),
-            },
+            params: cwdAndStaticProviderOptions(command.cwd),
           };
         case "provider/health":
           return {
@@ -217,10 +214,7 @@ export function createBridgeProtocolAdapter(
             method: BRIDGE_REQUEST_METHODS.providerHealth,
             params: {
               providerId: options.id,
-              ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-              ...(options.staticProviderOptions !== undefined
-                ? { providerOptions: options.staticProviderOptions }
-                : {}),
+              ...cwdAndStaticProviderOptions(command.cwd),
             },
           };
         case "provider/usage":
@@ -229,10 +223,7 @@ export function createBridgeProtocolAdapter(
             method: BRIDGE_REQUEST_METHODS.providerUsage,
             params: {
               providerId: options.id,
-              ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-              ...(options.staticProviderOptions !== undefined
-                ? { providerOptions: options.staticProviderOptions }
-                : {}),
+              ...cwdAndStaticProviderOptions(command.cwd),
             },
           };
         case "provider/installation/status":
@@ -241,13 +232,11 @@ export function createBridgeProtocolAdapter(
             method: BRIDGE_REQUEST_METHODS.providerInstallationStatus,
             params: {
               providerId: options.id,
+              checkUpdates: command.checkUpdates,
               ...(command.requirement !== undefined
                 ? { requirement: command.requirement }
                 : {}),
-              ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-              ...(options.staticProviderOptions !== undefined
-                ? { providerOptions: options.staticProviderOptions }
-                : {}),
+              ...cwdAndStaticProviderOptions(command.cwd),
             },
           };
         case "provider/installation/run":
@@ -257,10 +246,7 @@ export function createBridgeProtocolAdapter(
             params: {
               providerId: options.id,
               action: command.action,
-              ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-              ...(options.staticProviderOptions !== undefined
-                ? { providerOptions: options.staticProviderOptions }
-                : {}),
+              ...cwdAndStaticProviderOptions(command.cwd),
             },
           };
         case "skills/configure":
@@ -279,17 +265,7 @@ export function createBridgeProtocolAdapter(
             params: {
               threadId: command.threadId,
               cwd: command.cwd,
-              options: toBridgeWireOptions(
-                command.options,
-                options.staticProviderOptions,
-              ),
-              ...(command.dynamicTools !== undefined
-                ? { dynamicTools: command.dynamicTools }
-                : {}),
-              ...(command.disallowedTools !== undefined
-                ? { disallowedTools: command.disallowedTools }
-                : {}),
-              instructionMode: command.instructionMode,
+              ...sessionConstructionParams(command),
             },
           };
         case "thread/resume":
@@ -300,17 +276,7 @@ export function createBridgeProtocolAdapter(
               threadId: command.threadId,
               cwd: command.cwd,
               providerThreadId: command.providerThreadId,
-              options: toBridgeWireOptions(
-                command.options,
-                options.staticProviderOptions,
-              ),
-              ...(command.dynamicTools !== undefined
-                ? { dynamicTools: command.dynamicTools }
-                : {}),
-              ...(command.disallowedTools !== undefined
-                ? { disallowedTools: command.disallowedTools }
-                : {}),
-              instructionMode: command.instructionMode,
+              ...sessionConstructionParams(command),
             },
           };
         case "thread/fork": {
@@ -341,17 +307,7 @@ export function createBridgeProtocolAdapter(
                       command.sourceProviderCheckpointId,
                   }
                 : {}),
-              options: toBridgeWireOptions(
-                command.options,
-                options.staticProviderOptions,
-              ),
-              ...(command.dynamicTools !== undefined
-                ? { dynamicTools: command.dynamicTools }
-                : {}),
-              ...(command.disallowedTools !== undefined
-                ? { disallowedTools: command.disallowedTools }
-                : {}),
-              instructionMode: command.instructionMode,
+              ...sessionConstructionParams(command),
             },
           };
         }
@@ -522,9 +478,7 @@ export function createBridgeProtocolAdapter(
         });
       }
       if (method === BRIDGE_NOTIFICATION_METHODS.threadIdentity) {
-        const parsed = threadIdentityNotificationParamsSchema.safeParse(
-          event.params,
-        );
+        const parsed = threadIdentityNotificationSchema.safeParse(event.params);
         if (!parsed.success) {
           return [];
         }
@@ -538,15 +492,27 @@ export function createBridgeProtocolAdapter(
         ];
       }
       if (method === BRIDGE_NOTIFICATION_METHODS.sessionReplaced) {
-        const parsed = sessionReplacedNotificationParamsSchema.safeParse(
+        const parsed = sessionReplacedNotificationSchema.safeParse(
           event.params,
         );
         if (
           !parsed.success ||
           parsed.data.providerThreadId === null ||
-          !parsed.data.contextLost
+          (!parsed.data.contextLost && !parsed.data.showRuntimeNote)
         ) {
           return [];
+        }
+        if (!parsed.data.contextLost) {
+          return [
+            {
+              type: "provider/warning",
+              threadId: parsed.data.threadId,
+              providerThreadId: parsed.data.providerThreadId,
+              category: "general",
+              summary: parsed.data.reason,
+              scope: { kind: "thread" },
+            },
+          ];
         }
         return [
           {
@@ -562,7 +528,7 @@ export function createBridgeProtocolAdapter(
         ];
       }
       if (method === BRIDGE_NOTIFICATION_METHODS.error) {
-        const parsed = errorNotificationParamsSchema.safeParse(event.params);
+        const parsed = errorNotificationSchema.safeParse(event.params);
         if (
           !parsed.success ||
           parsed.data.threadId === undefined ||

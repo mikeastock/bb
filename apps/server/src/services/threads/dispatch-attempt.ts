@@ -1,11 +1,14 @@
+import { requestQueuedMachineReadiness } from "./queued-message-dispatch.js";
+import {
+  cancelPreparingMachinePause,
+  isMachineWaitingForExecution,
+} from "../machines/lifecycle.js";
 import {
   deleteClaimedQueuedThreadMessageBatchInTransaction,
   getEnvironment,
   getThread,
-  getThreadPendingStartContext,
   isThreadQueueAutoSendPaused,
   listRunningThreads,
-  setThreadPendingStartContext,
   type ClaimedQueuedThreadMessageRow,
   type RunningThreadRow,
 } from "@bb/db";
@@ -15,15 +18,17 @@ import {
   type QueuedMessagePayload,
   type QueuedMessageWaitingOn,
   type ResolvedThreadExecutionOptions,
+  startedOnBehalfOfSchema,
+  type StartedOnBehalfOf,
   type Thread,
+  type ThreadCreateOrigin,
   type ThreadQueuedMessage,
 } from "@bb/domain";
+import type { SendMessageRequest } from "@bb/server-contract";
 import type {
-  SendMessageRequest,
-  StartedOnBehalfOf,
-  ThreadCreateOrigin,
-} from "@bb/server-contract";
-import { startedOnBehalfOfSchema } from "@bb/server-contract";
+  MessageDispatchHookContext,
+  PluginDispatchEnvironmentIntent,
+} from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { ApiError } from "../../errors.js";
 import type { LoggedPendingInteractionWorkSessionDeps } from "../../types.js";
@@ -32,7 +37,7 @@ import {
   goneThreadEnvironmentDetails,
   throwThreadNotWritable,
 } from "../lib/lifecycle-api-errors.js";
-import { validatePromptAttachmentReferences } from "../projects/attachments.js";
+import { resolvePromptAttachmentReferences } from "../projects/attachments.js";
 import {
   dispatchEnvironmentAndHost,
   dispatchExecutionSources,
@@ -43,6 +48,8 @@ import {
   type DispatchAttemptKind,
 } from "./dispatch-hooks.js";
 import {
+  createQueuedMessageAutoSendPausedError,
+  createQueuedMessageClaimLostError,
   recordQueuedMessageWait,
   settleQueueRowDispatched,
   type QueuedDispatchMessage,
@@ -51,16 +58,19 @@ import { applyLoggedThreadLifecycleEventInTransaction } from "./lifecycle-outcom
 import { buildExecutionOptions } from "./thread-commands.js";
 import { getActiveTurnId, isManualCompactionActive } from "./thread-events.js";
 import { requireThreadCommandEnvironment } from "./thread-command-environment.js";
+import { assertThreadHostAcceptsWork } from "./thread-host-admission.js";
 import {
-  advanceThreadProvisioning,
   requestThreadProvision,
   scheduleThreadProvisioningAdvance,
 } from "./thread-provisioning.js";
 import {
   threadForkDescriptorSchema,
   threadProvisionEnvironmentIntentSchema,
-} from "./thread-provisioning-context.js";
-import { getActiveThreadProvisionContext } from "./thread-provisioning-active-context.js";
+} from "./thread-startup-store.js";
+import {
+  readThreadProvisionContext,
+  readThreadStartupContextOfKind,
+} from "./thread-startup-store.js";
 import {
   buildThreadStatusChangeMetadata,
   toThreadResponseFromThread,
@@ -74,18 +84,11 @@ import {
   sendThreadMessage,
   type SendThreadMessageTransactionPreflight,
 } from "./thread-send.js";
+import { resolveDispatchAuthor } from "./dispatch-author.js";
 import type { TurnRequestRetryMarker } from "./thread-events.js";
+import { restoreInterruptedThreadStartupRequest } from "./thread-provisioning.js";
+import { markTurnTraceSpan } from "../system/turn-trace.js";
 
-/**
- * The half of a never-started thread's first turn that the message itself does
- * not carry: where the thread will run and how it will be established.
- *
- * Persisted on the thread (`threads.pending_start_context`) rather than
- * recomputed, because the live provisioning context is in-memory only and
- * requires the thread to be `starting` — a `pending` thread's first message can
- * wait for a week and across a restart, so an in-memory context would not survive
- * the wait.
- */
 export const pendingThreadStartContextSchema = z.object({
   environmentIntent: threadProvisionEnvironmentIntentSchema,
   fork: threadForkDescriptorSchema.nullable(),
@@ -102,19 +105,60 @@ export function readPendingThreadStartContext(
   deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
   threadId: string,
 ): PendingThreadStartContext | null {
-  const stored = getThreadPendingStartContext(deps.db, threadId);
-  if (stored === null) return null;
-  return pendingThreadStartContextSchema.parse(JSON.parse(stored));
+  return readThreadStartupContextOfKind(
+    deps.db,
+    threadId,
+    "pending",
+    pendingThreadStartContextSchema,
+  );
 }
 
-function hostIdForEnvironmentIntent(
+export function hostIdForEnvironmentIntent(
   deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
   intent: PendingThreadStartContext["environmentIntent"],
 ): string | null {
   if (intent.type === "reuse") {
     return getEnvironment(deps.db, intent.environmentId)?.hostId ?? null;
   }
-  return intent.hostId;
+  return intent.machine.type === "existing" ? intent.machine.hostId : null;
+}
+
+function toPluginEnvironmentIntent(
+  intent: PendingThreadStartContext["environmentIntent"],
+): PluginDispatchEnvironmentIntent {
+  switch (intent.type) {
+    case "reuse":
+      return { kind: "environment", environmentId: intent.environmentId };
+    case "provider":
+      return {
+        kind: "provider",
+        environmentProviderId: intent.environmentProviderId,
+        machine: intent.machine,
+        inputs: intent.inputs,
+      };
+  }
+}
+
+function intendedThreadIntent(
+  deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
+  threadId: string,
+): PendingThreadStartContext["environmentIntent"] | null {
+  return (
+    readThreadProvisionContext(deps.db, threadId)?.request.environmentIntent ??
+    readPendingThreadStartContext(deps, threadId)?.environmentIntent ??
+    null
+  );
+}
+
+export function intendedThreadEnvironmentIntent(
+  deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
+  thread: Pick<Thread, "id" | "environmentId">,
+): PluginDispatchEnvironmentIntent | null {
+  if (thread.environmentId !== null) {
+    return { kind: "environment", environmentId: thread.environmentId };
+  }
+  const intent = intendedThreadIntent(deps, thread.id);
+  return intent === null ? null : toPluginEnvironmentIntent(intent);
 }
 
 /**
@@ -130,11 +174,17 @@ export function intendedThreadHostId(
   deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
   threadId: string,
 ): string | null {
-  const intent =
-    getActiveThreadProvisionContext(threadId)?.request.environmentIntent ??
-    readPendingThreadStartContext(deps, threadId)?.environmentIntent ??
-    null;
+  const intent = intendedThreadIntent(deps, threadId);
   return intent === null ? null : hostIdForEnvironmentIntent(deps, intent);
+}
+
+export function threadTargetHostId(
+  deps: Pick<LoggedPendingInteractionWorkSessionDeps, "db">,
+  thread: Pick<Thread, "id" | "environmentId">,
+): string | null {
+  return thread.environmentId !== null
+    ? (getEnvironment(deps.db, thread.environmentId)?.hostId ?? null)
+    : intendedThreadHostId(deps, thread.id);
 }
 
 /**
@@ -186,6 +236,7 @@ export interface DispatchAttemptArgs {
   startContext?: PendingThreadStartContext;
   /** What the queued row would carry; `retry` for a re-submitted failed turn. */
   queuePayload: QueuedMessagePayload;
+  pluginSubmission: MessageDispatchHookContext["experimental_submission"];
   /** Retry provenance, when this attempt re-submits a failed turn. */
   retryOf?: TurnRequestRetryMarker;
   origin: ThreadCreateOrigin | null;
@@ -229,13 +280,10 @@ export function resolveDispatchAttemptKind(
  * conversation operations — compaction, an edit's re-send — that never come
  * through here at all. The shape is the plan's three steps:
  *
- * 1. **Core waits.** A future `sendAt`, a thread already running a turn this
- *    message did not ask to join, a workspace still provisioning, an
- *    unanswered interaction. Each queues the message with its typed reason and
- *    returns; none of them consults a plugin, because none of them is a
- *    policy — they are the invariants a dispatch cannot violate.
- * 2. **The single plugin pass.** One hook, one chain, `proceed` / `wait` /
- *    `reject`.
+ * 1. **Plugin policy.** One hook pass decides whether the submission may
+ *    proceed before operational state can defer it.
+ * 2. **Core waits.** Scheduling, thread, workspace, host, and interaction
+ *    state queue an admitted message until it can physically run.
  * 3. **Dispatch.** A cleared first attempt moves a `pending` thread to
  *    `starting` and rides the cold-start command; every other cleared attempt
  *    sends or steers exactly as it does today.
@@ -255,16 +303,26 @@ async function runDispatchAttempt(
   args: DispatchAttemptArgs,
   reattempted: boolean,
 ): Promise<DispatchAttemptOutcome> {
-  const { payload, thread } = args;
-  ensureThreadIsWritable(thread);
+  const { thread } = args;
+  let { payload } = args;
+  // A stopping thread is writable HERE and nowhere upstream: the checkpoint
+  // below turns it into a core wait, which is a truthful "not yet" the row can
+  // recover from, rather than the 409 that used to make a stop a dead end for
+  // everything the user lined up behind it.
+  ensureThreadIsWritable(thread, true);
+  assertThreadHostAcceptsWork(deps.db, thread);
   if (args.trigger === "user" && args.source.kind === "inline") {
     // Reject what can never deliver while the sender is still listening; a
     // drain has nobody to tell, and its rows were validated when they were queued.
-    await validatePromptAttachmentReferences({
+    const input = await resolvePromptAttachmentReferences({
+      db: deps.db,
       dataDir: deps.config.dataDir,
       input: payload.input,
       projectId: thread.projectId,
+      hostId: threadTargetHostId(deps, thread),
     });
+    payload = { ...payload, input };
+    args = { ...args, payload };
   }
   const senderThreadId = resolveMessageSenderThreadId(deps, {
     ...(payload.senderThreadId !== undefined
@@ -273,7 +331,27 @@ async function runDispatchAttempt(
     targetThread: thread,
   });
 
-  const firstDispatch = thread.status === "pending";
+  const interruptedStartupRequest =
+    (thread.status === "error" || thread.status === "idle") &&
+    thread.environmentId === null
+      ? await restoreInterruptedThreadStartupRequest(deps, thread.id)
+      : null;
+  const firstDispatch =
+    thread.status === "pending" || interruptedStartupRequest !== null;
+  const retryStartContext: PendingThreadStartContext | null =
+    interruptedStartupRequest === null
+      ? null
+      : {
+          environmentIntent: interruptedStartupRequest.environmentIntent,
+          fork: interruptedStartupRequest.fork,
+          startedOnBehalfOf: args.startedOnBehalfOf,
+          titleProvided: interruptedStartupRequest.titleProvided,
+        };
+  const author = resolveDispatchAuthor({
+    retrying: args.retryOf !== undefined,
+    senderThreadId,
+    startedOnBehalfOf: args.startedOnBehalfOf,
+  });
   const claimed = args.source.kind === "drain" ? args.source.claimed : null;
   const sendNow = args.source.kind === "drain" && args.source.sendNow;
   const respectManualStopPause =
@@ -290,6 +368,9 @@ async function runDispatchAttempt(
     input: payload.input,
     execution,
     senderThreadId,
+    origin: args.origin,
+    originPluginId: args.originPluginId,
+    requestedBy: args.startedOnBehalfOf,
     payload: args.queuePayload,
     systemNotice: null,
   };
@@ -314,100 +395,133 @@ async function runDispatchAttempt(
     return { kind: "queued", entry };
   };
 
-  // --- 1. core waits, in the order a message meets them -------------------
+  // --- 1. plugin policy ---------------------------------------------------
 
-  const sendAt = payload.sendAt ?? null;
-  if (!sendNow && sendAt !== null && sendAt > Date.now()) {
-    return waitOn({ kind: "time" }, sendAt);
-  }
+  const admitted: { value: PendingThreadAdmission | null } = {
+    value: null,
+  };
+  const continued: {
+    outcome: DispatchAttemptOutcome | null;
+    reattemptThread: Thread | null;
+  } = {
+    outcome: null,
+    reattemptThread: null,
+  };
 
-  if (thread.status === "active" && attempt === "start-turn") {
-    if (payload.mode === "start") {
-      // `start` asks for a FRESH turn specifically, so a running one is a
-      // conflict rather than something to wait behind. Unchanged 409.
+  const continueThroughCoreWaits = async (): Promise<void> => {
+    const sendAt = payload.sendAt ?? null;
+    if (!sendNow && sendAt !== null && sendAt > Date.now()) {
+      continued.outcome = waitOn({ kind: "time" }, sendAt);
+      return;
+    }
+
+    if (thread.status === "stopping") {
+      continued.outcome = waitOn({ kind: "stopping" }, null);
+      return;
+    }
+
+    const currentThread = getThread(deps.db, thread.id);
+    if (currentThread === null) {
+      throw new ApiError(404, "thread_not_found", "Thread not found");
+    }
+    if (
+      currentThread.status !== thread.status ||
+      currentThread.archivedAt !== thread.archivedAt ||
+      currentThread.deletedAt !== thread.deletedAt
+    ) {
+      continued.reattemptThread = currentThread;
+      return;
+    }
+
+    if (thread.status === "active" && payload.mode === "start") {
       throwThreadNotWritable(
         thread,
         "already_active",
         "Thread is already active",
       );
     }
-    return waitOn({ kind: "thread-busy" }, null);
-  }
 
-  const { environment: dispatchEnvironment, host: dispatchHost } =
-    dispatchEnvironmentAndHost(deps, thread.environmentId);
-  if (
-    dispatchEnvironment !== null &&
-    goneThreadEnvironmentDetails(dispatchEnvironment) === null &&
-    dispatchHost?.status === "disconnected"
-  ) {
-    return waitOn({ kind: "host-offline", hostName: dispatchHost.name }, null);
-  }
-
-  if (payload.mode !== "start" && isManualCompactionActive(deps, thread)) {
-    return waitOn({ kind: "thread-busy" }, null);
-  }
-  const currentThread = getThread(deps.db, thread.id);
-  if (currentThread === null) {
-    throw new ApiError(404, "thread_not_found", "Thread not found");
-  }
-  if (
-    currentThread.status !== thread.status ||
-    currentThread.archivedAt !== thread.archivedAt ||
-    currentThread.deletedAt !== thread.deletedAt
-  ) {
-    return reattemptDispatchForThreadChange(
-      deps,
-      args,
-      currentThread,
-      reattempted,
-    );
-  }
-  if (
-    currentThread.status === "active" &&
-    resolveDispatchAttemptKind(currentThread, payload.mode) === "join-turn" &&
-    getActiveTurnId(deps, thread.id) === null
-  ) {
-    const outcome = queueInputForStartingTurn(deps, {
-      claimed,
-      input: queuedMessage,
-      threadId: thread.id,
-    });
-    if (outcome.kind === "queued" || outcome.kind === "dispatched") {
-      return outcome;
-    }
-    if (outcome.kind === "retry") {
-      return reattemptDispatchForThreadChange(
-        deps,
-        args,
-        outcome.thread,
-        reattempted,
+    const { environment: dispatchEnvironment, host: dispatchHost } =
+      dispatchEnvironmentAndHost(deps, thread.environmentId);
+    if (
+      dispatchHost !== null &&
+      isMachineWaitingForExecution(deps, dispatchHost.id)
+    ) {
+      cancelPreparingMachinePause(deps, dispatchHost.id);
+      continued.outcome = waitOn(
+        { kind: "host-offline", hostName: dispatchHost.name },
+        null,
       );
+      requestQueuedMachineReadiness(deps, dispatchHost.id);
+      return;
     }
-  }
-  if (!firstDispatch && isPreStartThreadStatus(thread.status)) {
-    // A follow-up or steer sent while the workspace is being (re)provisioned.
-    // The workspace-ready drain re-attempts it; the thread's first message
-    // never lands here, because it rides the cold-start command instead.
-    return waitOn({ kind: "provisioning" }, null);
-  }
-  if (
-    payload.mode !== "start" &&
-    deps.pendingInteractions.hasPendingThreadInteraction(thread.id)
-  ) {
-    return waitOn({ kind: "interaction" }, null);
-  }
 
-  // --- 2. the single plugin pass ------------------------------------------
+    if (thread.status === "active" && attempt === "start-turn") {
+      continued.outcome = waitOn({ kind: "thread-busy" }, null);
+      return;
+    }
 
-  /**
-   * Filled by `commitAdmission` while the pass still holds the evaluation
-   * lock. A holder rather than a bare `let` because the write happens in a
-   * callback, which narrowing cannot see.
-   */
-  const admitted: { ran: boolean; value: PendingThreadAdmission | null } = {
-    ran: false,
-    value: null,
+    if (
+      dispatchEnvironment !== null &&
+      goneThreadEnvironmentDetails(dispatchEnvironment) === null &&
+      dispatchHost !== null &&
+      !deps.hub.hasDaemonForHost(dispatchHost.id)
+    ) {
+      continued.outcome = waitOn(
+        { kind: "host-offline", hostName: dispatchHost.name },
+        null,
+      );
+      return;
+    }
+
+    if (payload.mode !== "start" && isManualCompactionActive(deps, thread)) {
+      continued.outcome = waitOn({ kind: "thread-busy" }, null);
+      return;
+    }
+    if (
+      currentThread.status === "active" &&
+      resolveDispatchAttemptKind(currentThread, payload.mode) === "join-turn" &&
+      getActiveTurnId(deps, thread.id) === null
+    ) {
+      const outcome = queueInputForStartingTurn(deps, {
+        claimed,
+        input: queuedMessage,
+        threadId: thread.id,
+      });
+      if (outcome.kind === "queued" || outcome.kind === "dispatched") {
+        continued.outcome = outcome;
+        return;
+      }
+      if (outcome.kind === "retry") {
+        continued.reattemptThread = outcome.thread;
+        return;
+      }
+    }
+    if (!firstDispatch && isPreStartThreadStatus(thread.status)) {
+      continued.outcome = waitOn({ kind: "provisioning" }, null);
+      return;
+    }
+    if (
+      payload.mode !== "start" &&
+      deps.pendingInteractions.hasTurnBoundPendingThreadInteraction(thread.id)
+    ) {
+      continued.outcome = waitOn({ kind: "interaction" }, null);
+      return;
+    }
+
+    if (firstDispatch) {
+      admitted.value = await admitPendingThread(deps, {
+        claimed,
+        payload: resolvedPayload,
+        respectManualStopPause,
+        startContext: args.startContext ?? retryStartContext,
+        thread,
+      });
+      if (admitted.value === null) {
+        const current = getThread(deps.db, thread.id);
+        continued.reattemptThread = current;
+      }
+    }
   };
 
   if (!sendNow && hasMessageDispatchHooks()) {
@@ -420,6 +534,7 @@ async function runDispatchAttempt(
         thread.environmentId !== null
           ? null
           : intendedThreadHostId(deps, thread.id),
+      environmentIntent: intendedThreadEnvironmentIntent(deps, thread),
       input: payload.input,
       requestedExecution: {
         providerId: thread.providerId,
@@ -432,30 +547,15 @@ async function runDispatchAttempt(
         payload.executionInputSources ?? {},
       ),
       attempt,
+      initiator: author.initiator,
+      senderThreadId: author.senderThreadId,
       origin: args.origin,
       originPluginId: args.originPluginId,
       startedOnBehalfOf: args.startedOnBehalfOf,
       parentThreadId: thread.parentThreadId,
-      queuedMessage:
-        claimed?.[0] === undefined ? null : toThreadQueuedMessage(claimed[0]),
-      // A first dispatch is the admission a limiter is deciding about, so its
-      // `pending → starting` flip is committed here, inside the lock, and the
-      // next handler in line sees it. A follow-up has no transition this side of
-      // the send transaction, so it has nothing to commit.
-      ...(firstDispatch
-        ? {
-            commitAdmission: async () => {
-              admitted.ran = true;
-              admitted.value = await admitPendingThread(deps, {
-                claimed,
-                payload: resolvedPayload,
-                respectManualStopPause,
-                startContext: args.startContext ?? null,
-                thread,
-              });
-            },
-          }
-        : {}),
+      queuedMessages: claimed?.map(toThreadQueuedMessage) ?? [],
+      pluginSubmission: args.pluginSubmission,
+      continueAfterHooks: continueThroughCoreWaits,
     });
     if (outcome.kind === "wait") {
       if (claimed !== null) {
@@ -470,22 +570,26 @@ async function runDispatchAttempt(
         outcome.waiter.sendAt,
       );
     }
+  } else {
+    await continueThroughCoreWaits();
   }
 
-  // --- 3. dispatch --------------------------------------------------------
+  if (continued.outcome !== null) {
+    return continued.outcome;
+  }
+  if (continued.reattemptThread !== null) {
+    return reattemptDispatchForThreadChange(
+      deps,
+      args,
+      continued.reattemptThread,
+      reattempted,
+    );
+  }
+
+  // --- 2. dispatch --------------------------------------------------------
 
   if (firstDispatch) {
-    // Already admitted under the lock when a hook pass ran; admitted here when
-    // no handler is installed or send-now skipped the pass entirely.
-    const admission = admitted.ran
-      ? admitted.value
-      : await admitPendingThread(deps, {
-          claimed,
-          payload: resolvedPayload,
-          respectManualStopPause,
-          startContext: args.startContext ?? null,
-          thread,
-        });
+    const admission = admitted.value;
     if (admission === null) {
       // The thread left `pending` underneath this attempt — a concurrent
       // attempt admitted it, or it was archived. Nothing was consumed and
@@ -500,28 +604,46 @@ async function runDispatchAttempt(
     return { kind: "dispatched" };
   }
 
+  markTurnTraceSpan("dispatch.checkpoint.done");
   const environment = await requireThreadCommandEnvironment(deps, { thread });
-  await sendThreadMessage(deps, {
-    environment,
-    payload: resolvedPayload,
-    thread,
-    trigger: args.trigger,
-    ...(args.retryOf !== undefined ? { retryOf: args.retryOf } : {}),
-    ...(claimed === null
-      ? {}
-      : {
-          beforeAppendInTransaction: consumeClaimedRows(
+  try {
+    await sendThreadMessage(deps, {
+      environment,
+      payload: resolvedPayload,
+      thread,
+      trigger: args.trigger,
+      ...(args.retryOf !== undefined ? { retryOf: args.retryOf } : {}),
+      beforeAppendInTransaction: ({ tx }) => {
+        if (getThread(tx, thread.id)?.status !== thread.status) {
+          throw new DispatchThreadStatusChangedError();
+        }
+        if (claimed !== null) {
+          consumeClaimedRows(
             claimed,
             thread.id,
             respectManualStopPause,
-          ),
-        }),
-  });
+          )({ tx });
+        }
+      },
+    });
+  } catch (error) {
+    if (!(error instanceof DispatchThreadStatusChangedError)) {
+      throw error;
+    }
+    return reattemptDispatchForThreadChange(
+      deps,
+      args,
+      getThread(deps.db, thread.id),
+      reattempted,
+    );
+  }
   if (claimed !== null) {
     settleQueueRowDispatched({ row: claimed[0]! });
   }
   return { kind: "dispatched" };
 }
+
+class DispatchThreadStatusChangedError extends Error {}
 
 function reattemptDispatchForThreadChange(
   deps: LoggedPendingInteractionWorkSessionDeps,
@@ -555,21 +677,13 @@ function consumeClaimedRows(
 ): SendThreadMessageTransactionPreflight {
   return ({ tx }) => {
     if (respectManualStopPause && isThreadQueueAutoSendPaused(tx, threadId)) {
-      throw new ApiError(
-        409,
-        "queued_message_auto_send_paused",
-        "Queued message auto-send was paused by a manual stop",
-      );
+      throw createQueuedMessageAutoSendPausedError();
     }
     const consumed = deleteClaimedQueuedThreadMessageBatchInTransaction(tx, {
       queuedMessages: claimed,
     });
     if (!consumed) {
-      throw new ApiError(
-        409,
-        "queued_message_claim_lost",
-        "Queued message claim expired before it could be sent",
-      );
+      throw createQueuedMessageClaimLostError();
     }
   };
 }
@@ -583,15 +697,8 @@ interface AdmitPendingThreadArgs {
   thread: Thread;
 }
 
-/**
- * What a committed admission hands to the launch half: everything already
- * resolved, so launching cannot fail its way back into `pending`.
- */
 interface PendingThreadAdmission {
   claimedRow: ClaimedQueuedThreadMessageRow | null;
-  execution: Awaited<ReturnType<typeof buildExecutionOptions>>;
-  input: PromptInput[];
-  startContext: PendingThreadStartContext;
   startingThread: Thread;
 }
 
@@ -642,7 +749,7 @@ async function admitPendingThread(
     threadId: args.thread.id,
   });
   const claimedRow = args.claimed?.[0] ?? null;
-  let startingThread: Thread | null;
+  let startingThread: Thread;
   try {
     startingThread = deps.db.transaction(
       (tx) => {
@@ -664,11 +771,21 @@ async function admitPendingThread(
         if (!prepared.applied) {
           throw new PendingThreadAdmissionLost();
         }
-        setThreadPendingStartContext(tx, {
-          threadId: args.thread.id,
-          pendingStartContext: null,
+        const starting = getThread(tx, args.thread.id);
+        if (starting === null) throw new PendingThreadAdmissionLost();
+        requestThreadProvision(deps, {
+          thread: starting,
+          environmentIntent: startContext.environmentIntent,
+          execution,
+          fork: startContext.fork,
+          input: args.payload.input,
+          ...(startContext.providerInput === undefined
+            ? {}
+            : { providerInput: startContext.providerInput }),
+          startedOnBehalfOf: startContext.startedOnBehalfOf,
+          titleProvided: startContext.titleProvided,
         });
-        return getThread(tx, args.thread.id);
+        return starting;
       },
       { behavior: "immediate" },
     );
@@ -684,9 +801,6 @@ async function admitPendingThread(
     );
     return null;
   }
-  if (!startingThread) {
-    return null;
-  }
   deps.hub.notifyThread(
     startingThread.id,
     ["status-changed"],
@@ -694,52 +808,19 @@ async function admitPendingThread(
   );
   return {
     claimedRow,
-    execution,
-    input: args.payload.input,
-    startContext,
     startingThread,
   };
 }
 
-/**
- * The launching half: the existing provisioning machinery takes over with the
- * message riding the cold-start command, exactly as creation has always done
- * it. Deliberately outside the evaluation lock — provisioning can take as long
- * as a clone, and holding the lock across it would stall every other dispatch
- * in the server.
- */
 async function launchAdmittedThread(
   deps: LoggedPendingInteractionWorkSessionDeps,
   admission: PendingThreadAdmission,
 ): Promise<void> {
-  const { claimedRow, startContext, startingThread } = admission;
-  const context = requestThreadProvision(deps, {
-    thread: startingThread,
-    environmentIntent: startContext.environmentIntent,
-    execution: admission.execution,
-    fork: startContext.fork,
-    input: admission.input,
-    ...(startContext.providerInput !== undefined
-      ? { providerInput: startContext.providerInput }
-      : {}),
-    startedOnBehalfOf: startContext.startedOnBehalfOf,
-    titleProvided: startContext.titleProvided,
-  });
+  const { claimedRow, startingThread } = admission;
   if (claimedRow !== null) {
     settleQueueRowDispatched({ row: claimedRow });
   }
-  if (startContext.environmentIntent.type === "direct-personal") {
-    // A personal workspace needs no worktree, so provisioning it is fast and
-    // the caller is told about a failure synchronously instead of finding the
-    // thread in `error` afterwards. Every other intent is driven off this
-    // stack, because it can take as long as a clone.
-    await advanceThreadProvisioning(deps, {
-      context,
-      threadId: startingThread.id,
-    });
-    return;
-  }
-  scheduleThreadProvisioningAdvance(deps, context, startingThread.id);
+  scheduleThreadProvisioningAdvance(deps, startingThread.id);
 }
 
 /**

@@ -1,5 +1,8 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import {
+  createFakePluginHost,
+  makeHostResponse,
+} from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import plugin from "./server.js";
 
@@ -13,9 +16,7 @@ type RealtimeConnectionSubscription = Extract<
   { event: "realtime:connection" }
 >;
 type SdkSubscription = Parameters<BbPluginApi["sdk"]["subscribe"]>[0];
-type HostRecord = Awaited<
-  ReturnType<BbPluginApi["sdk"]["hosts"]["list"]>
->[number];
+type HostResponse = ReturnType<typeof makeHostResponse>;
 
 function isHostChangedSubscription(
   subscription: SdkSubscription,
@@ -31,19 +32,9 @@ function isRealtimeConnectionSubscription(
 
 function hostRecord(
   id: string,
-  status: HostRecord["status"] = "connected",
-): HostRecord {
-  return {
-    id,
-    name: id,
-    type: "persistent",
-    status,
-    maxPermissionMode: "full",
-    lastSeenAt: null,
-    lastRejectedProtocolVersion: null,
-    createdAt: 1,
-    updatedAt: 1,
-  };
+  status: "connected" | "disconnected" = "connected",
+): HostResponse {
+  return makeHostResponse({ id, name: id, status });
 }
 
 function enabledInput(input: unknown): boolean {
@@ -179,7 +170,7 @@ describe("builtin Keep Awake server entry", () => {
 
   it("reconciles when a host connects after startup", async () => {
     const subscriptions = lifecycleSubscriptions();
-    let status: HostRecord["status"] = "disconnected";
+    let status: HostResponse["status"] = "disconnected";
     const host = createFakePluginHost({
       pluginId: "keep-awake",
       sdk: {
@@ -367,6 +358,38 @@ describe("builtin Keep Awake server entry", () => {
       exitCode: 0,
       stdout: "host-1\nhost-2",
     });
+
+    await host.harness.dispose();
+  });
+
+  it("documents host ids in help and reports errors as JSON", async () => {
+    const host = createFakePluginHost({
+      pluginId: "keep-awake",
+      sdk: { hosts: { list: async () => [] } },
+    });
+    await plugin(host.bb);
+
+    const help = (await host.harness.runCli(["hosts", "--help"])).stdout;
+    expect(help).toContain("bb keep-awake hosts");
+    expect(help).toContain("<host-id...>");
+
+    const envelope = await host.harness.runCli([
+      "hosts",
+      "all",
+      "host-1",
+      "--json",
+    ]);
+    expect(envelope.exitCode).toBe(1);
+    expect(JSON.parse(envelope.stdout)).toMatchObject({
+      ok: false,
+      error: { code: "invalid_host_selection" },
+    });
+    expect(envelope.stderr).toContain(
+      '"all" cannot be combined with individual host ids',
+    );
+    await expect(
+      host.bb.storage.kv.get("configuration"),
+    ).resolves.toBeUndefined();
 
     await host.harness.dispose();
   });

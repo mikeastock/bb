@@ -1,3 +1,4 @@
+import { reportPluginUpdatePhase } from "./plugin-update-progress.js";
 import { PLUGIN_SDK_VERSION } from "@bb/domain";
 import {
   getInstalledPlugin,
@@ -24,10 +25,8 @@ import {
   garbageCollectPluginArtifacts,
   pluginArtifactStorageRoot,
 } from "./plugin-artifact-gc.js";
-import type {
-  PluginRuntimeStatus,
-  PluginServiceDeps,
-} from "./plugin-service-internal.js";
+import type { PluginRuntimeStatus } from "@bb/server-contract";
+import type { PluginServiceDeps } from "./plugin-service-internal.js";
 import type { PluginManifest } from "./manifest.js";
 
 export class PluginActivationRolledBackError extends Error {
@@ -234,6 +233,7 @@ export function createPluginActivation(context: PluginActivationContext) {
       }
       let pointerWritten = false;
       try {
+        reportPluginUpdatePhase("activating");
         await args.beforePersist?.();
         const beforeWrite = getInstalledPlugin(deps.db, args.row.id);
         if (
@@ -255,6 +255,7 @@ export function createPluginActivation(context: PluginActivationContext) {
           rootDir: args.rootDir,
           version: args.manifest.version,
           enabled: args.row.enabled,
+          enabledFollowsDefault: args.row.enabledFollowsDefault,
         });
         pointerWritten = true;
         const current = getInstalledPlugin(deps.db, args.row.id);
@@ -265,6 +266,7 @@ export function createPluginActivation(context: PluginActivationContext) {
           throw new Error(immediate.detail ?? "plugin failed to load");
         }
         if (stabilizationWindowMs > 0) {
+          reportPluginUpdatePhase("checking");
           const failure = await new Promise<string | null>((resolveFailure) => {
             let cancelWindow = () => {};
             const listener = (
@@ -322,6 +324,7 @@ export function createPluginActivation(context: PluginActivationContext) {
             `plugin rollback snapshot ${snapshot.id} could not be marked pending`,
           );
         }
+        reportPluginUpdatePhase("rolling-back");
         await recoverRollbackWithinLifecycle(snapshot.id);
         throw new PluginActivationRolledBackError(
           `activation of ${args.manifest.version} failed and was rolled back: ${detail}; run apply update again to retry explicitly`,

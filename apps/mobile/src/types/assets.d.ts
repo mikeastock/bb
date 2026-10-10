@@ -1,5 +1,7 @@
 declare module "*.css";
-declare module "*.html" {
-  const assetModuleId: number;
-  export default assetModuleId;
+
+declare module "*.png" {
+  import type { ImageSourcePropType } from "react-native";
+  const source: ImageSourcePropType;
+  export default source;
 }

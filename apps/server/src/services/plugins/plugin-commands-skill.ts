@@ -9,6 +9,7 @@ export interface PluginCliContribution {
   name: string;
   summary: string;
   commands: PluginCliCommandInfo[];
+  rendersHelp: boolean;
 }
 
 const SKILL_NAME = "plugin-commands";
@@ -48,7 +49,7 @@ function renderPluginCommandsSkill(
   return [
     "---",
     `name: ${SKILL_NAME}`,
-    "description: CLI commands contributed by installed BB plugins. Use when a task involves one of the plugin commands listed here; run them with bash like any other bb command.",
+    "description: Discover CLI commands contributed by installed BB plugins and their invocation paths.",
     "---",
     "",
     "# Plugin Commands",

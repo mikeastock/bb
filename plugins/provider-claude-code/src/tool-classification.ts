@@ -46,6 +46,10 @@ const claudeBackgroundFlagSchema = z
   .object({ run_in_background: z.boolean().optional() })
   .passthrough();
 
+const claudeSandboxOverrideFlagSchema = z
+  .object({ dangerouslyDisableSandbox: z.boolean().optional() })
+  .passthrough();
+
 const claudeReadArgsSchema = z
   .object({ file_path: z.string().optional(), path: z.string().optional() })
   .passthrough();
@@ -100,6 +104,7 @@ interface ClaudeBashCommand {
   command: string;
   cwd: string | null;
   background: boolean;
+  sandboxOverridden: boolean;
 }
 
 export function parseClaudeBashCommand(
@@ -114,11 +119,15 @@ export function parseClaudeBashCommand(
     return null;
   }
   const background = claudeBackgroundFlagSchema.safeParse(input);
+  const sandboxOverride = claudeSandboxOverrideFlagSchema.safeParse(input);
   return {
     command,
     cwd: toOptionalString(parsed.data.cwd) ?? null,
     background:
       background.success && background.data.run_in_background === true,
+    sandboxOverridden:
+      sandboxOverride.success &&
+      sandboxOverride.data.dangerouslyDisableSandbox === true,
   };
 }
 
@@ -151,7 +160,6 @@ export function parseClaudeMcpToolName(
 }
 
 function mcpTool(
-  toolName: string,
   server: string,
   tool: string,
   args: unknown,
@@ -338,8 +346,9 @@ export function classifyClaudeToolUse(args: {
   toolUseId: string;
   input: unknown;
   injectedTools: ReadonlyMap<string, ClaudeInjectedTool>;
+  sandboxEnabled: boolean;
 }): ClaudeClassifiedTool {
-  const { toolName, toolUseId, input } = args;
+  const { toolName, toolUseId, input, sandboxEnabled } = args;
   switch (toolName) {
     case "Bash": {
       const command = parseClaudeBashCommand(input);
@@ -350,7 +359,10 @@ export function classifyClaudeToolUse(args: {
               command: command.command,
               cwd: command.cwd ?? "",
             },
-            presentation: commandPresentation(command),
+            presentation: commandPresentation({
+              ...command,
+              sandboxEscaped: sandboxEnabled && command.sandboxOverridden,
+            }),
           }
         : genericTool(toolName, input);
     }
@@ -445,7 +457,7 @@ export function classifyClaudeToolUse(args: {
       if (mcp.server === BB_BRIDGE_MCP_SERVER_NAME) {
         return bbTool(mcp.tool, input, args.injectedTools.get(mcp.tool));
       }
-      return mcpTool(toolName, mcp.server, mcp.tool, input);
+      return mcpTool(mcp.server, mcp.tool, input);
     }
   }
 }
@@ -460,7 +472,11 @@ export function classifyClaudeToolResultFallback(
     }
     return {
       shape: { type: "command", command: "", cwd: sessionCwd },
-      presentation: commandPresentation({ command: "", background: false }),
+      presentation: commandPresentation({
+        command: "",
+        background: false,
+        sandboxEscaped: false,
+      }),
     };
   }
   if (

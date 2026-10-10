@@ -5,7 +5,6 @@ import {
   createNodeVerifiedProcessOps,
   stopVerifiedProcess,
   type VerifiedProcessOps,
-  type WaitForProcessExitArgs,
 } from "@bb/config/verified-process-stop";
 import { z } from "zod";
 
@@ -49,14 +48,11 @@ interface ReadOwnedRuntimePidFileArgs {
 }
 
 interface ReapStaleOwnedRuntimeArgs {
-  processOps?: OwnedRuntimeProcessOps;
+  processOps?: VerifiedProcessOps;
   signal: NodeJS.Signals;
   timeoutMs: number;
   userDataPath: string;
 }
-
-export type OwnedRuntimeProcessOps = VerifiedProcessOps;
-export type { WaitForProcessExitArgs };
 
 interface NoStaleOwnedRuntimePidFileResult {
   kind: "no-pid-file";
@@ -85,10 +81,6 @@ interface SkippedStaleOwnedRuntimeResult {
 
 function ownedRuntimePidFilePath(userDataPath: string): string {
   return join(userDataPath, OWNED_RUNTIME_PID_FILE_NAME);
-}
-
-function createNodeOwnedRuntimeProcessOps(): OwnedRuntimeProcessOps {
-  return createNodeVerifiedProcessOps();
 }
 
 export async function writeOwnedRuntimePidFile(
@@ -142,7 +134,7 @@ export async function readOwnedRuntimePidFile(
 export async function reapStaleOwnedRuntime(
   args: ReapStaleOwnedRuntimeArgs,
 ): Promise<ReapStaleOwnedRuntimeResult> {
-  const processOps = args.processOps ?? createNodeOwnedRuntimeProcessOps();
+  const processOps = args.processOps ?? createNodeVerifiedProcessOps();
   const pidFile = await readOwnedRuntimePidFile({
     userDataPath: args.userDataPath,
   });

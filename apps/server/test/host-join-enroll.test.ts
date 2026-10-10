@@ -7,7 +7,7 @@ import {
 } from "@bb/host-daemon-contract";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
-import { errorToResponse } from "../src/errors.js";
+import { createServerErrorHandler } from "../src/errors.js";
 import { TRUSTED_REMOTE_ADDRESS_CONTEXT_KEY } from "../src/request-context.js";
 import { registerInternalHostRoutes } from "../src/internal/hosts.js";
 import type { AppDeps } from "../src/types.js";
@@ -29,7 +29,7 @@ async function parseHostEnrollKeyResponse(response: Response) {
 
 function createInternalHostRouteApp(args: CreateHostRouteAppArgs): Hono {
   const app = new Hono();
-  app.onError((error) => errorToResponse(error, testLogger));
+  app.onError(createServerErrorHandler(testLogger));
   app.use("*", async (context, next) => {
     context.set(TRUSTED_REMOTE_ADDRESS_CONTEXT_KEY, args.trustedRemoteAddress);
     await next();
@@ -157,7 +157,6 @@ describe("host enroll routes", () => {
           body: JSON.stringify({
             hostId: enrollKeyBody.hostId,
             hostName: "real-host-name",
-            hostType: "persistent",
           }),
         },
       );
@@ -186,7 +185,6 @@ describe("host enroll routes", () => {
           body: JSON.stringify({
             hostId: enrollKeyBody.hostId,
             hostName: "real-host-name",
-            hostType: "persistent",
           }),
         },
       );
@@ -211,7 +209,6 @@ describe("host enroll routes", () => {
         body: JSON.stringify({
           hostId: "host_other",
           hostName: "wrong-host",
-          hostType: "persistent",
         }),
       });
 
@@ -245,7 +242,6 @@ describe("host enroll routes", () => {
           body: JSON.stringify({
             hostId: firstEnrollKeyBody.hostId,
             hostName: "stale-enroll-key-host",
-            hostType: "persistent",
           }),
         },
       );
@@ -263,7 +259,6 @@ describe("host enroll routes", () => {
           body: JSON.stringify({
             hostId: secondEnrollKeyBody.hostId,
             hostName: "fresh-enroll-key-host",
-            hostType: "persistent",
           }),
         },
       );
@@ -310,7 +305,6 @@ describe("host enroll routes", () => {
           body: JSON.stringify({
             hostId: enrollKeyBody.hostId,
             hostName: "expired-host",
-            hostType: "persistent",
           }),
         },
       );

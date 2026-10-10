@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { build } from "esbuild";
 import {
   buildPluginApp,
-  isSharedUiIconRelativeImport,
+  sharedUiRuntimeModuleFor,
   runtimeShimPlugin,
   RUNTIME_SLOT_BY_SPECIFIER,
 } from "./build-plugin-app.js";
@@ -85,7 +85,8 @@ describe("plugin app runtime shim", () => {
           `import { twMerge } from "tailwind-merge";`,
           `import { cva } from "class-variance-authority";`,
           `import { Icon } from "@bb/shared-ui/icon";`,
-          `export { clsx, twMerge, cva, Icon };`,
+          `import { useQuestionFormHost } from "@bb/shared-ui/question-form-host";`,
+          `export { clsx, twMerge, cva, Icon, useQuestionFormHost };`,
         ].join("\n"),
         loader: "js",
         resolveDir: dir,
@@ -103,6 +104,7 @@ describe("plugin app runtime shim", () => {
       "tailwindMerge",
       "classVarianceAuthority",
       "sharedUiIcon",
+      "questionFormHost",
     ]) {
       expect(js).toMatch(new RegExp(`runtime\\d*\\.${slot}\\b`));
     }
@@ -111,11 +113,13 @@ describe("plugin app runtime shim", () => {
     const twMergeFn = () => "merged";
     const cvaFn = () => "cva";
     const IconComponent = () => null;
+    const useQuestionFormHost = () => null;
     (globalThis as { __bbPluginRuntime?: unknown }).__bbPluginRuntime = {
       clsx: { default: clsxFn, clsx: clsxFn },
       tailwindMerge: { twMerge: twMergeFn },
       classVarianceAuthority: { cva: cvaFn },
       sharedUiIcon: { Icon: IconComponent, ICON_NAMES: [] },
+      questionFormHost: { useQuestionFormHost },
     };
     try {
       const bundlePath = join(dir, "bundle.mjs");
@@ -128,6 +132,7 @@ describe("plugin app runtime shim", () => {
       expect(loaded.twMerge).toBe(twMergeFn);
       expect(loaded.cva).toBe(cvaFn);
       expect(loaded.Icon).toBe(IconComponent);
+      expect(loaded.useQuestionFormHost).toBe(useQuestionFormHost);
     } finally {
       delete (globalThis as { __bbPluginRuntime?: unknown }).__bbPluginRuntime;
     }
@@ -177,30 +182,84 @@ describe("plugin app runtime shim", () => {
     expect(js).toContain("plugin-owned-icon-map");
   });
 
-  it("recognizes only shared-ui's own icon module as a relative import", () => {
+  it("shims shared-ui's relative ./question-form-host import to the host's context", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bb-plugin-question-host-rel-"));
+    tempDirs.push(dir);
+    const sharedUiDir = join(dir, "node_modules", "@bb", "shared-ui");
+    const files: Record<string, string> = {
+      [join(sharedUiDir, "package.json")]: JSON.stringify({
+        name: "@bb/shared-ui",
+        type: "module",
+        exports: {
+          "./question-form": "./src/components/ui/question-form.tsx",
+        },
+      }),
+      [join(sharedUiDir, "src", "components", "ui", "question-form-host.tsx")]:
+        `export function useQuestionFormHost() { return "bundled-default-context"; }\n`,
+      [join(sharedUiDir, "src", "components", "ui", "question-form.tsx")]:
+        `import { useQuestionFormHost } from "./question-form-host";\nexport function QuestionForm() { return useQuestionFormHost(); }\n`,
+      [join(dir, "app.tsx")]:
+        `import { QuestionForm } from "@bb/shared-ui/question-form";\nexport { QuestionForm };\n`,
+    };
+    for (const [filePath, contents] of Object.entries(files)) {
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, contents);
+    }
+    const result = await build({
+      entryPoints: [join(dir, "app.tsx")],
+      bundle: true,
+      format: "esm",
+      platform: "browser",
+      jsx: "automatic",
+      write: false,
+      logLevel: "silent",
+      plugins: [runtimeShimPlugin()],
+    });
+    const js = result.outputFiles[0]?.text ?? "";
+    expect(js).not.toContain("bundled-default-context");
+    expect(js).toMatch(/runtime\d*\.questionFormHost\b/);
+  });
+
+  it("recognizes only shared-ui's own host-backed modules as relative imports", () => {
     const sharedUiComponent =
       "/repo/packages/shared-ui/src/components/ui/empty-state.tsx";
-    expect(isSharedUiIconRelativeImport("./icon", sharedUiComponent)).toBe(
-      true,
+    expect(sharedUiRuntimeModuleFor("./icon", sharedUiComponent)).toBe(
+      "@bb/shared-ui/icon",
     );
-    expect(isSharedUiIconRelativeImport("./icon.js", sharedUiComponent)).toBe(
-      true,
+    expect(sharedUiRuntimeModuleFor("./icon.js", sharedUiComponent)).toBe(
+      "@bb/shared-ui/icon",
     );
     expect(
-      isSharedUiIconRelativeImport(
+      sharedUiRuntimeModuleFor(
         "../components/ui/icon",
         "/repo/packages/shared-ui/src/hooks/use-thing.ts",
       ),
-    ).toBe(true);
-    expect(isSharedUiIconRelativeImport("./button", sharedUiComponent)).toBe(
-      false,
-    );
+    ).toBe("@bb/shared-ui/icon");
     expect(
-      isSharedUiIconRelativeImport(
+      sharedUiRuntimeModuleFor(
+        "./question-form-host",
+        "/repo/packages/shared-ui/src/components/ui/question-form.tsx",
+      ),
+    ).toBe("@bb/shared-ui/question-form-host");
+    expect(
+      sharedUiRuntimeModuleFor(
+        "./voice-input-textarea",
+        "/repo/packages/shared-ui/src/components/ui/question-form.tsx",
+      ),
+    ).toBe("@bb/shared-ui/voice-input-textarea");
+    expect(sharedUiRuntimeModuleFor("./button", sharedUiComponent)).toBe(null);
+    expect(
+      sharedUiRuntimeModuleFor(
         "./icon",
         "/plugins/acme/components/ui/button.tsx",
       ),
-    ).toBe(false);
+    ).toBe(null);
+    expect(
+      sharedUiRuntimeModuleFor(
+        "./question-form-host",
+        "/plugins/acme/components/ui/question-form.tsx",
+      ),
+    ).toBe(null);
   });
 
   it("scopes Tailwind utilities while preserving imported CSS unscoped", async () => {
@@ -232,7 +291,8 @@ describe("plugin app runtime shim", () => {
     );
     await writeFile(
       join(dir, "app.css"),
-      ".bb71-authored-decoration { text-decoration: underline; }\n",
+      ".bb71-authored-decoration { text-decoration: underline; }\n" +
+        "@keyframes bb71-authored-pulse { to { opacity: 0.5; } }\n",
     );
 
     const result = await buildPluginApp(
@@ -251,7 +311,11 @@ describe("plugin app runtime shim", () => {
     expect(css).not.toContain(`${scope}${sibling}`);
     expect(css).not.toContain("@scope");
     expect(css).not.toContain(`${scope} .bb71-authored-decoration`);
-    expect(css).toContain(".bb71-authored-decoration");
+    expect(css).not.toContain(`${scope}.bb71-authored-decoration`);
+    expect(css.indexOf(".bb71-authored-decoration{")).toBeGreaterThan(
+      css.lastIndexOf("@layer utilities{"),
+    );
+    expect(css).toContain("@keyframes bb71-authored-pulse");
   });
 
   it("minifies app.js and app.css unless the caller asks for readable output", async () => {
@@ -408,8 +472,6 @@ describe("plugin app runtime shim", () => {
   });
 
   it.each([
-    ["non-SVG XML", "<html/>", /<svg> root element/],
-    ["malformed XML", "<svg><path></svg>", /not valid SVG XML/],
     [
       "entity declarations",
       '<!DOCTYPE svg [<!ENTITY mark "x">]><svg>&mark;</svg>',

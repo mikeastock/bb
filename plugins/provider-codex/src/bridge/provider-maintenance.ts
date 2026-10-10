@@ -84,6 +84,7 @@ function codexUpdateCommand(): {
 
 export async function getCodexProviderInstallationStatus(
   requirement?: "thread_rewind",
+  checkUpdates = true,
 ): Promise<ProviderInstallationStatus> {
   const minimumSupportedVersion =
     minimumSupportedVersionForRequirement(requirement);
@@ -91,8 +92,10 @@ export async function getCodexProviderInstallationStatus(
     await Promise.all([
       resolveExecutablePath("codex"),
       commandOutput("codex", ["--version"]),
-      npmLatestVersion(CODEX_NPM_PACKAGE),
-      probeNpmGlobalPackage(CODEX_NPM_PACKAGE),
+      checkUpdates ? npmLatestVersion(CODEX_NPM_PACKAGE) : null,
+      checkUpdates
+        ? probeNpmGlobalPackage(CODEX_NPM_PACKAGE)
+        : { npmBin: null, npmGlobalPackageVersion: null },
     ]);
   const installed = resolvedExecutable !== null || versionOutput !== null;
   const currentVersion = versionFrom(versionOutput);
@@ -194,7 +197,8 @@ function healthResult(
       minimumSupportedVersion: CODEX_MINIMUM_SUPPORTED_VERSION,
       canInstall: true,
       canUpdate: status !== "not_installed",
-      loginCommand: "codex login",
+      loginCommand: "codex login --device-auth",
+      localLoginCommand: "codex login",
     },
   };
 }
@@ -256,6 +260,14 @@ function usageWindow(
 ): ProviderUsageWindow | null {
   if (!value) return null;
   return {
+    kind:
+      value.limit_window_seconds === 18_000
+        ? "five-hour"
+        : value.limit_window_seconds === 86_400
+          ? "daily"
+          : value.limit_window_seconds === 604_800
+            ? "weekly"
+            : "custom",
     label:
       value.limit_window_seconds === 604_800 ? "Weekly limit" : fallbackLabel,
     usedPercent: clampPercent(value.used_percent),
@@ -300,6 +312,9 @@ function normalizeUsage(raw: unknown, email: string | null): ProviderUsage {
     status: "ok",
     accountEmail: email,
     planLabel: planLabel(parsed.data.plan_type),
+    plan: parsed.data.plan_type
+      ? { id: parsed.data.plan_type, multiplier: null }
+      : null,
     windows,
   };
 }
@@ -366,7 +381,12 @@ export async function getCodexProviderUsage(): Promise<ProviderUsageResult> {
     }
     return {
       supported: true,
-      usage: normalizeUsage(await response.json(), credentials.accountEmail),
+      usage: {
+        ...normalizeUsage(await response.json(), credentials.accountEmail),
+        accountKey: credentials.accountId
+          ? `openai:chatgpt:${credentials.accountId}`
+          : null,
+      },
     };
   } catch (error) {
     return {

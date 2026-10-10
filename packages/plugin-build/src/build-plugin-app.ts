@@ -3,51 +3,75 @@ import {
   mkdtemp,
   readFile,
   realpath,
-  rename,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { derivePluginId } from "@bb/domain";
 import type { Metafile, Plugin } from "esbuild";
 import {
   PLUGIN_THEME_CSS,
   TW_ANIMATE_CSS,
 } from "./generated/plugin-theme.generated.js";
+import { renameIntoPlace } from "./rename-into-place.js";
 import { RUNTIME_EXPORT_MANIFEST } from "./generated/runtime-export-manifest.generated.js";
 import { type PluginBuildToolchain } from "./toolchain.js";
 import { createPluginArtifactMeta } from "./plugin-artifact-meta.js";
-import { isRecord, validatePluginBuildManifest } from "./plugin-manifest.js";
+import {
+  isRecord,
+  readPluginPackageJsonFile,
+  resolveManifestEntryFile,
+  validatePluginBuildManifest,
+} from "./plugin-manifest.js";
 import {
   LEGACY_PLUGIN_SDK_APP_SPECIFIER,
   PLUGIN_SDK_APP_SPECIFIER,
   RUNTIME_SLOT_BY_SPECIFIER,
   SHARED_UI_ICON_SPECIFIER,
+  SHARED_UI_QUESTION_FORM_HOST_SPECIFIER,
+  SHARED_UI_VOICE_INPUT_TEXTAREA_SPECIFIER,
 } from "./runtime-shims.mjs";
 import {
   pluginScopeRoots,
   scopePluginUtilities,
 } from "./scope-plugin-utilities.js";
+import {
+  ZOD_LOCALE_STUB_NAMESPACE,
+  zodLocaleStubPlugin,
+} from "./zod-locale-stub.mjs";
 
 export {
   RUNTIME_SLOT_BY_SPECIFIER,
   SHIMMED_TYPE_PACKAGES,
 } from "./runtime-shims.mjs";
 
-const SHARED_UI_ICON_MODULE_SUFFIX = "/shared-ui/src/components/ui/icon";
 const SHARED_UI_SOURCE_IMPORTER = /[\\/]shared-ui[\\/]src[\\/]/;
+const SHARED_UI_RUNTIME_MODULES: ReadonlyMap<string, string> = new Map([
+  ["/shared-ui/src/components/ui/icon", SHARED_UI_ICON_SPECIFIER],
+  [
+    "/shared-ui/src/components/ui/question-form-host",
+    SHARED_UI_QUESTION_FORM_HOST_SPECIFIER,
+  ],
+  [
+    "/shared-ui/src/components/ui/voice-input-textarea",
+    SHARED_UI_VOICE_INPUT_TEXTAREA_SPECIFIER,
+  ],
+]);
 
-export function isSharedUiIconRelativeImport(
+export function sharedUiRuntimeModuleFor(
   importPath: string,
   importer: string,
-): boolean {
-  if (!SHARED_UI_SOURCE_IMPORTER.test(importer)) return false;
+): string | null {
+  if (!SHARED_UI_SOURCE_IMPORTER.test(importer)) return null;
   const resolved = resolve(dirname(importer), importPath)
     .replace(/\\/g, "/")
     .replace(/\.(?:tsx?|jsx?)$/, "");
-  return resolved.endsWith(SHARED_UI_ICON_MODULE_SUFFIX);
+  for (const [suffix, specifier] of SHARED_UI_RUNTIME_MODULES) {
+    if (resolved.endsWith(suffix)) return specifier;
+  }
+  return null;
 }
 
 let freshFacadeImportSequence = 0;
@@ -130,16 +154,18 @@ export function runtimeShimPlugin(pluginSdkAppModuleUrl?: string): Plugin {
         path: args.path,
         namespace: SHIM_NAMESPACE,
       }));
-      build.onResolve({ filter: /(^|\/)icon(\.[jt]sx?)?$/ }, (args) => {
-        if (
-          args.namespace !== "file" ||
-          !args.path.startsWith(".") ||
-          !isSharedUiIconRelativeImport(args.path, args.importer)
-        ) {
-          return undefined;
-        }
-        return { path: SHARED_UI_ICON_SPECIFIER, namespace: SHIM_NAMESPACE };
-      });
+      build.onResolve(
+        { filter: /(^|\/)(icon|question-form-host|voice-input-textarea)(\.[jt]sx?)?$/ },
+        (args) => {
+          if (args.namespace !== "file" || !args.path.startsWith(".")) {
+            return undefined;
+          }
+          const specifier = sharedUiRuntimeModuleFor(args.path, args.importer);
+          return specifier === null
+            ? undefined
+            : { path: specifier, namespace: SHIM_NAMESPACE };
+        },
+      );
       build.onLoad(
         { filter: /.*/, namespace: SHIM_NAMESPACE },
         async (args) => ({
@@ -182,18 +208,7 @@ function readDependencyNames(pkg: Record<string, unknown>): string[] {
 async function readPackageJson(
   filePath: string,
 ): Promise<Record<string, unknown>> {
-  let raw: string;
-  try {
-    raw = await readFile(filePath, "utf8");
-  } catch {
-    throw new Error(`no readable package.json at ${filePath}`);
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`package.json is not valid JSON at ${filePath}`);
-  }
+  const json = await readPluginPackageJsonFile(filePath);
   if (!isRecord(json)) {
     throw new Error(`package.json must contain an object at ${filePath}`);
   }
@@ -280,18 +295,7 @@ async function readPluginAppConfig(rootDir: string): Promise<PluginAppConfig> {
       `no frontend entry: ${packageJsonPath} has no "bb": { "app": "./app.tsx" } field (only plugins with an app entry can be built)`,
     );
   }
-  if (isAbsolute(app)) {
-    throw new Error(`manifest bb.app must be relative, got "${app}"`);
-  }
-  const appEntry = resolve(rootDir, app);
-  if (appEntry !== rootDir && !appEntry.startsWith(rootDir + "/")) {
-    throw new Error(`manifest bb.app escapes the plugin directory: "${app}"`);
-  }
-  try {
-    await stat(appEntry);
-  } catch {
-    throw new Error(`manifest bb.app points at a missing file: ${app}`);
-  }
+  const appEntry = await resolveManifestEntryFile(rootDir, app, "bb.app");
   return {
     appEntry,
     packageName: manifest.name,
@@ -380,7 +384,11 @@ async function bundledInputPaths(
   const paths = new Set<string>();
   await Promise.all(
     Object.keys(metafile.inputs).map(async (input) => {
-      if (input.startsWith(`${SHIM_NAMESPACE}:`) || input.startsWith("(")) {
+      if (
+        input.startsWith(`${SHIM_NAMESPACE}:`) ||
+        input.startsWith(`${ZOD_LOCALE_STUB_NAMESPACE}:`) ||
+        input.startsWith("(")
+      ) {
         return;
       }
       paths.add(await realpath(resolve(absWorkingDir, input)));
@@ -442,7 +450,7 @@ export async function buildPluginApp(
         __BB_PLUGIN_ID__: JSON.stringify(pluginId),
       },
       logLevel: "error",
-      plugins: [runtimeShimPlugin()],
+      plugins: [zodLocaleStubPlugin(), runtimeShimPlugin()],
     });
 
     let authoredCss = "";
@@ -485,9 +493,9 @@ export async function buildPluginApp(
       ) + "\n",
     );
 
-    await rename(stagedJsPath, jsPath);
-    await rename(stagedCssPath, cssPath);
-    await rename(stagedMetaPath, metaPath);
+    await renameIntoPlace(stagedJsPath, jsPath);
+    await renameIntoPlace(stagedCssPath, cssPath);
+    await renameIntoPlace(stagedMetaPath, metaPath);
   } finally {
     await rm(stageDir, { recursive: true, force: true });
   }

@@ -6,29 +6,29 @@ import {
   type Project,
   type PromptInput,
   type Thread,
+  type StartedOnBehalfOf,
+  type ThreadCreateOrigin,
   type ThreadQueuedMessage,
+  type ThreadTurnInitiator,
 } from "@bb/domain";
+import { sliceUtf16Head } from "@bb/text-utils";
 import type {
   ExecutionInputFieldSource,
-  StartedOnBehalfOf,
-  ThreadCreateOrigin,
   ThreadResponse,
 } from "@bb/server-contract";
 import type {
   MessageDispatchHookContext,
   PluginDispatchAttemptKind,
+  PluginDispatchEnvironmentIntent,
   PluginDispatchExecution,
   PluginDispatchExecutionSources,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { ApiError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
+import { toEnvironmentResponse } from "../environments/environment-response.js";
 import { getNonDestroyedHostWithStatus } from "../lib/entity-lookup.js";
-import {
-  pluginHookProvider,
-  type PluginHookProvider,
-  type PluginHookRegistration,
-} from "../plugins/plugin-hook-registry.js";
+import { pluginHookProvider } from "../plugins/plugin-hook-registry.js";
 
 type DispatchHookDeps = Pick<AppDeps, "db" | "hub">;
 
@@ -91,33 +91,20 @@ export interface MessageDispatchHookPassRequest {
    * pool; null when an environment answers instead, or nothing names one.
    */
   intendedHostId: string | null;
+  environmentIntent: PluginDispatchEnvironmentIntent | null;
   input: PromptInput[];
   requestedExecution: PluginDispatchExecution;
   executionSources: PluginDispatchExecutionSources;
   attempt: DispatchAttemptKind;
+  initiator: ThreadTurnInitiator;
+  senderThreadId: string | null;
   origin: ThreadCreateOrigin | null;
   originPluginId: string | null;
   startedOnBehalfOf: StartedOnBehalfOf | null;
   parentThreadId: string | null;
-  /** The queued row being re-attempted; null for an inline first attempt. */
-  queuedMessage: ThreadQueuedMessage | null;
-  /**
-   * Commits this admission BEFORE the evaluation lock releases.
-   *
-   * This is what makes `sdk.threads.listRunning()` exact inside a handler. The
-   * lock already serializes evaluation, but serializing the *questions* is
-   * worthless if the answers land later: five creates arriving together would
-   * each ask "how many are running", each be told the same stale number, and
-   * each be admitted against a limit of two. Committing the thread's
-   * `pending → starting` flip here means attempt N+1 reads a database that
-   * already contains attempt N's admission.
-   *
-   * Run only when the pass yields no waits, and only for an attempt that has a
-   * transition to commit — a warm follow-up's `idle → active` flip lives inside
-   * the send transaction, which needs a prepared host command and therefore
-   * cannot run under this lock. See the exactness note on `listRunning`.
-   */
-  commitAdmission?: () => Promise<void>;
+  queuedMessages: ThreadQueuedMessage[];
+  pluginSubmission: MessageDispatchHookContext["experimental_submission"];
+  continueAfterHooks?: () => Promise<void>;
 }
 
 /**
@@ -185,8 +172,8 @@ export function hasMessageDispatchHooks(): boolean {
  *
  * A handler that limits concurrency is only correct if no two passes
  * interleave, so every pass runs to completion before the next starts — AND,
- * via `commitAdmission`, a cleared attempt's thread-status flip commits before
- * the lock releases. Those two together are what let a handler simply ask the
+ * via `continueAfterHooks`, a cleared attempt's thread-status flip commits
+ * before the lock releases. Those two together are what let a handler ask the
  * server what is running (`sdk.threads.listRunning()`) instead of maintaining
  * its own tally of in-flight `proceed`s: the fact is already true by the time
  * the next handler reads it.
@@ -207,7 +194,10 @@ function withEvaluationLock<T>(run: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function messageDispatchHookFailure(pluginId: string, detail: string): ApiError {
+function messageDispatchHookFailure(
+  pluginId: string,
+  detail: string,
+): ApiError {
   // Fail-closed, mirroring how a throwing `deriveProviderOptions` fails the
   // command: 502 says the failure came from something behind the server rather
   // than from the caller's request, and the plugin is named so the user knows
@@ -226,17 +216,12 @@ function dispatchRejection(pluginId: string, message: string): ApiError {
   });
 }
 
-/** True when `error` is a handler's `reject` decision rather than a failure. */
-export function isDispatchRejectedError(error: unknown): error is ApiError {
-  return error instanceof ApiError && error.body.code === "dispatch_rejected";
-}
-
 /**
  * Runs one handler inside its decision box. A timeout resolves as a failure
  * rather than racing on: the handler's promise may never settle, and the whole
  * point of the box is that the dispatch does not wait on it.
  */
-async function decideWithinBox<T>(
+export async function decideWithinBox<T>(
   run: () => Promise<T>,
   timeoutMs: number,
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
@@ -245,10 +230,11 @@ async function decideWithinBox<T>(
     return await Promise.race([
       run().then(
         (value) => ({ ok: true, value }) as const,
-        (error: unknown) => ({
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        }) as const,
+        (error: unknown) =>
+          ({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }) as const,
       ),
       new Promise<{ ok: false; error: string }>((resolveTimeout) => {
         timer = setTimeout(
@@ -268,18 +254,6 @@ async function decideWithinBox<T>(
 }
 
 /**
- * The handler chain for a hook: plugin install order, which is deterministic
- * and is the only order there is. Nothing reorders it — a chain of pure
- * decisions composes the same way whichever order it runs in, because a
- * `reject` from any handler refuses and a `wait` from any handler queues.
- */
-function orderedHooks(
-  provider: PluginHookProvider,
-): PluginHookRegistration<"message.dispatch">[] {
-  return provider.listHooks("message.dispatch");
-}
-
-/**
  * The environment/host pair a dispatch context carries, resolved the same way
  * for every reader so a queue-failure line names the same host record —
  * including its live connection state — that the hook context did.
@@ -294,7 +268,7 @@ export function dispatchEnvironmentAndHost(
   // The same DTO `GET /threads/:id?include=host` serves, so a handler reading
   // `host.status` sees the live connection state rather than a stored row.
   return {
-    environment,
+    environment: toEnvironmentResponse(deps.db, environment),
     host: getNonDestroyedHostWithStatus(deps, environment.hostId),
   };
 }
@@ -305,6 +279,59 @@ export function dispatchInputText(input: readonly PromptInput[]): string {
     .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join("\n");
+}
+
+/**
+ * Fields no longer in `MessageDispatchHookContext` that core still puts on the
+ * object, so a handler compiled against an older SDK keeps reading them.
+ * `startedOnBehalfOf` said why the THREAD was started, never who sent the
+ * message being decided about; `initiator` and `senderThreadId` answer that.
+ */
+interface DroppedFromContractStillEmitted {
+  startedOnBehalfOf: StartedOnBehalfOf | null;
+  queuedMessage: ThreadQueuedMessage | null;
+}
+
+/**
+ * The author a whole dispatch reports, which a group of queued rows may not
+ * agree on: the drain sends them as one turn and the hook decides once for all
+ * of them. `mixed` says the rows differ, so a handler that cares reads
+ * `queuedMessages` for each row's own author. An inline attempt has no rows and
+ * reports the author the dispatch was requested with.
+ */
+function summarizeDispatchProvenance(
+  request: MessageDispatchHookPassRequest,
+): Pick<
+  MessageDispatchHookContext,
+  "initiator" | "senderThreadId" | "origin" | "originPluginId"
+> {
+  const [first, ...rest] = request.queuedMessages;
+  if (first === undefined) {
+    return {
+      initiator: request.initiator,
+      senderThreadId: request.senderThreadId,
+      origin: request.origin,
+      originPluginId: request.originPluginId,
+    };
+  }
+  return {
+    origin: rest.every((message) => message.origin === first.origin)
+      ? first.origin
+      : "mixed",
+    originPluginId: rest.every(
+      (message) => message.originPluginId === first.originPluginId,
+    )
+      ? first.originPluginId
+      : "mixed",
+    initiator: rest.every((message) => message.initiator === first.initiator)
+      ? first.initiator
+      : "mixed",
+    senderThreadId: rest.every(
+      (message) => message.senderThreadId === first.senderThreadId,
+    )
+      ? first.senderThreadId
+      : "mixed",
+  };
 }
 
 /**
@@ -322,7 +349,13 @@ function buildHookContext(
     deps,
     request.environmentId,
   );
+  const droppedFromContractStillEmitted: DroppedFromContractStillEmitted = {
+    startedOnBehalfOf: request.startedOnBehalfOf,
+    queuedMessage: request.queuedMessages[0] ?? null,
+  };
   return {
+    ...droppedFromContractStillEmitted,
+    ...summarizeDispatchProvenance(request),
     thread: request.threadResponse,
     attempt: request.attempt,
     project: request.project,
@@ -332,17 +365,16 @@ function buildHookContext(
       (request.intendedHostId === null
         ? null
         : getNonDestroyedHostWithStatus(deps, request.intendedHostId)),
+    environmentIntent: request.environmentIntent,
     input: {
       blocks: [...request.input],
       text: dispatchInputText(request.input),
     },
     requestedExecution: { ...request.requestedExecution },
     executionSources: { ...request.executionSources },
-    origin: request.origin,
-    originPluginId: request.originPluginId,
-    startedOnBehalfOf: request.startedOnBehalfOf,
     parentThreadId: request.parentThreadId,
-    queuedMessage: request.queuedMessage,
+    queuedMessages: request.queuedMessages,
+    experimental_submission: request.pluginSubmission,
   };
 }
 
@@ -366,7 +398,7 @@ export async function runMessageDispatchHookPass(
   if (provider === undefined) {
     return { kind: "proceed" };
   }
-  const hooks = orderedHooks(provider);
+  const hooks = provider.listHooks("message.dispatch");
   if (hooks.length === 0) {
     return { kind: "proceed" };
   }
@@ -389,10 +421,7 @@ export async function runMessageDispatchHookPass(
         throw messageDispatchHookFailure(hook.pluginId, invocation.error);
       }
       if (!invocation.value.ok) {
-        throw messageDispatchHookFailure(
-          hook.pluginId,
-          invocation.value.error,
-        );
+        throw messageDispatchHookFailure(hook.pluginId, invocation.value.error);
       }
       const parsed = messageDispatchHookDecisionSchema.safeParse(
         invocation.value.value,
@@ -421,8 +450,7 @@ export async function runMessageDispatchHookPass(
 
     const waiter = waits[0];
     if (waiter === undefined) {
-      // Still inside the lock, deliberately: see `commitAdmission`.
-      await request.commitAdmission?.();
+      await request.continueAfterHooks?.();
       return { kind: "proceed" };
     }
     return { kind: "wait", waiter, additionalWaiters: waits.slice(1) };
@@ -445,7 +473,7 @@ export function dispatchWaitReasonForPass(
       ? outcome.waiter.reason
       : `${outcome.waiter.reason} (also waiting on ${extra})`;
   return reason.length > QUEUED_MESSAGE_WAIT_REASON_MAX_LENGTH
-    ? `${reason.slice(0, QUEUED_MESSAGE_WAIT_REASON_MAX_LENGTH - 1)}…`
+    ? `${sliceUtf16Head(reason, QUEUED_MESSAGE_WAIT_REASON_MAX_LENGTH - 1)}…`
     : reason;
 }
 

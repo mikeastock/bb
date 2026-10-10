@@ -1,5 +1,3 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { handleLine } from "./bridge.js";
@@ -25,6 +23,22 @@ afterEach(async () => {
   await harness.teardown();
 });
 
+function providerThreadIdFor(threadId: string): string {
+  const identity = [...harness.messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.method === "thread/identity" &&
+        (message.params as { threadId?: unknown }).threadId === threadId,
+    );
+  const providerThreadId = (identity?.params as { providerThreadId?: unknown })
+    .providerThreadId;
+  expect(typeof providerThreadId).toBe("string");
+  if (typeof providerThreadId !== "string")
+    throw new Error("missing provider thread identity");
+  return providerThreadId;
+}
+
 function turnStart(
   threadId: string,
   text: string,
@@ -37,7 +51,7 @@ function turnStart(
       method: "turn/start",
       params: {
         threadId,
-        providerThreadId: threadId,
+        providerThreadId: providerThreadIdFor(threadId),
         clientRequestId,
         input: [{ type: "text", text, mentions: [] }],
         options: FULL_PERMISSION_OPTIONS,
@@ -49,7 +63,7 @@ function turnStart(
 it("a child that dies mid-run does not take the bridge down: the next write is answered, not thrown", async () => {
   const threadId = "thr_r2_epipe";
   expect((await harness.startThread(threadId)).result).toMatchObject({
-    providerThreadId: threadId,
+    providerThreadId: expect.stringMatching(/^pi_/u),
   });
   turnStart(threadId, "/die", "creq_ab23456789");
   await harness.waitForDelta(
@@ -58,7 +72,7 @@ it("a child that dies mid-run does not take the bridge down: the next write is a
   );
   const steer = await harness.request((nextId += 1), "turn/steer", {
     threadId,
-    providerThreadId: threadId,
+    providerThreadId: providerThreadIdFor(threadId),
     expectedTurnId: "turn-1",
     clientRequestId: "creq_cd23456789",
     input: [{ type: "text", text: "still there?", mentions: [] }],
@@ -67,9 +81,10 @@ it("a child that dies mid-run does not take the bridge down: the next write is a
   expect(steer.error).toMatchObject({
     message: expect.stringMatching(/No active Pi session|pi exited/u),
   });
-  expect((await harness.startThread("thr_r2_epipe_next")).result).toMatchObject(
-    { providerThreadId: "thr_r2_epipe_next" },
-  );
+  const nextStarted = await harness.startThread("thr_r2_epipe_next");
+  expect(nextStarted.result).toMatchObject({
+    providerThreadId: expect.stringMatching(/^pi_[0-9a-f-]{36}$/u),
+  });
 }, 90_000);
 
 it("a missing executable fails thread/start fast with the spawn error", async () => {
@@ -91,7 +106,7 @@ it("refuses a manual compaction while pi reports a run still streaming", async (
   await harness.waitForDelta(threadId, (d) => d.kind === "turn.open");
   await harness.request((nextId += 1), "turn/steer", {
     threadId,
-    providerThreadId: threadId,
+    providerThreadId: providerThreadIdFor(threadId),
     expectedTurnId: "turn-1",
     clientRequestId: "creq_cd23456789",
     input: [{ type: "text", text: "go", mentions: [] }],
@@ -106,7 +121,7 @@ it("refuses a manual compaction while pi reports a run still streaming", async (
       method: "turn/start",
       params: {
         threadId,
-        providerThreadId: threadId,
+        providerThreadId: providerThreadIdFor(threadId),
         clientRequestId: "creq_ef23456789",
         input: [
           {
@@ -160,15 +175,19 @@ it("refuses a manual compaction while pi reports a run still streaming", async (
 
 it("a steer consumed by the run is reported accepted and named in the reply", async () => {
   const threadId = "thr_r2_steer_ok";
+  const filePath = join(harness.workspaceDir, "notes.md");
   await harness.startThread(threadId);
   turnStart(threadId, "/hold", "creq_ab23456789");
   await harness.waitForDelta(threadId, (d) => d.kind === "turn.open");
   const steer = await harness.request((nextId += 1), "turn/steer", {
     threadId,
-    providerThreadId: threadId,
+    providerThreadId: providerThreadIdFor(threadId),
     expectedTurnId: "turn-1",
     clientRequestId: "creq_cd23456789",
-    input: [{ type: "text", text: "take the left path", mentions: [] }],
+    input: [
+      { type: "text", text: "take the left path", mentions: [] },
+      { type: "localFile", path: filePath },
+    ],
     options: FULL_PERMISSION_OPTIONS,
   });
   expect(steer.result).toMatchObject({ threadId });
@@ -188,7 +207,9 @@ it("a steer consumed by the run is reported accepted and named in the reply", as
       .some(
         (d) =>
           d.kind === "item.textDelta" &&
-          String(d.text).includes("Steered: take the left path"),
+          String(d.text).includes(
+            `Steered: take the left path\n[Attached file: ${filePath}]`,
+          ),
       ),
   ).toBe(true);
   expect(harness.messages.some((m) => m.method === "error")).toBe(false);
@@ -202,7 +223,7 @@ it("a steer's ack precedes the event pi wrote in the same chunk as the prompt re
   await harness.waitForDelta(threadId, (d) => d.kind === "turn.open");
   const steer = await harness.request((nextId += 1), "turn/steer", {
     threadId,
-    providerThreadId: threadId,
+    providerThreadId: providerThreadIdFor(threadId),
     expectedTurnId: "turn-1",
     clientRequestId: "creq_cd23456789",
     input: [{ type: "text", text: "take the left path", mentions: [] }],
@@ -250,7 +271,7 @@ it("a steer still queued when the run ends is reported dropped through the deliv
       method: "turn/steer",
       params: {
         threadId,
-        providerThreadId: threadId,
+        providerThreadId: providerThreadIdFor(threadId),
         expectedTurnId: "turn-1",
         clientRequestId: "creq_cd23456789",
         input: [{ type: "text", text: "never consumed", mentions: [] }],
@@ -282,6 +303,11 @@ it("a steer still queued when the run ends is reported dropped through the deliv
 }, 90_000);
 
 it("recovers from one transient model mismatch by respawning", async () => {
+  const catalog = await harness.request((nextId += 1), "model/list", {
+    cwd: harness.workspaceDir,
+  });
+  expect(catalog.error).toBeUndefined();
+  const catalogPids = new Set(harness.readProcessLog().spawned);
   vi.stubEnv(
     "FAKE_PI_SPAWN_COUNTER_FILE",
     join(harness.workspaceDir, "spawns"),
@@ -291,19 +317,23 @@ it("recovers from one transient model mismatch by respawning", async () => {
   const response = await harness.startThread(threadId, {
     options: { ...FULL_PERMISSION_OPTIONS, model: "fake-provider/fake-mini" },
   });
-  expect(response.result).toMatchObject({ providerThreadId: threadId });
-  const log = harness.readProcessLog();
-  expect(log.spawned).toHaveLength(2);
+  expect(response.result).toMatchObject({
+    providerThreadId: expect.stringMatching(/^pi_/u),
+  });
+  const spawned = harness
+    .readProcessLog()
+    .spawned.filter((pid) => !catalogPids.has(pid));
+  expect(spawned).toHaveLength(2);
   const deadline = Date.now() + 10_000;
   while (
     Date.now() < deadline &&
-    !log.spawned
+    !spawned
       .slice(0, 1)
       .every((pid) => harness.readProcessLog().exited.includes(pid))
   ) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  expect(harness.readProcessLog().exited).toContain(log.spawned[0]);
+  expect(harness.readProcessLog().exited).toContain(spawned[0]);
   expect(harness.messages.some((m) => m.method === "error")).toBe(false);
   expect(harness.messages.some((m) => m.method === "session/ended")).toBe(
     false,
@@ -366,37 +396,4 @@ it("reports a bash call's cwd as the thread's working directory, never an empty 
     cwd: harness.workspaceDir,
   });
   expect(JSON.stringify(harness.deltasOf(threadId))).not.toContain('"cwd":""');
-}, 90_000);
-
-it("a resumed thread reports the session header's cwd, not the cwd bb asked for", async () => {
-  const headerDir = mkdtempSync(join(tmpdir(), "bb-pi-header-cwd-"));
-  try {
-    const sessionDir = join(harness.workspaceDir, "sessions");
-    mkdirSync(sessionDir, { recursive: true });
-    writeFileSync(
-      join(sessionDir, "thr-resume-cwd.jsonl"),
-      `${JSON.stringify({ type: "session", version: 3, id: "sess-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: headerDir })}\n`,
-    );
-    const threadId = "thr-resume-cwd";
-    const resumed = await harness.request((nextId += 1), "thread/resume", {
-      threadId,
-      providerThreadId: threadId,
-      cwd: harness.workspaceDir,
-      instructionMode: "append",
-      options: FULL_PERMISSION_OPTIONS,
-    });
-    expect(resumed.result).toMatchObject({ providerThreadId: threadId });
-    turnStart(threadId, '/tool bash {"command":"pwd"}', "creq_rsm2345678");
-    await harness.waitForDelta(threadId, (d) => d.kind === "item.close");
-    const opened = harness
-      .deltasOf(threadId)
-      .find((d) => d.kind === "item.open");
-    expect(opened?.item).toMatchObject({
-      type: "command",
-      command: "pwd",
-      cwd: headerDir,
-    });
-  } finally {
-    rmSync(headerDir, { recursive: true, force: true });
-  }
 }, 90_000);

@@ -9,6 +9,7 @@ import type {
 } from "../../shared/contract.js";
 import { TASK_PRIORITIES, TASK_STATUSES } from "../../shared/contract.js";
 import type { Preset } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import { useTasksQuery, useTasksRpc } from "../../shell/data.js";
 import {
   PriorityIcon,
@@ -24,21 +25,15 @@ import {
 } from "../list/lib.js";
 import { DispatchControl } from "./threads.js";
 import { DEFAULT_COLOR } from "../manage/shared.js";
-import {
-  BbProjectLinkPicker,
-  bbProjectLinkStateFor,
-  emptyBbProjectLinkState,
-  resolveBbProjectLink,
-  type BbProjectLinkState,
-} from "../manage/bb-project-link.js";
+import { BbProjectLinkPicker } from "../manage/bb-project-link.js";
 import type { BbProjectOption } from "../../shared/contract.js";
-import { Button } from "@bb/shared-ui/button";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
+} from "@/components/ui/dropdown-menu";
 import {
   Command,
   CommandEmpty,
@@ -46,10 +41,14 @@ import {
   CommandInput,
   CommandItem,
   CommandList,
-} from "@bb/shared-ui/command";
-import { Popover, PopoverContent, PopoverTrigger } from "@bb/shared-ui/popover";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 
 export interface TaskPropertyUpdate {
   status?: TaskStatus;
@@ -61,9 +60,11 @@ export interface TaskPropertyUpdate {
 interface TaskPropertiesProps {
   task: Task;
   project: Project | undefined;
+  projects: Project[] | undefined;
   labels: Label[] | undefined;
   threads: TaskThread[];
   onUpdate: (update: TaskPropertyUpdate) => void;
+  onMoveToProject: (projectId: string) => void;
 }
 
 function LabelChip({ label }: { label: Label }) {
@@ -289,7 +290,6 @@ function LabelsMenu({
                 </CommandItem>
               </CommandGroup>
             ) : null}
-            {}
             {labelList.length > 0 ? (
               <CommandGroup>
                 {labelList.map((label) => (
@@ -318,6 +318,78 @@ function LabelsMenu({
   );
 }
 
+function ProjectSwatch({ project }: { project: Project | undefined }) {
+  return (
+    <span
+      aria-hidden
+      className="size-3 shrink-0 rounded-sm"
+      style={{ backgroundColor: project?.color }}
+    />
+  );
+}
+
+function ProjectMenu({
+  task,
+  project,
+  projects,
+  onMoveToProject,
+  triggerClassName,
+}: {
+  task: Task;
+  project: Project | undefined;
+  projects: Project[] | undefined;
+  onMoveToProject: (projectId: string) => void;
+  triggerClassName: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="Move to project"
+          className={triggerClassName}
+        >
+          <ProjectSwatch project={project} />
+          <span className="truncate">{project?.name ?? "…"}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-56 p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Move to project…" />
+          <CommandList>
+            <CommandEmpty>No matching projects.</CommandEmpty>
+            <CommandGroup>
+              {(projects ?? []).map((candidate) => (
+                <CommandItem
+                  key={candidate.id}
+                  value={`${candidate.name} ${candidate.prefix}`}
+                  onSelect={() => {
+                    setOpen(false);
+                    if (candidate.id !== task.projectId) {
+                      onMoveToProject(candidate.id);
+                    }
+                  }}
+                >
+                  <ProjectSwatch project={candidate} />
+                  <span className="flex-1 truncate">{candidate.name}</span>
+                  {candidate.id === task.projectId ? (
+                    <Icon name="Check" className="size-3.5" />
+                  ) : (
+                    <span className="text-2xs text-muted-foreground">
+                      {candidate.prefix}
+                    </span>
+                  )}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function DispatchTargetMenu({
   project,
   bbProjects,
@@ -331,15 +403,12 @@ function DispatchTargetMenu({
 }) {
   const rpc = useTasksRpc();
   const [open, setOpen] = useState(false);
-  const [state, setState] = useState<BbProjectLinkState>(
-    emptyBbProjectLinkState,
-  );
+  const [selection, setSelection] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const linkedBbProjectId = project.linkedBbProjectId;
   const linkedName = bbProjects.find(
     (candidate) => candidate.id === linkedBbProjectId,
   )?.name;
-  const resolved = resolveBbProjectLink(state);
 
   const save = async (linkedId: string | null) => {
     if (saving) return;
@@ -351,9 +420,7 @@ function DispatchTargetMenu({
       });
       setOpen(false);
     } catch (saveError) {
-      onError(
-        saveError instanceof Error ? saveError.message : String(saveError),
-      );
+      onError(errorMessage(saveError));
     } finally {
       setSaving(false);
     }
@@ -363,7 +430,7 @@ function DispatchTargetMenu({
     <Popover
       open={open}
       onOpenChange={(next) => {
-        if (next) setState(bbProjectLinkStateFor(linkedBbProjectId));
+        if (next) setSelection(linkedBbProjectId);
         setOpen(next);
       }}
     >
@@ -387,8 +454,8 @@ function DispatchTargetMenu({
       </PopoverTrigger>
       <PopoverContent align="start" className="w-64 p-3">
         <BbProjectLinkPicker
-          state={state}
-          onStateChange={setState}
+          value={selection}
+          onChange={setSelection}
           bbProjects={bbProjects}
           noneLabel={linkedBbProjectId !== null ? "Unlink" : "Not linked"}
         />
@@ -411,7 +478,7 @@ function DispatchTargetMenu({
             size="sm"
             className="h-7"
             disabled={saving}
-            onClick={() => void save(resolved === "" ? null : resolved)}
+            onClick={() => void save(selection)}
           >
             Save
           </Button>
@@ -427,10 +494,12 @@ const RAIL_ROW_CLASS =
 export function PropertiesRail({
   task,
   project,
+  projects,
   labels,
   threads,
   presets,
   onUpdate,
+  onMoveToProject,
   onError,
   className,
 }: TaskPropertiesProps & {
@@ -488,14 +557,13 @@ export function PropertiesRail({
       <div className="mb-1 mt-3 text-2xs font-semibold text-muted-foreground">
         Project
       </div>
-      <div className="flex items-center gap-2 py-0.5 text-sm">
-        <span
-          aria-hidden
-          className="size-3 shrink-0 rounded-sm"
-          style={{ backgroundColor: project?.color }}
-        />
-        <span className="truncate">{project?.name ?? "…"}</span>
-      </div>
+      <ProjectMenu
+        task={task}
+        project={project}
+        projects={projects}
+        onMoveToProject={onMoveToProject}
+        triggerClassName={RAIL_ROW_CLASS}
+      />
 
       <div className="mb-1 mt-3 text-2xs font-semibold text-muted-foreground">
         Dispatch target
@@ -554,12 +622,15 @@ const CHIP_CLASS =
 
 export function InlineProperties({
   task,
+  project,
+  projects,
   labels,
   presets,
   onUpdate,
+  onMoveToProject,
   onError,
   className,
-}: Omit<TaskPropertiesProps, "project" | "threads"> & {
+}: Omit<TaskPropertiesProps, "threads"> & {
   presets: Preset[] | undefined;
   onError: (message: string) => void;
   className?: string;
@@ -569,6 +640,13 @@ export function InlineProperties({
   );
   return (
     <div className={cn("flex flex-wrap items-center gap-1.5", className)}>
+      <ProjectMenu
+        task={task}
+        project={project}
+        projects={projects}
+        onMoveToProject={onMoveToProject}
+        triggerClassName={CHIP_CLASS}
+      />
       <StatusMenu
         task={task}
         onUpdate={onUpdate}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { Host } from "@bb/domain";
 import type {
   CliSkillMachineStatus,
@@ -13,7 +13,7 @@ import {
 import { appToast } from "@/components/ui/app-toast";
 import { InstallCliSkillsDialog } from "@/components/settings/InstallCliSkillsDialog";
 import { useInstallCliSkills } from "@/hooks/mutations/settings-mutations";
-import { useHosts } from "@/hooks/queries/host-queries";
+import { selectHosts, useHosts } from "@/hooks/queries/host-queries";
 import { useCliSkillsStatus } from "@/hooks/queries/system-queries";
 
 const CLI_SKILLS_SETTING_LABEL = "bb CLI skills";
@@ -59,6 +59,7 @@ export function CliSkillsSettingsSectionContent({
   return (
     <SettingsSection title="Skills">
       <SettingsWithControl
+        controlPlacement="trailing"
         label={CLI_SKILLS_SETTING_LABEL}
         {...(statusBadge === null ? {} : { labelBadge: statusBadge })}
         description={installDescription(hasConnectedMachine)}
@@ -106,7 +107,10 @@ export function CliSkillsSettingsSection() {
   const statusQuery = useCliSkillsStatus();
   const installCliSkills = useInstallCliSkills();
   const [pickerOpen, setPickerOpen] = useState(false);
-  const hosts: readonly Host[] = hostsQuery.data ?? [];
+  const hosts: readonly Host[] = useMemo(
+    () => selectHosts(hostsQuery.data, "persistent"),
+    [hostsQuery.data],
+  );
   const statuses = statusByHostId(statusQuery.data);
 
   return (

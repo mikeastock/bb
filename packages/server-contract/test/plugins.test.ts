@@ -5,9 +5,27 @@ import {
   pluginCatalogSearchResponseSchema,
   pluginCatalogSearchResultSchema,
   pluginCatalogStatusSchema,
+  pluginSettingDescriptorSchema,
 } from "../src/index.js";
 
-describe("plugin catalog contracts", () => {
+describe("plugin contracts", () => {
+  it("accepts finite number setting descriptors", () => {
+    expect(
+      pluginSettingDescriptorSchema.parse({
+        type: "number",
+        label: "Retries",
+        default: 3,
+      }),
+    ).toEqual({ type: "number", label: "Retries", default: 3 });
+    expect(
+      pluginSettingDescriptorSchema.safeParse({
+        type: "number",
+        label: "Retries",
+        default: Number.POSITIVE_INFINITY,
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts catalog install coordinates without marketplace nesting", () => {
     expect(
       pluginCatalogInstallRequestSchema.parse({
@@ -69,6 +87,7 @@ describe("plugin catalog contracts", () => {
       official: false,
       author: null,
       installed: false,
+      conflictingInstallSource: null,
       compatible: true,
       incompatibleReason: null,
     };
@@ -120,6 +139,7 @@ describe("plugin catalog contracts", () => {
           pluginIds: ["notes", "tasks"],
         },
       ],
+      categories: [],
     });
     expect(
       pluginCatalogSearchResponseSchema.safeParse({ results: [] }).success,

@@ -4,6 +4,7 @@ export * from "./thread/thread-read-state.js";
 export * from "./thread/thread-activity.js";
 
 export * from "./codepoint-compare.js";
+export * from "./environment-providers.js";
 export * from "./sidebar/sectionKeys.js";
 export * from "./sidebar/projectThreadGroups.js";
 export * from "./sidebar/machineThreadGroups.js";
@@ -14,7 +15,6 @@ export * from "./sidebar/sidebarSectionOrder.js";
 export * from "./sidebar/neighbor-reorder.js";
 
 export * from "./prompt/create-resource-prompts.js";
-export * from "./prompt/automation-prompt.js";
 export * from "./prompt/prompt-draft.js";
 export * from "./prompt/follow-up-submit-mode.js";
 export * from "./prompt/threadDetailPromptSubmission.js";
@@ -34,9 +34,11 @@ export * from "./timeline/timeline-auto-expand.js";
 export * from "./timeline/timelineRowSignatures.js";
 export * from "./timeline/conversation-message-limits.js";
 export * from "./timeline/compute-muted-prefix-length.js";
+export * from "./timeline/automation-due-message.js";
 export * from "./timeline/conversation-turn-request-label.js";
 export * from "./timeline/optimistic-timeline-row.js";
 export * from "./timeline/timeline-merge.js";
+export * from "./timeline/deferred-content.js";
 
 export * from "./diff/renderable-patch.js";
 

@@ -51,23 +51,6 @@ export function promptMentionClipboardDataAttributes(
   };
 }
 
-export function promptMentionClipboardContent(
-  resource: PromptMentionResource,
-): { text: string; html: string } {
-  const serializedText = serializedTextForPromptMentionResource(resource);
-  const element = document.createElement("span");
-  for (const [name, value] of Object.entries(
-    promptMentionClipboardDataAttributes({ resource, serializedText }),
-  )) {
-    element.setAttribute(name, value);
-  }
-  element.textContent = serializedText;
-  return {
-    text: `${serializedText} `,
-    html: `${element.outerHTML} `,
-  };
-}
-
 export function serializedTextForPromptMentionResource(
   resource: PromptMentionResource,
 ): string {
@@ -83,7 +66,7 @@ export function serializedTextForPromptMentionResource(
   if (resource.kind === "command") {
     return `${resource.trigger}${resource.name}`;
   }
-  if (resource.kind === "plugin") {
+  if (resource.kind === "plugin" || resource.kind === "attachment") {
     return `@${resource.label}`;
   }
 

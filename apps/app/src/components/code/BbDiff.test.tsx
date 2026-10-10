@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultResolvedCodeTheme } from "@bb/domain";
 import { applyResolvedCodeTheme } from "@/lib/code-theme";
 import { parseGitDiffFiles } from "@/components/git-diff/git-diff-parsing";
-import { BbDiff } from "./BbDiff";
+import BbDiff from "./BbDiff";
 
 interface RenderedOptions {
   theme: { dark: string; light: string };
@@ -130,22 +130,6 @@ describe("BbDiff", () => {
       dark: "custom-dark",
       light: "custom-light",
     });
-  });
-
-  it("omits the expansion budget unless the caller can supply file contents", async () => {
-    render(
-      <BbDiff
-        file={fixture()}
-        view="unified"
-        overflow="scroll"
-        showLineNumbers
-        fullFileContents={null}
-      />,
-    );
-    await screen.findByTestId("pierre-file-diff");
-
-    expect(pierre.lastOptions).not.toBeNull();
-    expect("expansionLineCount" in (pierre.lastOptions ?? {})).toBe(false);
   });
 
   it("enriches matching full contents and enables context expansion", async () => {

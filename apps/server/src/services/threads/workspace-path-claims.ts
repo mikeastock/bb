@@ -1,73 +1,58 @@
 import {
   findForeignManagedEnvironmentAtHostPath,
   findProjectEnvironmentByHostPath,
-  hasLiveThreadAtHostPath,
   type DbConnection,
 } from "@bb/db";
-import { isBbManagedWorkspacePath } from "./worktree-paths.js";
+import { isBbManagedWorkspacePath } from "./workspace-paths.js";
 
-interface UnmanagedAttachRefusal {
-  reason: "foreign-managed" | "live-thread";
-  message: string;
-}
-
-interface UnmanagedAttachCheckArgs {
-  dataDir: string | null;
-  checksOutBranch: boolean;
+interface ForeignProjectPathCheckArgs {
   hostId: string;
   path: string;
   projectId: string;
 }
 
-export function unmanagedAttachRefusal(
-  db: DbConnection,
-  args: UnmanagedAttachCheckArgs,
-): UnmanagedAttachRefusal | null {
-  const foreignManagedMessage =
-    "Workspace path is a bb-managed workspace owned by another project";
+interface SuppliedWorkspacePathCheckArgs extends ForeignProjectPathCheckArgs {
+  dataDir: string | null;
+}
 
-  if (
-    findForeignManagedEnvironmentAtHostPath(db, {
-      hostId: args.hostId,
-      path: args.path,
-      projectId: args.projectId,
-    })
-  ) {
-    return { reason: "foreign-managed", message: foreignManagedMessage };
-  }
+const FOREIGN_PROJECT_REFUSAL =
+  "Workspace path is a bb-managed workspace owned by another project";
+
+const UNRECORDED_MANAGED_REFUSAL =
+  "Workspace path is inside bb-managed storage but is not a workspace of this project";
+
+export function foreignProjectOwnedPathRefusal(
+  db: DbConnection,
+  args: ForeignProjectPathCheckArgs,
+): string | null {
+  return findForeignManagedEnvironmentAtHostPath(db, {
+    hostId: args.hostId,
+    path: args.path,
+    projectId: args.projectId,
+  })
+    ? FOREIGN_PROJECT_REFUSAL
+    : null;
+}
+
+export function suppliedWorkspacePathRefusal(
+  db: DbConnection,
+  args: SuppliedWorkspacePathCheckArgs,
+): string | null {
+  const foreign = foreignProjectOwnedPathRefusal(db, args);
+  if (foreign !== null) return foreign;
 
   if (
     args.dataDir !== null &&
     isBbManagedWorkspacePath({ dataDir: args.dataDir, path: args.path }) &&
-    !findProjectOwnsPath(db, args)
-  ) {
-    return { reason: "foreign-managed", message: foreignManagedMessage };
-  }
-
-  if (
-    args.checksOutBranch &&
-    hasLiveThreadAtHostPath(db, { hostId: args.hostId, path: args.path })
-  ) {
-    return {
-      reason: "live-thread",
-      message:
-        "Cannot checkout branch while another thread is using this workspace",
-    };
-  }
-
-  return null;
-}
-
-function findProjectOwnsPath(
-  db: DbConnection,
-  args: Pick<UnmanagedAttachCheckArgs, "hostId" | "path" | "projectId">,
-): boolean {
-  return (
     findProjectEnvironmentByHostPath(
       db,
       args.projectId,
       args.hostId,
       args.path,
-    ) !== null
-  );
+    ) === null
+  ) {
+    return UNRECORDED_MANAGED_REFUSAL;
+  }
+
+  return null;
 }

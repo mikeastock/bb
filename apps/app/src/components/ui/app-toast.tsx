@@ -5,7 +5,7 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react";
-import { toast as sonnerToast, type Action, type ExternalToast } from "sonner";
+import type { Action, ExternalToast } from "sonner";
 import { Button } from "@bb/shared-ui/button";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
@@ -13,6 +13,7 @@ import {
   openNotificationCenter,
   recordNotification,
 } from "@/lib/notifications/notification-store";
+import { withSonnerToast } from "./app-toast-runtime";
 
 export type AppToastTone =
   | "message"
@@ -56,10 +57,12 @@ interface AppToastContentProps {
   tone: AppToastTone;
 }
 
-interface AppToastDescriptionProps {
-  description: ReactNode;
+interface AppToastOverflowTextProps {
+  className?: string;
+  content: ReactNode;
   notificationId: string | null;
   onShowMore: () => void;
+  testId: string;
 }
 
 interface ShowAppToastParams {
@@ -81,7 +84,7 @@ type AppToastMethod = (
 
 const DEFAULT_TOAST_DURATION = 4000;
 
-function iconForTone(tone: AppToastTone): IconName {
+export function iconForTone(tone: AppToastTone): IconName {
   switch (tone) {
     case "success":
       return "CircleCheck";
@@ -100,7 +103,7 @@ function dismissToast(id: number | string | undefined): void {
   if (id === undefined) {
     return;
   }
-  sonnerToast.dismiss(id);
+  withSonnerToast((sonnerToast) => sonnerToast.dismiss(id));
 }
 
 function AppToastActionButton({
@@ -129,11 +132,13 @@ function AppToastActionButton({
   );
 }
 
-export function AppToastDescription({
-  description,
+function AppToastOverflowText({
+  className,
+  content,
   notificationId,
   onShowMore,
-}: AppToastDescriptionProps) {
+  testId,
+}: AppToastOverflowTextProps) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const [truncated, setTruncated] = useState(false);
 
@@ -142,17 +147,29 @@ export function AppToastDescription({
     if (body === null) {
       return;
     }
-    setTruncated(body.scrollWidth - body.clientWidth > 1);
-  }, [description]);
+    const measure = () => {
+      setTruncated(
+        body.scrollHeight - body.clientHeight > 1 ||
+          body.scrollWidth - body.clientWidth > 1,
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [content]);
 
   return (
-    <>
+    <div className="min-w-0 w-full">
       <div
         ref={bodyRef}
-        data-testid="app-toast-description"
-        className="min-w-0 flex-1 truncate"
+        data-testid={testId}
+        className={cn(
+          "line-clamp-4 whitespace-pre-wrap break-words [overflow-wrap:anywhere]",
+          className,
+        )}
       >
-        {description}
+        {content}
       </div>
       {truncated && notificationId !== null ? (
         <Button
@@ -165,7 +182,7 @@ export function AppToastDescription({
           Show more
         </Button>
       ) : null}
-    </>
+    </div>
   );
 }
 
@@ -181,6 +198,10 @@ export function AppToastContent({
   tone,
 }: AppToastContentProps) {
   const hasActions = action !== undefined || cancel !== undefined;
+  const showNotification = () => {
+    dismissToast(id);
+    openNotificationCenter(notificationId);
+  };
   const actions = hasActions ? (
     <>
       {action ? (
@@ -205,23 +226,27 @@ export function AppToastContent({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
-            <div className="min-w-0 flex-1 truncate text-sm font-medium leading-5">
-              {title}
-            </div>
+            <AppToastOverflowText
+              className="text-sm font-medium leading-5"
+              content={title}
+              notificationId={notificationId}
+              onShowMore={showNotification}
+              testId="app-toast-title"
+            />
           </div>
           {description || hasActions ? (
-            <div className="mt-0.5 flex min-w-0 flex-nowrap items-center gap-2 text-xs leading-5 text-muted-foreground">
+            <div className="mt-0.5 flex min-w-0 flex-col items-start gap-2 text-xs leading-5 text-muted-foreground">
               {description ? (
-                <AppToastDescription
-                  description={description}
+                <AppToastOverflowText
+                  content={description}
                   notificationId={notificationId}
-                  onShowMore={() => {
-                    dismissToast(id);
-                    openNotificationCenter(notificationId);
-                  }}
+                  onShowMore={showNotification}
+                  testId="app-toast-description"
                 />
               ) : null}
-              {actions}
+              {hasActions ? (
+                <div className="flex flex-wrap gap-2">{actions}</div>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -246,6 +271,8 @@ export function AppToastContent({
     </div>
   );
 }
+
+let nextToastId = 0;
 
 function showAppToast({
   options,
@@ -274,26 +301,31 @@ function showAppToast({
           createdAt: Date.now(),
         });
 
-  return sonnerToast.custom(
-    (id) => (
-      <AppToastContent
-        action={action}
-        cancel={cancel}
-        description={description}
-        dismissible={dismissible}
-        id={id}
-        notificationId={notificationId}
-        title={title}
-        tone={tone}
-      />
+  const toastId = sonnerOptions.id ?? `app-toast-${(nextToastId += 1)}`;
+  withSonnerToast((sonnerToast) =>
+    sonnerToast.custom(
+      (id) => (
+        <AppToastContent
+          action={action}
+          cancel={cancel}
+          description={description}
+          dismissible={dismissible}
+          id={id}
+          notificationId={notificationId}
+          title={title}
+          tone={tone}
+        />
+      ),
+      {
+        ...sonnerOptions,
+        id: toastId,
+        className: cn("bb-app-toast", className),
+        dismissible,
+        duration: nextDuration,
+      },
     ),
-    {
-      ...sonnerOptions,
-      className: cn("bb-app-toast", className),
-      dismissible,
-      duration: nextDuration,
-    },
   );
+  return toastId;
 }
 
 const showMessageToast: AppToastMethod = (title, options) =>
@@ -311,8 +343,12 @@ const showErrorToast: AppToastMethod = (title, options) =>
 const showLoadingToast: AppToastMethod = (title, options) =>
   showAppToast({ options, title, tone: "loading" });
 
+function dismissAppToast(id?: number | string): void {
+  withSonnerToast((sonnerToast) => sonnerToast.dismiss(id));
+}
+
 export const appToast = {
-  dismiss: sonnerToast.dismiss,
+  dismiss: dismissAppToast,
   error: showErrorToast,
   loading: showLoadingToast,
   message: showMessageToast,

@@ -12,7 +12,7 @@ import {
 export function NotificationsSettingsScreen() {
   const { profiles } = useProfiles();
   return (
-    <GroupedScreen scroll testID="notifications-settings-screen">
+    <GroupedScreen testID="notifications-settings-screen">
       {profiles.length === 0 ? (
         <SettingsSection title="Push notifications">
           <SettingsHint title="No servers" message="Add a server first." />
@@ -64,6 +64,7 @@ function PushProfileSection({ profile }: { profile: ServerProfile }) {
         />
       </SettingsSection>
       <ActionSheet
+        presentation="prompt"
         controller={permissionSheet}
         title="Allow push notifications?"
         message={`bb will ask this phone for permission, then register it with ${profile.label}.`}
@@ -71,7 +72,7 @@ function PushProfileSection({ profile }: { profile: ServerProfile }) {
           {
             key: "enable",
             label: "Turn on notifications",
-            icon: "Zap",
+            icon: "Bell",
             onPress: () => setEnabled(true),
           },
         ]}

@@ -1,3 +1,4 @@
+import { DiffLoadingSkeleton } from "@/components/code/code-loading-skeletons";
 import {
   type CSSProperties,
   type RefCallback,
@@ -20,7 +21,6 @@ import {
   ImageLightbox,
   IMAGE_TRANSPARENCY_CHECKER_STYLE,
 } from "@/components/ui/image-lightbox.js";
-import { Skeleton } from "@bb/shared-ui/skeleton";
 import {
   formatGitDiffFileLabel,
   isPreviewableImagePath,
@@ -87,6 +87,7 @@ type DiffFileEnrichmentState =
 type DiffContextExpansionStatus =
   | "unavailable"
   | "idle"
+  | "prefetching"
   | "loading"
   | "ready"
   | "error";
@@ -218,9 +219,9 @@ function svgTextToDataUrl(contents: string): string | null {
 interface UseGitDiffCardBodyArgs {
   fileDiff: ParsedGitDiffFile;
   changeKind: GitDiffFileChangeKind;
-  isRendering: boolean;
   onRequestFileContents: RequestDiffFileContents | undefined;
   patchText?: string;
+  renderBeforeVisible: boolean;
 }
 
 interface GitDiffCardBodyState {
@@ -242,9 +243,9 @@ interface GitDiffCardBodyState {
 export function useGitDiffCardBody({
   fileDiff,
   changeKind,
-  isRendering,
   onRequestFileContents,
   patchText,
+  renderBeforeVisible,
 }: UseGitDiffCardBodyArgs): GitDiffCardBodyState {
   const isDeletedFile = changeKind === "deleted";
   const isImageCard = isImagePreviewCard(fileDiff, onRequestFileContents);
@@ -270,15 +271,19 @@ export function useGitDiffCardBody({
     status: "idle",
   });
   const enrichmentStatusRef = useRef<DiffFileEnrichmentState["status"]>("idle");
-  const [hasBodyEnteredViewport, setHasBodyEnteredViewport] = useState(false);
+  const [hasBodyEnteredViewport, setHasBodyEnteredViewport] =
+    useState(renderBeforeVisible);
   const [hasLoadedDeletedDiff, setHasLoadedDeletedDiff] = useState(false);
   const [contextRequestVersion, setContextRequestVersion] = useState(0);
+  const [isContextRequestedByUser, setIsContextRequestedByUser] =
+    useState(false);
   const isPointerCoarse = usePointerCoarse();
   useEffect(() => {
     enrichmentStatusRef.current = "idle";
     setEnrichment({ status: "idle" });
     setHasLoadedDeletedDiff(false);
     setContextRequestVersion(0);
+    setIsContextRequestedByUser(false);
   }, [fileContentPlan.identity, isImageCard, isSvgCard]);
   useEffect(() => {
     if (isBodyVisible) {
@@ -287,8 +292,7 @@ export function useGitDiffCardBody({
   }, [isBodyVisible]);
   const shouldGateDeletedDiff =
     isDeletedFile && !isImageCard && !isSvgCard && !hasLoadedDeletedDiff;
-  const shouldRenderDiffView =
-    hasBodyEnteredViewport && !isRendering && !shouldGateDeletedDiff;
+  const shouldRenderDiffView = hasBodyEnteredViewport && !shouldGateDeletedDiff;
   const needsContentsToRender = isImageCard || isSvgCard;
   const canExpandContext =
     !needsContentsToRender &&
@@ -398,12 +402,15 @@ export function useGitDiffCardBody({
       enrichmentStatusRef.current = "idle";
       setEnrichment({ status: "idle" });
     }
+    setIsContextRequestedByUser(true);
     setContextRequestVersion((version) => version + 1);
   }, []);
   const contextExpansionStatus = getDiffContextExpansionStatus({
     canExpandContext,
     contextRequested: contextRequestVersion > 0,
     enrichmentStatus: enrichment.status,
+    isPrefetchedAutomatically: !isPointerCoarse,
+    isRequestedByUser: isContextRequestedByUser,
   });
   const contextExpansion = useMemo<DiffContextExpansionState>(
     () => ({
@@ -449,17 +456,23 @@ function getDiffContextExpansionStatus({
   canExpandContext,
   contextRequested,
   enrichmentStatus,
+  isPrefetchedAutomatically,
+  isRequestedByUser,
 }: {
   canExpandContext: boolean;
   contextRequested: boolean;
   enrichmentStatus: DiffFileEnrichmentState["status"];
+  isPrefetchedAutomatically: boolean;
+  isRequestedByUser: boolean;
 }): DiffContextExpansionStatus {
   if (!canExpandContext) return "unavailable";
+  const loadingStatus = isRequestedByUser ? "loading" : "prefetching";
   switch (enrichmentStatus) {
     case "idle":
-      return contextRequested ? "loading" : "idle";
+      if (contextRequested) return loadingStatus;
+      return isPrefetchedAutomatically ? "prefetching" : "idle";
     case "loading":
-      return "loading";
+      return loadingStatus;
     case "ready":
       return "ready";
     case "error":
@@ -473,19 +486,6 @@ function getDiffContextExpansionStatus({
       return _exhaustive;
     }
   }
-}
-
-export function GitDiffCardBodySkeleton() {
-  return (
-    <div className="space-y-1.5 px-3 py-3">
-      <Skeleton className="h-3 w-full rounded-sm" />
-      <Skeleton className="h-3 w-[96%] rounded-sm" />
-      <Skeleton className="h-3 w-[93%] rounded-sm" />
-      <Skeleton className="h-3 w-[90%] rounded-sm" />
-      <Skeleton className="h-3 w-[87%] rounded-sm" />
-      <Skeleton className="h-3 w-[84%] rounded-sm" />
-    </div>
-  );
 }
 
 interface GitDiffCardImageSide {
@@ -596,44 +596,46 @@ export function GitDiffCardImagePreviewBody({
   };
   return (
     <>
-      <div
-        className={
-          fitToFrame
-            ? imageSides.length > 1
-              ? "grid grid-cols-1 gap-3 px-3 py-3 sm:grid-cols-2"
-              : "grid grid-cols-1 gap-3 px-3 py-3"
-            : "flex items-start gap-3 px-3 py-3"
-        }
-      >
-        {imageSides.map((side, index) => (
-          <figure key={side.url} className="min-w-0">
-            <button
-              type="button"
-              className={
-                fitToFrame
-                  ? "flex h-64 w-full cursor-zoom-in items-center justify-center rounded-md border border-border bg-surface-recessed p-3"
-                  : "block max-w-full cursor-zoom-in"
-              }
-              onClick={() => setExpandedImageIndex(index)}
-            >
-              <img
-                src={side.url}
-                alt={getGitDiffCardImageAlt(fileDiffLabel, side)}
-                style={IMAGE_TRANSPARENCY_CHECKER_STYLE}
+      <div className="@container/diff-preview min-w-0">
+        <div
+          className={
+            fitToFrame
+              ? imageSides.length > 1
+                ? "grid grid-cols-1 gap-3 px-3 py-3 @min-[32rem]/diff-preview:grid-cols-2"
+                : "grid grid-cols-1 gap-3 px-3 py-3"
+              : "flex flex-col items-start gap-3 px-3 py-3 @min-[32rem]/diff-preview:flex-row"
+          }
+        >
+          {imageSides.map((side, index) => (
+            <figure key={side.url} className="min-w-0 max-w-full">
+              <button
+                type="button"
                 className={
                   fitToFrame
-                    ? "block h-full w-full object-contain"
-                    : "block max-h-80 max-w-full rounded-md border border-border object-contain"
+                    ? "flex h-64 w-full cursor-zoom-in items-center justify-center rounded-md border border-border bg-surface-recessed p-3"
+                    : "block max-w-full cursor-zoom-in"
                 }
-              />
-            </button>
-            {side.caption !== null ? (
-              <figcaption className="mt-1 text-xs text-muted-foreground">
-                {side.caption}
-              </figcaption>
-            ) : null}
-          </figure>
-        ))}
+                onClick={() => setExpandedImageIndex(index)}
+              >
+                <img
+                  src={side.url}
+                  alt={getGitDiffCardImageAlt(fileDiffLabel, side)}
+                  style={IMAGE_TRANSPARENCY_CHECKER_STYLE}
+                  className={
+                    fitToFrame
+                      ? "block h-full w-full object-contain"
+                      : "block max-h-80 max-w-full rounded-md border border-border object-contain"
+                  }
+                />
+              </button>
+              {side.caption !== null ? (
+                <figcaption className="mt-1 text-xs text-muted-foreground">
+                  {side.caption}
+                </figcaption>
+              ) : null}
+            </figure>
+          ))}
+        </div>
       </div>
       <ImageLightbox
         title={`${fileDiffLabel} image preview`}
@@ -658,7 +660,7 @@ function GitDiffCardImageBody({
   fitToFrame = false,
 }: GitDiffCardImageBodyProps) {
   if (enrichment.status === "idle" || enrichment.status === "loading") {
-    return <GitDiffCardBodySkeleton />;
+    return <DiffLoadingSkeleton />;
   }
   const preview = getGitDiffCardImageUrls(enrichment);
   if (preview === null) {
@@ -770,7 +772,7 @@ export function GitDiffCardBody({
           </span>
         </div>
       ) : !shouldRenderDiffView ? (
-        <GitDiffCardBodySkeleton />
+        <DiffLoadingSkeleton />
       ) : isImageCard ? (
         <GitDiffCardImageBody
           enrichment={enrichment}
@@ -794,7 +796,6 @@ export function GitDiffCardBody({
             patchText={patchText}
             fullFileContents={fullFileContents}
             {...presentation}
-            fallback={<GitDiffCardBodySkeleton />}
             onSelectionAddToChat={onSelectionAddToChat}
           />
           <GitDiffCardContextExpansionFooter
@@ -817,7 +818,11 @@ function GitDiffCardContextExpansionFooter({
   reservesCollapseGutter,
 }: GitDiffCardContextExpansionFooterProps) {
   const { status, request } = contextExpansion;
-  if (status === "unavailable" || status === "ready") {
+  if (
+    status === "unavailable" ||
+    status === "ready" ||
+    status === "prefetching"
+  ) {
     return null;
   }
   return (

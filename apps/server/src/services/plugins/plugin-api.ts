@@ -1,4 +1,14 @@
-import { createHash } from "node:crypto";
+import {
+  environmentCompositionSchema,
+  validateServerAccessProviderDeclaration,
+  type NormalizedPluginEnvironmentComposition,
+  type NormalizedPluginInteractionRequest,
+} from "@get-bb/plugin-sdk/internal/host-policy";
+import { createMachineBootstrapApi } from "../machines/bootstrap.js";
+import type { MachineEnrollments } from "../machines/enrollments.js";
+import { listServerAccessProviders } from "./plugin-server-access-registry.js";
+import { detachActivePluginToolCallForUserInput } from "./plugin-tool-calls.js";
+import { fillPluginPresentation } from "./plugin-presentation.js";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -6,21 +16,19 @@ import { CronExpressionParser } from "cron-parser";
 import {
   deletePluginKvValue,
   getPluginKvValue,
+  getHost,
   listPluginKvKeys,
   setPluginKvValue,
   type DbConnection,
 } from "@bb/db";
-import {
-  PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES,
-  PLUGIN_INTERACTION_MAX_TITLE_LENGTH,
-  type JsonValue,
-} from "@bb/domain";
+import type { ThreadEventItemPresentation } from "@bb/domain";
 import type {
   BbPluginApi,
   PluginAgentConfiguration,
   PluginAgentConfigurationContext,
   PluginAgentToolContext,
-  PluginAgentToolPresentation,
+  PluginRowPresentation,
+  PluginBbSdk,
   PluginAgentToolResult,
   PluginAgents,
   PluginBackground,
@@ -28,6 +36,7 @@ import type {
   PluginCliCommandInfo,
   PluginCliContext,
   PluginCliResult,
+  PluginEnvironments,
   PluginHooks,
   PluginHookHandler,
   PluginHookName,
@@ -39,11 +48,18 @@ import type {
   PluginKvStorage,
   PluginLogger,
   PluginMentionItem,
+  PluginMentionProviderRegistration,
   PluginMentionSearchContext,
   PluginMentionTrigger,
-  PluginAiServiceDeclaration,
+  PluginMachines,
   PluginAiServices,
   PluginProviderDeclaration,
+  ExperimentalPluginProviderEnvContext,
+  ExperimentalPluginProviderEnvEntry,
+  ExperimentalPluginProviderEnvHealth,
+  ExperimentalPluginProviderEnvHealthContext,
+  ExperimentalPluginWebSocket,
+  ExperimentalPluginWebSocketHandler,
   PluginProviders,
   PluginRealtime,
   PluginRpc,
@@ -59,58 +75,65 @@ import type {
   PluginUi,
   StandardSchemaV1,
   PluginRpcContract,
+  ExperimentalPluginRpcHandlerContext,
 } from "@get-bb/plugin-sdk";
 import {
-  AGENT_TOOL_NAME_PATTERN,
-  assertNoRecursiveJsonSchemaReferences,
-  BACKGROUND_NAME_PATTERN,
-  CLI_COMMAND_NAME_PATTERN,
-  isZodSchemaLike,
   KV_VALUE_MAX_BYTES,
-  MENTION_PROVIDER_ID_PATTERN,
-  normalizeMentionProviderTriggers,
-  PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS,
-  PLUGIN_HTTP_METHODS,
-  parsePluginAgentToolPresentation,
+  normalizeAgentToolRegistration,
+  normalizeCliRegistration,
+  normalizeHttpRouteRegistration,
+  normalizeInteractionRequest,
+  normalizeMentionProviderRegistration,
+  normalizeRealtimePayload,
+  normalizeRpcRegistration,
+  publishRpcMethod,
+  normalizeWebSocketRouteRegistration,
   pluginCliCollisionWarning,
-  readRpcMethodContract,
   registerSettingDescriptors,
-  rejectStaleAgentToolFields,
-  RESERVED_AGENT_TOOL_NAMES,
-  RPC_METHOD_PATTERN,
+  runPluginStorageMigrations,
   isStandardSchema,
-  summarizeParseIssues,
-  agentToolIconRefusalMessage,
   aiServiceAlreadyRegisteredMessage,
   pluginHookAlreadyRegisteredMessage,
   storePluginHook,
+  validateBackgroundServiceRegistration,
+  validatePluginEnvironmentProviderDeclaration,
+  validatePluginMachineProviderDeclaration,
   providerAlreadyRegisteredMessage,
   providerIconRefusalMessage,
   undeclaredIconProblem,
+  validateProviderEnvContribution,
+  validateScheduleRegistration,
   validateSettingsUpdate,
   validatePluginAiServiceDeclaration,
   validatePluginProviderDeclaration,
-  zodSchemaToJsonSchema,
 } from "@get-bb/plugin-sdk/internal/host-policy";
 import type {
-  AiServiceHostBinding,
+  NormalizedPluginAiService,
+  NormalizedPluginEnvironmentProvider,
+  NormalizedPluginMachineProvider,
   NormalizedPluginProviderDeclaration,
 } from "@get-bb/plugin-sdk/internal/host-policy";
-import type { BbSdk, ThreadForkArgs, ThreadSpawnArgs } from "@bb/sdk";
+import type {
+  BbSdk,
+  ThreadForkArgs,
+  PluginThreadMetadataListArgs,
+  ThreadPluginMetadataArgs,
+  ThreadPluginMetadataUpdateArgs,
+  ThreadSpawnArgs,
+} from "@bb/sdk";
+import { requestEnvironmentProviderRecheck } from "./plugin-environment-provider-registry.js";
+import { requestServerAccessRecheck } from "./plugin-server-access-registry.js";
+import {
+  createPluginRpcCallerSdk,
+  type PluginRpcCallerCredential,
+} from "./plugin-rpc-caller.js";
 import type { ServerLogger } from "../../types.js";
 import type { PluginInteractionResult } from "../interactions/pending-interactions.js";
 import { appendPluginLogLine } from "./plugin-log.js";
-import type { PluginHostArtifactSnapshot } from "./plugin-service-internal.js";
 import {
   readPluginSettingsValues,
   writePluginSettingsUpdate,
 } from "./plugin-settings.js";
-
-const LEGACY_UNKNOWN_MIGRATION_HASH = "legacy-unknown";
-
-function migrationStatementHash(statement: string): string {
-  return createHash("sha256").update(statement).digest("hex");
-}
 
 export type {
   BbPluginApi,
@@ -159,16 +182,28 @@ export interface PluginHttpRouteRecord {
   handler: PluginHttpHandler;
 }
 
+export interface PluginWebSocketRouteRecord {
+  path: string;
+  auth: PluginHttpAuthMode;
+  handler: ExperimentalPluginWebSocketHandler;
+  active: boolean;
+  sockets: Set<ExperimentalPluginWebSocket>;
+}
+
 export interface PluginRpcHandler {
+  publication: ReturnType<typeof publishRpcMethod>;
   inputSchema: StandardSchemaV1;
   outputSchema: StandardSchemaV1;
-  handler: (input: never) => unknown;
+  handler: (
+    input: unknown,
+    context: ExperimentalPluginRpcHandlerContext,
+  ) => unknown;
 }
 
 export interface PluginAgentToolRecord {
   name: string;
   description: string;
-  presentation: PluginAgentToolPresentation | null;
+  presentation: PluginRowPresentation | null;
   instructions: string | null;
   inputSchema: unknown;
   parse(
@@ -180,8 +215,6 @@ export interface PluginAgentToolRecord {
   ): PluginAgentToolResult | Promise<PluginAgentToolResult>;
 }
 
-export { RESERVED_AGENT_TOOL_NAMES };
-
 interface PluginMentionProviderRecord {
   id: string;
   label: string;
@@ -189,9 +222,7 @@ interface PluginMentionProviderRecord {
   search: (
     ctx: PluginMentionSearchContext,
   ) => PluginMentionItem[] | Promise<PluginMentionItem[]>;
-  resolve: (
-    itemId: string,
-  ) => { context: string } | Promise<{ context: string }>;
+  resolve: PluginMentionProviderRegistration["resolve"];
 }
 
 export interface PluginBackgroundServiceRecord {
@@ -209,6 +240,7 @@ interface PluginCliRegistrationRecord {
   name: string;
   summary: string;
   commands: PluginCliCommandInfo[];
+  rendersHelp: boolean;
   run: (
     argv: string[],
     ctx: PluginCliContext,
@@ -223,6 +255,8 @@ type PluginSettingsListener = (
 export interface PluginApiHandle {
   api: BbPluginApi;
   disposeHooks: Array<() => void | Promise<void>>;
+  /** Handlers recorded by `bb.onInstall`; run once after a fresh install. */
+  installHandlers: Array<() => void | Promise<void>>;
   settings: {
     descriptors: PluginSettingDescriptors;
     listeners: PluginSettingsListener[];
@@ -231,8 +265,16 @@ export interface PluginApiHandle {
   threadEventHandlers: PluginThreadEventHandlers;
   /** Hook handlers recorded by `bb.experimental_hooks.on`. */
   hooks: PluginHookRecords;
+  environmentCompositions: Map<string, NormalizedPluginEnvironmentComposition>;
+  environmentProviders: Map<string, NormalizedPluginEnvironmentProvider>;
+  machineProviders: Map<string, NormalizedPluginMachineProvider>;
+  serverAccessProviders: Map<
+    string,
+    import("@get-bb/plugin-sdk").ServerAccessProviderDeclaration
+  >;
   /** HTTP routes recorded by `bb.http.route`; dropped with the handle. */
   httpRoutes: PluginHttpRouteRecord[];
+  websocketRoutes: PluginWebSocketRouteRecord[];
   rpcHandlers: Map<string, PluginRpcHandler>;
   hostWorkerExitHandlers: PluginHostWorkerExitHandler[];
   hostSignalHandlers: PluginHostSignalHandler[];
@@ -241,10 +283,16 @@ export interface PluginApiHandle {
   cli: { registration: PluginCliRegistrationRecord | null };
   agentTools: PluginAgentToolRecord[];
   listProviderDeclarations(): NormalizedPluginProviderDeclaration[];
+  providerEnvResolvers: ReadonlyMap<string, PluginProviderEnvResolver>;
+  providerEnvHealthResolvers: ReadonlyMap<
+    string,
+    PluginProviderEnvHealthResolver
+  >;
   agentConfigurationProvider: PluginAgentConfigurationProvider | null;
   instructionProvider: PluginInstructionProvider | null;
   mentionProviders: PluginMentionProviderRecord[];
   activate(): void;
+  closeWebSockets(): void;
   invalidate(): void;
 }
 
@@ -270,30 +318,81 @@ type PluginAgentConfigurationProvider = (
   context: PluginAgentConfigurationContext,
 ) => PluginAgentConfiguration;
 
-function wrapSdkForPlugin(sdk: BbSdk, pluginId: string): BbSdk {
+export type PluginProviderEnvResolver = (
+  context: ExperimentalPluginProviderEnvContext,
+) =>
+  | readonly ExperimentalPluginProviderEnvEntry[]
+  | Promise<readonly ExperimentalPluginProviderEnvEntry[]>;
+
+export type PluginProviderEnvHealthResolver = (
+  context: ExperimentalPluginProviderEnvHealthContext,
+) =>
+  | ExperimentalPluginProviderEnvHealth
+  | null
+  | Promise<ExperimentalPluginProviderEnvHealth | null>;
+
+function withPluginThreadAttribution<
+  TArgs extends ThreadForkArgs | ThreadSpawnArgs,
+>(args: TArgs, pluginId: string): TArgs {
+  const attribution: Pick<ThreadSpawnArgs, "origin" | "originPluginId"> =
+    args.pluginMetadata !== undefined
+      ? { origin: "plugin", originPluginId: pluginId }
+      : args.origin === undefined || args.origin === "plugin"
+        ? { origin: "plugin", originPluginId: args.originPluginId ?? pluginId }
+        : { origin: args.origin };
+  return { ...args, ...attribution };
+}
+
+function wrapSdkForPlugin(
+  sdk: BbSdk,
+  pluginId: string,
+  rpcCallerSdk: BbSdk,
+): PluginBbSdk {
   return {
     ...sdk,
+    plugins: {
+      ...sdk.plugins,
+      callRpc(args) {
+        return rpcCallerSdk.plugins.callRpc(args);
+      },
+    },
     threads: {
       ...sdk.threads,
-      fork(args: ThreadForkArgs) {
-        const origin = args.origin ?? "plugin";
-        return sdk.threads.fork({
+      async getPluginMetadata(
+        args: Omit<ThreadPluginMetadataArgs, "pluginId"> & {
+          pluginId?: string;
+        },
+      ) {
+        return sdk.threads.getPluginMetadata({
           ...args,
-          origin,
-          ...(origin === "plugin"
-            ? { originPluginId: args.originPluginId ?? pluginId }
-            : {}),
+          pluginId: args.pluginId ?? pluginId,
         });
       },
-      spawn(args: ThreadSpawnArgs) {
-        const origin = args.origin ?? "plugin";
-        return sdk.threads.spawn({
+      async experimental_listPluginMetadata(
+        args: Omit<PluginThreadMetadataListArgs, "pluginId"> & {
+          pluginId?: string;
+        },
+      ) {
+        return sdk.threads.experimental_listPluginMetadata({
           ...args,
-          origin,
-          ...(origin === "plugin"
-            ? { originPluginId: args.originPluginId ?? pluginId }
-            : {}),
+          pluginId: args.pluginId ?? pluginId,
         });
+      },
+      async updatePluginMetadata(
+        args: Omit<ThreadPluginMetadataUpdateArgs, "pluginId"> & {
+          pluginId?: string;
+        },
+      ) {
+        return sdk.threads.updatePluginMetadata({
+          ...args,
+          pluginId: args.pluginId ?? pluginId,
+        });
+      },
+      fork(args: ThreadForkArgs) {
+        return sdk.threads.fork(withPluginThreadAttribution(args, pluginId));
+      },
+      spawn(args: ThreadSpawnArgs) {
+        return sdk.threads.spawn(withPluginThreadAttribution(args, pluginId));
       },
     },
   };
@@ -306,7 +405,7 @@ function createStagedRegistrations<
 >(options: {
   validate: (declaration: TDeclaration) => TNormalized;
   bind: (id: string) => TBinding;
-  isTaken: (id: string) => boolean;
+  isTaken?: (id: string) => boolean;
   registerLive: (
     declaration: TNormalized,
     binding: TBinding,
@@ -345,7 +444,7 @@ function createStagedRegistrations<
       };
       if (options.isActivated()) {
         entry.disposer = options.registerLive(normalized, binding);
-      } else if (options.isTaken(normalized.id)) {
+      } else if (options.isTaken?.(normalized.id) === true) {
         throw new Error(options.alreadyRegisteredMessage(normalized.id));
       }
       entries.set(normalized.id, entry);
@@ -376,18 +475,29 @@ function createStagedRegistrations<
   };
 }
 
+const PLUGIN_HOST_CALL_MAX_TIMEOUT_MS = 30 * 60_000;
+
 export function createPluginApi(options: {
   pluginId: string;
   logger: ServerLogger;
   db: DbConnection;
   dataDir: string;
   getSdk: () => BbSdk | undefined;
+  getMachineEnrollments: () => MachineEnrollments;
   getAppUrl: () => string | null;
   getLoopbackBaseUrl: () => string | undefined;
+  /**
+   * This load's rpc caller token, attached to the plugin's
+   * `bb.sdk.plugins.callRpc` requests so handlers see it as the caller.
+   * Revoked when the handle is invalidated.
+   */
+  rpcCaller: PluginRpcCallerCredential;
   publishSignal: (channel: string, payload: unknown) => void;
   settingsChanged: () => void;
   reportNeedsConfiguration: (message: string) => void;
   isAgentToolNameTaken: (name: string) => string | undefined;
+  isEnvironmentProviderIdTaken: (id: string) => string | undefined;
+  isMachineProviderIdTaken: (id: string) => string | undefined;
   reportAgentToolProblem: (message: string) => void;
   /**
    * Schedules a re-attempt of every plugin-queued row
@@ -402,14 +512,13 @@ export function createPluginApi(options: {
    * name. Empty when the manifest declares none.
    */
   declaredIconNames: ReadonlySet<string>;
-  requestInteraction: (args: {
-    threadId: string;
-    rendererId: string;
-    title: string;
-    payload: JsonValue;
-    timeoutMs: number;
-    signal?: AbortSignal;
-  }) => Promise<PluginInteractionResult>;
+  brandingIcon: string | undefined;
+  requestInteraction: (
+    args: Omit<NormalizedPluginInteractionRequest, "presentation"> & {
+      presentation: ThreadEventItemPresentation;
+      signal?: AbortSignal;
+    },
+  ) => Promise<PluginInteractionResult>;
   ensureSharedPortTunnel: PluginHosts["ensureSharedPortTunnel"];
   validateSharedPortDeclaration: (
     hostId: string,
@@ -428,21 +537,15 @@ export function createPluginApi(options: {
     input: unknown;
     hostId: string;
     signal?: AbortSignal;
+    timeoutMs?: number;
   }) => Promise<unknown>;
   registerProvider: (declaration: NormalizedPluginProviderDeclaration) => {
     dispose(): void;
   };
-  registerAiService: (
-    declaration: PluginAiServiceDeclaration,
-    binding: AiServiceHostBinding<PluginHostArtifactSnapshot>,
-  ) => {
+  registerAiService: (declaration: NormalizedPluginAiService) => {
     dispose(): void;
   };
   isProviderIdTaken: (providerId: string) => boolean;
-  isAiServiceIdTaken: (serviceId: string) => boolean;
-  assertAiServiceRegistrable: (
-    serviceId: string,
-  ) => AiServiceHostBinding<PluginHostArtifactSnapshot>;
   assertProviderRegistrable: (providerId: string) => void;
 }): PluginApiHandle {
   const {
@@ -453,6 +556,7 @@ export function createPluginApi(options: {
     getSdk,
     getAppUrl,
     getLoopbackBaseUrl,
+    rpcCaller,
     publishSignal,
     settingsChanged,
     reportNeedsConfiguration,
@@ -460,6 +564,7 @@ export function createPluginApi(options: {
     reportAgentToolProblem,
     requestQueueDrain,
     declaredIconNames,
+    brandingIcon,
     requestInteraction,
     ensureSharedPortTunnel,
     validateSharedPortDeclaration,
@@ -470,22 +575,26 @@ export function createPluginApi(options: {
     registerAiService,
     isProviderIdTaken,
     assertProviderRegistrable,
-    isAiServiceIdTaken,
-    assertAiServiceRegistrable,
   } = options;
   let invalidated = false;
   let activated = false;
-  let wrappedSdk: BbSdk | undefined;
+  let wrappedSdk: PluginBbSdk | undefined;
   let pendingNeedsConfiguration: string | null = null;
   const pendingAgentToolProblems: string[] = [];
   const pendingSharedPorts = new Map<string, readonly number[]>();
   const disposeHooks: Array<() => void | Promise<void>> = [];
+  const installHandlers: Array<() => void | Promise<void>> = [];
   const settingsRecord: PluginApiHandle["settings"] = {
     descriptors: {},
     listeners: [],
   };
   const databaseHandles: Database.Database[] = [];
   const threadEventHandlers: PluginThreadEventHandlers = {
+    "experimental_thread.events": [],
+    "experimental_thread.parentChanged": [],
+    "experimental_terminal.input": [],
+    "experimental_host.deleted": [],
+    "experimental_environment.removed": [],
     "thread.created": [],
     "thread.active": [],
     "thread.idle": [],
@@ -496,11 +605,27 @@ export function createPluginApi(options: {
     "message.queued": [],
     "message.dispatched": [],
     "turn.failed": [],
+    "message.cancelled": [],
+    "thread.unarchived": [],
   };
   const hooks: PluginHookRecords = {
     "message.dispatch": null,
   };
+  const environmentCompositions = new Map<
+    string,
+    NormalizedPluginEnvironmentComposition
+  >();
+  const environmentProviders = new Map<
+    string,
+    NormalizedPluginEnvironmentProvider
+  >();
+  const machineProviders = new Map<string, NormalizedPluginMachineProvider>();
+  const serverAccessProviders = new Map<
+    string,
+    import("@get-bb/plugin-sdk").ServerAccessProviderDeclaration
+  >();
   const httpRoutes: PluginHttpRouteRecord[] = [];
+  const websocketRoutes: PluginWebSocketRouteRecord[] = [];
   const rpcHandlers = new Map<string, PluginRpcHandler>();
   const hostWorkerExitHandlers: PluginHostWorkerExitHandler[] = [];
   const hostSignalHandlers: PluginHostSignalHandler[] = [];
@@ -531,62 +656,31 @@ export function createPluginApi(options: {
     requestOptions?: Parameters<PluginUi["requestInput"]>[1],
   ) {
     assertLive();
-    if (!request || typeof request !== "object") {
-      throw new Error("ui.requestInput requires an options object");
+    const normalized = normalizeInteractionRequest(request);
+    const glyph = normalized.presentation?.icon?.glyph;
+    const iconProblem =
+      glyph === undefined
+        ? null
+        : undeclaredIconProblem(pluginId, declaredIconNames, glyph);
+    if (iconProblem !== null) {
+      throw new Error(`ui.requestInput presentation.icon ${iconProblem}`);
     }
-    if (typeof request.threadId !== "string" || request.threadId.length === 0) {
-      throw new Error("ui.requestInput threadId must be a non-empty string");
-    }
-    if (
-      typeof request.rendererId !== "string" ||
-      !/^[a-zA-Z0-9_-]+$/.test(request.rendererId)
-    ) {
-      throw new Error(
-        "ui.requestInput rendererId must use letters, digits, '-' or '_'",
-      );
-    }
-    if (
-      typeof request.title !== "string" ||
-      request.title.trim().length === 0 ||
-      request.title.trim().length > PLUGIN_INTERACTION_MAX_TITLE_LENGTH
-    ) {
-      throw new Error(
-        `ui.requestInput title must be 1-${PLUGIN_INTERACTION_MAX_TITLE_LENGTH} characters`,
-      );
-    }
-    let payload: JsonValue;
-    try {
-      const json = JSON.stringify(request.payload);
-      if (json === undefined) throw new Error();
-      if (
-        Buffer.byteLength(json, "utf8") > PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES
-      ) {
-        throw new Error("ui.requestInput payload exceeds 64 KiB");
-      }
-      payload = JSON.parse(json) as JsonValue;
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("64 KiB"))
-        throw error;
-      throw new Error("ui.requestInput payload must be JSON-serializable");
-    }
-    const timeoutMs = request.timeoutMs ?? 10 * 60 * 1000;
-    if (
-      !Number.isInteger(timeoutMs) ||
-      timeoutMs <= 0 ||
-      timeoutMs > 60 * 60 * 1000
-    ) {
-      throw new Error(
-        "ui.requestInput timeoutMs must be between 1 and 3600000",
-      );
-    }
-    return requestInteraction({
-      threadId: request.threadId,
-      rendererId: request.rendererId,
-      title: request.title.trim(),
-      payload,
-      timeoutMs,
+    const pending = requestInteraction({
+      ...normalized,
+      presentation: fillPluginPresentation({
+        declared: normalized.presentation,
+        brandingIcon,
+        label: {
+          pending: `Waiting for ${normalized.title}`,
+          completed: `Submitted ${normalized.title}`,
+        },
+      }),
       signal: requestOptions?.signal,
     });
+    if (!requestOptions?.signal?.aborted) {
+      detachActivePluginToolCallForUserInput();
+    }
+    return pending;
   }
 
   const kv: PluginKvStorage = {
@@ -642,59 +736,7 @@ export function createPluginApi(options: {
     },
     migrate(database, statements) {
       assertLive();
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, statement_hash TEXT)",
-      );
-      const migrationColumns = database
-        .prepare<[], { name: string }>("PRAGMA table_info(_bb_migrations)")
-        .all();
-      if (
-        !migrationColumns.some((column) => column.name === "statement_hash")
-      ) {
-        database.exec(
-          "ALTER TABLE _bb_migrations ADD COLUMN statement_hash TEXT",
-        );
-      }
-      const rows = database
-        .prepare<[], { id: number; statement_hash: string | null }>(
-          "SELECT id, statement_hash FROM _bb_migrations ORDER BY id",
-        )
-        .all();
-      const applied = new Map<number, string | null>();
-      for (const row of rows) applied.set(row.id, row.statement_hash);
-      const statementHashes = statements.map(migrationStatementHash);
-      statementHashes.forEach((statementHash, index) => {
-        const recordedHash = applied.get(index);
-        if (
-          recordedHash !== undefined &&
-          recordedHash !== null &&
-          recordedHash !== statementHash
-        ) {
-          throw new Error(
-            `migration ${index} does not match the recorded statement; append a new migration instead of changing or reusing an index`,
-          );
-        }
-      });
-      const adopt = database.prepare(
-        "UPDATE _bb_migrations SET statement_hash = ? WHERE id = ? AND statement_hash IS NULL",
-      );
-      const record = database.prepare(
-        "INSERT INTO _bb_migrations (id, applied_at, statement_hash) VALUES (?, ?, ?)",
-      );
-      database.transaction(() => {
-        for (const row of rows) {
-          if (row.statement_hash !== null) continue;
-          adopt.run(
-            statementHashes[row.id] ?? LEGACY_UNKNOWN_MIGRATION_HASH,
-            row.id,
-          );
-        }
-        statements.forEach((statement, index) => {
-          if (applied.has(index)) return;
-          database.exec(statement);
-          record.run(index, Date.now(), statementHashes[index]);
-        });
-      })();
+      runPluginStorageMigrations(database, statements);
     },
   };
 
@@ -766,95 +808,41 @@ export function createPluginApi(options: {
   const http: PluginHttp = {
     route(method, path, handler, opts) {
       assertLive();
-      const normalizedMethod = String(method).toUpperCase();
-      if (!PLUGIN_HTTP_METHODS.has(normalizedMethod)) {
-        throw new Error(
-          `invalid http method "${String(method)}" — use one of: ${[...PLUGIN_HTTP_METHODS].join(", ")}`,
-        );
-      }
-      if (typeof path !== "string" || !path.startsWith("/")) {
-        throw new Error(
-          `http route path must be a string starting with "/", got ${JSON.stringify(path)}`,
-        );
-      }
-      if (typeof handler !== "function") {
-        throw new Error(
-          `http route handler for ${normalizedMethod} ${path} must be a function`,
-        );
-      }
-      const auth = opts?.auth ?? "local";
-      if (auth !== "local" && auth !== "token" && auth !== "none") {
-        throw new Error(
-          `invalid auth mode "${String(auth)}" for ${normalizedMethod} ${path} — use "local", "token", or "none"`,
-        );
-      }
-      if (
-        httpRoutes.some(
-          (route) => route.method === normalizedMethod && route.path === path,
-        )
-      ) {
-        throw new Error(
-          `http route ${normalizedMethod} ${path} is already registered`,
-        );
-      }
-      httpRoutes.push({ method: normalizedMethod, path, auth, handler });
+      const route = normalizeHttpRouteRegistration(
+        method,
+        path,
+        handler,
+        opts,
+        httpRoutes,
+      );
+      httpRoutes.push({ ...route, handler });
+    },
+    experimental_websocket(path, handler, opts) {
+      assertLive();
+      const route = normalizeWebSocketRouteRegistration(
+        path,
+        handler,
+        opts,
+        websocketRoutes,
+      );
+      websocketRoutes.push({
+        ...route,
+        handler,
+        active: true,
+        sockets: new Set(),
+      });
     },
   };
 
   const rpc: PluginRpc = {
-    register(contract, handlers) {
+    register(contract, handlers, options) {
       assertLive();
-      if (
-        typeof contract !== "object" ||
-        contract === null ||
-        Array.isArray(contract)
-      ) {
-        throw new Error("rpc.register contract must be an object");
-      }
-      if (
-        typeof handlers !== "object" ||
-        handlers === null ||
-        Array.isArray(handlers)
-      ) {
-        throw new Error("rpc.register handlers must be an object");
-      }
-
-      const pending: Array<[string, PluginRpcHandler]> = [];
-      const contractEntries = Object.entries(contract);
-      const contractNames = new Set(contractEntries.map(([name]) => name));
-      for (const extraName of Object.keys(handlers)) {
-        if (!contractNames.has(extraName)) {
-          throw new Error(
-            `rpc handler "${extraName}" has no matching contract method`,
-          );
-        }
-      }
-      for (const [name, methodContractValue] of contractEntries) {
-        if (!RPC_METHOD_PATTERN.test(name)) {
-          throw new Error(
-            `invalid rpc method name "${name}" — use dot-separated segments with letters, digits, "-" and "_"`,
-          );
-        }
-        const methodContract = readRpcMethodContract(name, methodContractValue);
-        const handler = Reflect.get(handlers, name);
-        if (typeof handler !== "function") {
-          throw new Error(
-            `rpc method "${name}" must provide a handler function`,
-          );
-        }
-        if (rpcHandlers.has(name)) {
-          throw new Error(`rpc method "${name}" is already registered`);
-        }
-        pending.push([
-          name,
-          {
-            inputSchema: methodContract.input,
-            outputSchema: methodContract.output,
-            handler: handler as (input: never) => unknown,
-          },
-        ]);
-      }
-      for (const [name, record] of pending) {
+      for (const [name, record] of normalizeRpcRegistration(
+        contract,
+        handlers,
+        rpcHandlers,
+        options,
+      )) {
         rpcHandlers.set(name, record);
       }
     },
@@ -863,69 +851,34 @@ export function createPluginApi(options: {
   const realtime: PluginRealtime = {
     publish(channel, payload) {
       assertLive();
-      if (typeof channel !== "string" || channel.length === 0) {
-        throw new Error("realtime channel must be a non-empty string");
-      }
-      let normalized: unknown = null;
-      if (payload !== undefined) {
-        let json: string | undefined;
-        try {
-          json = JSON.stringify(payload);
-        } catch {
-          json = undefined;
-        }
-        if (json === undefined) {
-          throw new Error(
-            `realtime payload for channel "${channel}" is not JSON-serializable`,
-          );
-        }
-        normalized = JSON.parse(json);
-      }
-      publishSignal(channel, normalized);
+      publishSignal(channel, normalizeRealtimePayload(channel, payload));
     },
   };
 
   const background: PluginBackground = {
     service(name, service) {
       assertLive();
-      if (typeof name !== "string" || !BACKGROUND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid service name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (backgroundServices.some((record) => record.name === name)) {
-        throw new Error(`background service "${name}" is already registered`);
-      }
-      if (typeof service?.start !== "function") {
-        throw new Error(
-          `background service "${name}" must provide a start(signal) function`,
-        );
-      }
-      backgroundServices.push({ name, start: service.start.bind(service) });
+      backgroundServices.push(
+        validateBackgroundServiceRegistration(
+          name,
+          service,
+          backgroundServices,
+        ),
+      );
     },
     schedule(name, cron, fn) {
       assertLive();
-      if (typeof name !== "string" || !BACKGROUND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid schedule name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (schedules.some((record) => record.name === name)) {
-        throw new Error(`schedule "${name}" is already registered`);
-      }
-      try {
-        CronExpressionParser.parse(String(cron));
-      } catch (error) {
-        throw new Error(
-          `invalid cron ${JSON.stringify(cron)} for schedule "${name}": ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-      if (typeof fn !== "function") {
-        throw new Error(`schedule "${name}" must provide a function`);
-      }
-      schedules.push({ name, cron: String(cron), fn });
+      schedules.push(
+        validateScheduleRegistration(
+          name,
+          cron,
+          fn,
+          schedules,
+          (expression) => {
+            CronExpressionParser.parse(expression);
+          },
+        ),
+      );
     },
   };
 
@@ -950,6 +903,11 @@ export function createPluginApi(options: {
     isActivated: () => activated,
     disposeHooks,
   });
+  const providerEnvResolvers = new Map<string, PluginProviderEnvResolver>();
+  const providerEnvHealthResolvers = new Map<
+    string,
+    PluginProviderEnvHealthResolver
+  >();
   let agentConfigurationProvider: PluginAgentConfigurationProvider | null =
     null;
   let instructionProvider: PluginInstructionProvider | null = null;
@@ -983,7 +941,7 @@ export function createPluginApi(options: {
       name: string;
       description: string;
       instructions?: string;
-      presentation?: PluginAgentToolPresentation;
+      presentation?: PluginRowPresentation;
       parameters: unknown;
       execute(
         params: never,
@@ -991,174 +949,33 @@ export function createPluginApi(options: {
       ): PluginAgentToolResult | Promise<PluginAgentToolResult>;
     }) {
       assertLive();
-      const name = tool?.name;
-      if (typeof name !== "string" || !AGENT_TOOL_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid tool name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (RESERVED_AGENT_TOOL_NAMES.includes(name)) {
-        throw new Error(
-          `tool name "${name}" is a built-in bb tool — pick another name`,
-        );
-      }
-      rejectStaleAgentToolFields(name, tool);
-      if (
-        typeof tool.description !== "string" ||
-        tool.description.trim().length === 0
-      ) {
-        throw new Error(`tool "${name}" must provide a description`);
-      }
-      if (
-        tool.instructions !== undefined &&
-        typeof tool.instructions !== "string"
-      ) {
-        throw new Error(`tool "${name}" instructions must be a string`);
-      }
-      if (
-        typeof tool.instructions === "string" &&
-        tool.instructions.length > PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS
-      ) {
-        throw new Error(
-          `tool "${name}" instructions exceed the ${PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS}-character limit`,
-        );
-      }
-      const presentation = parsePluginAgentToolPresentation(
-        name,
-        tool.presentation,
-      );
-      if (presentation?.icon !== undefined) {
-        const problem = undeclaredIconProblem(
-          pluginId,
-          declaredIconNames,
-          presentation.icon.glyph,
-        );
-        if (problem !== null) {
-          throw new Error(agentToolIconRefusalMessage(name, problem));
-        }
-      }
-      if (typeof tool.execute !== "function") {
-        throw new Error(
-          `tool "${name}" must provide an execute(params, ctx) function`,
-        );
-      }
-      const parameters: unknown = tool.parameters;
-      let inputSchema: unknown;
-      let parse: PluginAgentToolRecord["parse"];
-      if (isZodSchemaLike(parameters)) {
-        try {
-          inputSchema = zodSchemaToJsonSchema(parameters);
-        } catch (error) {
-          throw new Error(
-            `tool "${name}" parameters look like a zod schema but could not be converted to JSON Schema (${
-              error instanceof Error ? error.message : String(error)
-            }) — use zod 4, or pass a plain JSON-schema object`,
-          );
-        }
-        parse = (input) => {
-          const result = parameters.safeParse(input);
-          if (result.success) return { ok: true, value: result.data };
-          return { ok: false, error: summarizeParseIssues(result.error) };
-        };
-      } else if (
-        typeof parameters === "object" &&
-        parameters !== null &&
-        !Array.isArray(parameters)
-      ) {
-        try {
-          inputSchema = JSON.parse(JSON.stringify(parameters));
-        } catch {
-          throw new Error(
-            `tool "${name}" parameters JSON schema is not JSON-serializable`,
-          );
-        }
-        parse = (input) => ({ ok: true, value: input });
-      } else {
-        throw new Error(
-          `tool "${name}" parameters must be a zod schema or a JSON-schema object`,
-        );
-      }
-      assertNoRecursiveJsonSchemaReferences(
-        inputSchema,
-        `tool "${name}" parameters`,
-      );
-      const owner = isAgentToolNameTaken(name);
+      const record = normalizeAgentToolRegistration({
+        pluginId,
+        declaredIconNames,
+        tool,
+      });
+      const owner = isAgentToolNameTaken(record.name);
       if (owner !== undefined) {
-        const problem = `tool "${name}" is already registered by plugin "${owner}" — not registered`;
+        const problem = `tool "${record.name}" is already registered by plugin "${owner}" — not registered`;
         if (activated) reportAgentToolProblem(problem);
         else pendingAgentToolProblems.push(problem);
         return;
       }
-      if (agentTools.some((existing) => existing.name === name)) {
-        throw new Error(`tool "${name}" is already registered`);
+      if (agentTools.some((existing) => existing.name === record.name)) {
+        throw new Error(`tool "${record.name}" is already registered`);
       }
-      const record: PluginAgentToolRecord = {
-        name,
-        description: tool.description,
-        presentation,
-        instructions:
-          tool.instructions !== undefined && tool.instructions.trim().length > 0
-            ? tool.instructions
-            : null,
-        inputSchema,
-        parse,
-        execute: (
-          tool.execute as (
-            params: unknown,
-            ctx: PluginAgentToolContext,
-          ) => PluginAgentToolResult | Promise<PluginAgentToolResult>
-        ).bind(tool),
-      };
       agentTools.push(record);
     },
   };
-  Object.defineProperty(agents, "experimental_registerProvider", {
-    enumerable: false,
-    configurable: false,
-    get(): never {
-      throw new Error(
-        "bb.agents.experimental_registerProvider was removed in SDK 0.4.16; use bb.providers.register",
-      );
-    },
-  });
 
   const mentionProviders: PluginMentionProviderRecord[] = [];
   const ui: PluginUi = {
     requestInput,
     registerMentionProvider(provider) {
       assertLive();
-      const id = provider?.id;
-      if (typeof id !== "string" || !MENTION_PROVIDER_ID_PATTERN.test(id)) {
-        throw new Error(
-          `invalid mention provider id ${JSON.stringify(id)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (mentionProviders.some((record) => record.id === id)) {
-        throw new Error(`mention provider "${id}" is already registered`);
-      }
-      if (
-        typeof provider.label !== "string" ||
-        provider.label.trim().length === 0
-      ) {
-        throw new Error(`mention provider "${id}" must provide a label`);
-      }
-      if (typeof provider.search !== "function") {
-        throw new Error(
-          `mention provider "${id}" must provide a search({ query, projectId, threadId }) function`,
-        );
-      }
-      if (typeof provider.resolve !== "function") {
-        throw new Error(
-          `mention provider "${id}" must provide a resolve(itemId) function`,
-        );
-      }
-      mentionProviders.push({
-        id,
-        label: provider.label.trim(),
-        triggers: normalizeMentionProviderTriggers(id, provider.triggers),
-        search: provider.search.bind(provider),
-        resolve: provider.resolve.bind(provider),
-      });
+      mentionProviders.push(
+        normalizeMentionProviderRegistration(provider, mentionProviders),
+      );
     },
   };
 
@@ -1166,53 +983,10 @@ export function createPluginApi(options: {
   const cli: PluginCli = {
     register(registration) {
       assertLive();
-      if (cliRecord.registration !== null) {
-        throw new Error("cli command is already registered");
-      }
-      const name = registration?.name;
-      if (typeof name !== "string" || !CLI_COMMAND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid cli command name ${JSON.stringify(name)} — use lowercase letters, digits, and "-"`,
-        );
-      }
-      if (
-        typeof registration.summary !== "string" ||
-        registration.summary.trim().length === 0
-      ) {
-        throw new Error(`cli command "${name}" must provide a summary`);
-      }
-      const commands = registration.commands ?? [];
-      if (!Array.isArray(commands)) {
-        throw new Error(`cli command "${name}" commands must be an array`);
-      }
-      const validatedCommands = commands.map((command, index) => {
-        if (
-          typeof command?.name !== "string" ||
-          !CLI_COMMAND_NAME_PATTERN.test(command.name) ||
-          typeof command.summary !== "string" ||
-          typeof command.usage !== "string"
-        ) {
-          throw new Error(
-            `cli command "${name}" commands[${index}] must be { name: [a-z0-9-]+, summary, usage }`,
-          );
-        }
-        return {
-          name: command.name,
-          summary: command.summary,
-          usage: command.usage,
-        };
-      });
-      if (typeof registration.run !== "function") {
-        throw new Error(
-          `cli command "${name}" must provide a run(argv, ctx) function`,
-        );
-      }
-      cliRecord.registration = {
-        name,
-        summary: registration.summary,
-        commands: validatedCommands,
-        run: registration.run.bind(registration),
-      };
+      cliRecord.registration = normalizeCliRegistration(
+        registration,
+        cliRecord.registration !== null,
+      );
     },
   };
 
@@ -1280,6 +1054,14 @@ export function createPluginApi(options: {
             ...(callOptions.signal === undefined
               ? {}
               : { signal: callOptions.signal }),
+            ...(callOptions.timeoutMs === undefined
+              ? {}
+              : {
+                  timeoutMs: Math.min(
+                    Math.max(1_000, Math.floor(callOptions.timeoutMs)),
+                    PLUGIN_HOST_CALL_MAX_TIMEOUT_MS,
+                  ),
+                }),
           });
         },
         experimental_onWorkerExit(handler) {
@@ -1382,13 +1164,155 @@ export function createPluginApi(options: {
 
   const providers: PluginProviders = {
     register: providerRegistrations.register,
+    experimental_contributeEnv(providerId, resolve) {
+      assertLive();
+      validateProviderEnvContribution(
+        "provider environment contribution",
+        providerId,
+        resolve,
+        providerEnvResolvers,
+      );
+      providerEnvResolvers.set(providerId, resolve);
+    },
+    experimental_contributeEnvHealth(providerId, resolve) {
+      assertLive();
+      validateProviderEnvContribution(
+        "provider environment health contribution",
+        providerId,
+        resolve,
+        providerEnvHealthResolvers,
+      );
+      providerEnvHealthResolvers.set(providerId, resolve);
+    },
+  };
+
+  const experimental_environments: PluginEnvironments = {
+    register(
+      declaration:
+        | import("@get-bb/plugin-sdk").PluginEnvironmentProviderDeclaration
+        | NormalizedPluginEnvironmentComposition,
+    ) {
+      assertLive();
+      if ("machineProviderId" in declaration) {
+        const composition = environmentCompositionSchema.parse(declaration);
+        const problem =
+          composition.icon === null
+            ? null
+            : undeclaredIconProblem(
+                pluginId,
+                declaredIconNames,
+                composition.icon,
+              );
+        if (problem !== null)
+          throw new Error(providerIconRefusalMessage(composition.id, problem));
+        const owner = options.isEnvironmentProviderIdTaken(composition.id);
+        if (owner !== undefined)
+          throw new Error(
+            `environment provider "${composition.id}" is already registered by plugin "${owner}"`,
+          );
+        if (environmentProviders.has(composition.id))
+          throw new Error(
+            "Environment ID is already registered as a concrete provider",
+          );
+        environmentCompositions.set(composition.id, composition);
+        return;
+      }
+      if (environmentCompositions.has(declaration.id))
+        throw new Error(
+          "Environment ID is already registered as a composition",
+        );
+      const provider =
+        validatePluginEnvironmentProviderDeclaration(declaration);
+      const problem =
+        provider.icon === null
+          ? null
+          : undeclaredIconProblem(pluginId, declaredIconNames, provider.icon);
+      if (problem !== null)
+        throw new Error(providerIconRefusalMessage(provider.id, problem));
+      const owner = options.isEnvironmentProviderIdTaken(provider.id);
+      if (owner !== undefined) {
+        throw new Error(
+          `environment provider "${provider.id}" is already registered by plugin "${owner}"`,
+        );
+      }
+      environmentProviders.set(provider.id, provider);
+    },
+    async recheck() {
+      assertLive();
+      requestEnvironmentProviderRecheck(options.pluginId);
+    },
+  };
+
+  const experimental_serverAccess: import("@get-bb/plugin-sdk").PluginServerAccess =
+    {
+      register(declaration) {
+        assertLive();
+        validateServerAccessProviderDeclaration(declaration);
+        if (
+          serverAccessProviders.has(declaration.id) ||
+          listServerAccessProviders().some(
+            (entry) =>
+              entry.provider.id === declaration.id &&
+              entry.pluginId !== pluginId,
+          )
+        ) {
+          throw new Error(
+            `Server access provider "${declaration.id}" is already registered`,
+          );
+        }
+        serverAccessProviders.set(declaration.id, declaration);
+      },
+      recheck() {
+        assertLive();
+        requestServerAccessRecheck(options.pluginId);
+      },
+    };
+
+  const enrollmentApi: MachineEnrollments = {
+    clearPending(key) {
+      assertLive();
+      options.getMachineEnrollments().clearPending(key);
+    },
+    prepare(request) {
+      assertLive();
+      return options.getMachineEnrollments().prepare(request);
+    },
+    waitForConnection(request) {
+      assertLive();
+      return options.getMachineEnrollments().waitForConnection(request);
+    },
+  };
+  const experimental_machines: PluginMachines = {
+    ...createMachineBootstrapApi(enrollmentApi),
+    async getResource(hostId) {
+      assertLive();
+      return getHost(db, hostId)?.resource ?? null;
+    },
+    register(declaration) {
+      assertLive();
+      const provider = validatePluginMachineProviderDeclaration(declaration);
+      const problem = undeclaredIconProblem(
+        pluginId,
+        declaredIconNames,
+        provider.icon,
+      );
+      if (problem !== null) {
+        throw new Error(providerIconRefusalMessage(provider.id, problem));
+      }
+      const owner = options.isMachineProviderIdTaken(provider.id);
+      if (owner !== undefined) {
+        throw new Error(
+          `machine provider "${provider.id}" is already registered by plugin "${owner}"`,
+        );
+      }
+      machineProviders.set(provider.id, provider);
+    },
   };
 
   const aiServiceRegistrations = createStagedRegistrations({
     validate: validatePluginAiServiceDeclaration,
-    bind: assertAiServiceRegistrable,
-    isTaken: isAiServiceIdTaken,
-    registerLive: registerAiService,
+    bind: () => null,
+    registerLive: (declaration) => registerAiService(declaration),
     alreadyRegisteredMessage: aiServiceAlreadyRegisteredMessage,
     assertLive,
     isActivated: () => activated,
@@ -1413,36 +1337,60 @@ export function createPluginApi(options: {
     ui,
     events,
     experimental_hooks,
+    experimental_environments,
+    experimental_machines,
+    experimental_serverAccess,
     status,
     server,
     hosts,
     experimental_aiServices,
-    get sdk(): BbSdk {
+    get sdk(): PluginBbSdk {
       assertLive();
       const sdk = getSdk();
-      if (!sdk) {
+      const loopbackBaseUrl = getLoopbackBaseUrl();
+      if (!sdk || loopbackBaseUrl === undefined) {
         throw new Error(
           "bb.sdk is not available until the server is listening — " +
             "use it inside handlers, services, or timers, not at factory load time",
         );
       }
-      wrappedSdk ??= wrapSdkForPlugin(sdk, pluginId);
+      wrappedSdk ??= wrapSdkForPlugin(
+        sdk,
+        pluginId,
+        createPluginRpcCallerSdk({
+          baseUrl: loopbackBaseUrl,
+          token: rpcCaller.token,
+        }),
+      );
       return wrappedSdk;
     },
     onDispose(hook) {
       assertLive();
       disposeHooks.push(hook);
     },
+    onInstall(handler) {
+      assertLive();
+      if (typeof handler !== "function") {
+        throw new Error("onInstall expects a function");
+      }
+      installHandlers.push(handler);
+    },
   };
 
   return {
     api,
     disposeHooks,
+    installHandlers,
     settings: settingsRecord,
     databaseHandles,
     threadEventHandlers,
     hooks,
+    environmentCompositions,
+    environmentProviders,
+    machineProviders,
+    serverAccessProviders,
     httpRoutes,
+    websocketRoutes,
     rpcHandlers,
     hostWorkerExitHandlers,
     hostSignalHandlers,
@@ -1451,6 +1399,8 @@ export function createPluginApi(options: {
     cli: cliRecord,
     agentTools,
     listProviderDeclarations: providerRegistrations.values,
+    providerEnvResolvers,
+    providerEnvHealthResolvers,
     get agentConfigurationProvider() {
       return agentConfigurationProvider;
     },
@@ -1481,8 +1431,24 @@ export function createPluginApi(options: {
         pendingNeedsConfiguration = null;
       }
     },
+    closeWebSockets() {
+      for (const route of websocketRoutes) {
+        route.active = false;
+        for (const socket of route.sockets) {
+          try {
+            socket.close(1012, "Plugin reloaded or disabled");
+          } catch (error) {
+            emitLog(
+              "warn",
+              `websocket ${route.path} close failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      }
+    },
     invalidate() {
       invalidated = true;
+      rpcCaller.revoke();
     },
   };
 }

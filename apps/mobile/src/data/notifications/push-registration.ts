@@ -1,3 +1,4 @@
+import { describeError } from "@/lib/describe-error";
 import type { PushPlatform } from "./push-contract";
 import type { PushRegistrationRecord, PushStore } from "./push-store";
 import {
@@ -13,6 +14,7 @@ export interface PushNotificationsModule {
   getPermission(): Promise<PushPermissionState>;
   requestPermission(): Promise<PushPermissionState>;
   getExpoPushToken(projectId: string): Promise<string>;
+  unregisterDevicePushToken(): Promise<void>;
   addTokenListener(listener: (deviceToken: string) => void): () => void;
   setBadgeCount(count: number): Promise<void>;
 }
@@ -62,10 +64,6 @@ export function isPushRegistrationAllowed(profile: PushSyncProfile): boolean {
   } catch {
     return false;
   }
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 export type PushSyncDecision =
@@ -145,7 +143,7 @@ export async function syncPushRegistration(
       notifications.projectId ?? "",
     );
   } catch (error) {
-    return { action: "failed", step: "token", error: describe(error) };
+    return { action: "failed", step: "token", error: describeError(error) };
   }
   const platform = notifications.platform;
   if (
@@ -177,7 +175,7 @@ export async function syncPushRegistration(
       deviceLabel: deps.deviceLabel,
     }));
   } catch (error) {
-    return { action: "failed", step: "register", error: describe(error) };
+    return { action: "failed", step: "register", error: describeError(error) };
   }
   store.setRegistration(profile.id, {
     subscriptionId,
@@ -199,7 +197,11 @@ export async function unregisterPushRegistration(
   try {
     await deps.api.unregister(existing.serverUrl, existing);
   } catch (error) {
-    return { action: "failed", step: "unregister", error: describe(error) };
+    return {
+      action: "failed",
+      step: "unregister",
+      error: describeError(error),
+    };
   }
   deps.store.setRegistration(profileId, null);
   return { action: "unregistered" };
@@ -216,6 +218,13 @@ export async function enablePushForProfile(
   deps.store.markPrompted();
   deps.store.setEnabled(profileId, permission === "granted");
   return permission;
+}
+
+export function shouldOfferPushPrompt(input: {
+  permission: PushPermissionState;
+  enabled: boolean;
+}): boolean {
+  return input.permission !== "denied" && !input.enabled;
 }
 
 export function describePushStatus(input: {
@@ -237,9 +246,7 @@ export function describePushStatus(input: {
     return "Notifications are blocked in system settings";
   }
   if (input.lastOutcome?.action === "failed") {
-    if (
-      input.lastOutcome.error === PUSH_NOTIFICATIONS_PLUGIN_DISABLED_STATUS
-    ) {
+    if (input.lastOutcome.error === PUSH_NOTIFICATIONS_PLUGIN_DISABLED_STATUS) {
       return PUSH_NOTIFICATIONS_PLUGIN_DISABLED_STATUS;
     }
     return `Could not register: ${input.lastOutcome.error}`;

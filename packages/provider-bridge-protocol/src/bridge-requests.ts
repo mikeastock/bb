@@ -14,6 +14,7 @@ export const toolCallRequestParamsSchema = z
     callId: z.string().min(1),
     tool: z.string().min(1),
     arguments: z.unknown(),
+    providerNativeIds: z.boolean().optional(),
   })
   .passthrough();
 
@@ -41,7 +42,3 @@ export const interactionRequestParamsSchema = z
     providerNativeIds: z.boolean().optional(),
   })
   .passthrough();
-
-export type InteractionRequestParams = z.infer<
-  typeof interactionRequestParamsSchema
->;

@@ -1,3 +1,5 @@
+import { createCoreComposerActions } from "@/lib/plugin-composer-handle";
+import { requestComposerFocus } from "@/lib/composer-focus-requests";
 import {
   useCallback,
   useEffect,
@@ -50,7 +52,7 @@ interface ShowcaseHeroCarouselProps {
   scenes: ShowcaseScenes;
   copy: ShowcaseHeroCopy;
   composer: ShowcaseHeroComposerConfig;
-  rail?: readonly IconName[];
+  rail: readonly IconName[];
   initialIndex?: number;
   autoplay?: boolean;
   composerDisabled?: boolean;
@@ -101,14 +103,21 @@ export function ShowcaseHeroCarousel({
     return () => document.removeEventListener("visibilitychange", update);
   }, []);
 
+  const composerActions = useMemo(
+    () =>
+      createCoreComposerActions({
+        ...promptDraft,
+        focus: () => requestComposerFocus(promptDraft.storageKey),
+      }),
+    [promptDraft],
+  );
   const composingRef = useRef(false);
   const setSeedAndNotify = useCallback(
     (seed: string | null, options?: { replaceDraft?: boolean }) => {
       if (seed !== null && options?.replaceDraft === true) {
-        promptDraft.setDraft({
+        composerActions.replace({
           text: seed,
           mentions: [],
-          attachments: promptDraft.getCurrent().attachments,
         });
       }
       const willCompose = seed !== null;
@@ -119,7 +128,7 @@ export function ShowcaseHeroCarousel({
       setComposerSeed(seed);
       if (seed !== null) setComposerKey((current) => current + 1);
     },
-    [onComposingChange, promptDraft],
+    [onComposingChange, composerActions],
   );
 
   const handledRequestNonce = useRef<number | null>(null);
@@ -208,7 +217,6 @@ export function ShowcaseHeroCarousel({
         {copy.description}
       </p>
 
-      {}
       <div className="@container relative mt-5 grid w-full max-w-[58rem] grid-cols-1 grid-rows-1">
         <div
           className={cn(

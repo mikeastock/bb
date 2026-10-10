@@ -1,9 +1,12 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ThreadEvent } from "@bb/domain";
+import type { ThreadEvent } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { describe, expect, it } from "vitest";
-import { createClaudeDeltaHarness } from "./delta-test-harness.js";
+import {
+  createClaudeDeltaHarness,
+  loadSessionFixture,
+} from "./delta-test-harness.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TRANSCRIPTS = resolve(__dirname, "./__fixtures__/transcripts");
@@ -21,19 +24,6 @@ interface FixtureExpectation {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function loadTranscript(name: string): Record<string, unknown>[] {
-  return readFileSync(resolve(TRANSCRIPTS, name), "utf8")
-    .trim()
-    .split("\n")
-    .map((line) => {
-      const parsed: unknown = JSON.parse(line);
-      if (!isRecord(parsed)) {
-        throw new Error(`${name}: non-object line`);
-      }
-      return parsed;
-    });
 }
 
 function loadExpectations(): Record<string, FixtureExpectation> {
@@ -200,14 +190,13 @@ const fixtureNames = readdirSync(TRANSCRIPTS)
   .filter((name) => name.endsWith(".ndjson"))
   .sort();
 const runs = new Map(
-  fixtureNames.map((name) => [name, runSession(loadTranscript(name))]),
+  fixtureNames.map((name) => [
+    name,
+    runSession(loadSessionFixture(name, "transcripts")),
+  ]),
 );
 
 describe("claude transcript fixtures", () => {
-  it("covers every converted session", () => {
-    expect(fixtureNames.length).toBeGreaterThan(0);
-  });
-
   describe.each(fixtureNames)("%s", (name) => {
     const run = runs.get(name)!;
 

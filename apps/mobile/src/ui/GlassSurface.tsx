@@ -1,10 +1,6 @@
 import Animated from "react-native-reanimated";
 import type { GlassSurfaceProps } from "./glass-surface-types";
 
-export function useLiquidGlass(): boolean {
-  return false;
-}
-
 export function GlassSurface({
   style,
   fallbackStyle,
@@ -22,7 +18,4 @@ export function GlassSurface({
   );
 }
 
-export type {
-  GlassSurfaceLayout,
-  GlassSurfaceProps,
-} from "./glass-surface-types";
+export type { GlassSurfaceProps } from "./glass-surface-types";

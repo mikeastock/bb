@@ -25,10 +25,15 @@ import {
   type CommandDispatchOptions,
 } from "./command-dispatch.js";
 import { isExpectedOnlineRpcFailureError } from "./command-dispatch-support.js";
-import { roundDurationMs } from "./event-loop-stall-monitor.js";
+import { roundDurationMs } from "@bb/process-utils";
 import type { HostDaemonLogger } from "./logger.js";
 import { RuntimeManager } from "./runtime-manager.js";
 import type { PluginHostManager } from "./plugin-host-manager.js";
+import { runInSerialLane } from "./serial-lane.js";
+import {
+  markTurnSubmitTraceSpan,
+  runWithTurnSubmitTrace,
+} from "./turn-submit-trace.js";
 
 type CommandRouterLogger = Pick<HostDaemonLogger, "debug" | "warn">;
 
@@ -46,12 +51,6 @@ interface ReadWriteLaneArgs<T> {
   work: () => Promise<T>;
 }
 
-interface SerialLaneArgs<T> {
-  key: string;
-  lanes: Map<string, Promise<void>>;
-  work: () => Promise<T>;
-}
-
 interface ReadWriteLaneIdleArgs {
   key: string;
   lanes: Map<string, ReadWriteLaneState>;
@@ -62,12 +61,13 @@ interface ReadWriteLaneIdleArgs {
 type CommandRouterTask = Promise<HostDaemonCommandResultForCommand>;
 
 export interface CommandRouterOptions {
+  emitEnvironmentHookProgress?: CommandDispatchOptions["emitEnvironmentHookProgress"];
+  desktopBrowserBroker?: CommandDispatchOptions["desktopBrowserBroker"];
   dataDir: CommandDispatchOptions["dataDir"];
   fetchProjectAttachment: CommandDispatchOptions["fetchProjectAttachment"];
   fetchSkillTree?: CommandDispatchOptions["fetchSkillTree"];
   fetchPluginHostArtifact?: CommandDispatchOptions["fetchPluginHostArtifact"];
   runtimeManager: RuntimeManager;
-  terminalManager?: CommandDispatchOptions["terminalManager"];
   eventSink: CommandDispatchOptions["eventSink"];
   listModels: CommandDispatchOptions["listModels"];
   providerHealth: CommandDispatchOptions["providerHealth"];
@@ -78,6 +78,7 @@ export interface CommandRouterOptions {
   resolveInteractiveRequest?: CommandDispatchOptions["resolveInteractiveRequest"];
   pluginHostManager?: PluginHostManager;
   ensureConnectTunnelIdentity?: CommandDispatchOptions["ensureConnectTunnelIdentity"];
+  serverMove?: CommandDispatchOptions["serverMove"];
   threadStorageRootPath: string;
   logger: CommandRouterLogger;
 }
@@ -104,7 +105,9 @@ export class CommandRouter {
   ): Promise<HostDaemonOnlineRpcResponseMessage> {
     const handlerStartedAtMs = performance.now();
     try {
-      const result = await this.executeHostRpcCommand(message.command);
+      const result = await runWithTurnSubmitTrace(message.command, () =>
+        this.executeHostRpcCommand(message.command),
+      );
       this.logOnlineRpc({
         commandType: message.command.type,
         handlerMs: elapsedMs(handlerStartedAtMs),
@@ -213,9 +216,11 @@ export class CommandRouter {
   private async executeLiveDaemonCommandBody(
     command: HostDaemonCommand,
   ): Promise<HostDaemonCommandResultForCommand> {
+    markTurnSubmitTraceSpan("lanes.entered");
     const result = await dispatchCommand(command, this.createDispatchOptions());
     if (shouldFlushEventsBeforeReportingCommandResult(command)) {
       await this.options.eventSink.flush();
+      markTurnSubmitTraceSpan("events.flushed");
     }
     return parseHostDaemonCommandResultForCommand(command, result);
   }
@@ -242,12 +247,7 @@ export class CommandRouter {
     const threadWork =
       threadLaneKey === null
         ? work
-        : () =>
-            this.runInSerialLane({
-              key: threadLaneKey,
-              lanes: this.threadLaneTails,
-              work,
-            });
+        : () => runInSerialLane(this.threadLaneTails, threadLaneKey, work);
     if (!environmentLaneMode) {
       return threadWork();
     }
@@ -268,11 +268,7 @@ export class CommandRouter {
     if (command.type !== "thread.start" && command.type !== "turn.submit") {
       return work();
     }
-    return this.runInSerialLane({
-      key: command.threadId,
-      lanes: this.threadTurnLaneTails,
-      work,
-    });
+    return runInSerialLane(this.threadTurnLaneTails, command.threadId, work);
   }
 
   private createDispatchOptions(): CommandDispatchOptions {
@@ -281,7 +277,7 @@ export class CommandRouter {
       fetchSkillTree: this.options.fetchSkillTree,
       fetchPluginHostArtifact: this.options.fetchPluginHostArtifact,
       runtimeManager: this.options.runtimeManager,
-      terminalManager: this.options.terminalManager,
+      desktopBrowserBroker: this.options.desktopBrowserBroker,
       dataDir: this.options.dataDir,
       eventSink: this.options.eventSink,
       listModels: this.options.listModels,
@@ -290,8 +286,10 @@ export class CommandRouter {
       providerInstallationStatus: this.options.providerInstallationStatus,
       providerInstallationRun: this.options.providerInstallationRun,
       refreshShellEnv: this.options.refreshShellEnv,
+      emitEnvironmentHookProgress: this.options.emitEnvironmentHookProgress,
       resolveInteractiveRequest: this.options.resolveInteractiveRequest,
       ensureConnectTunnelIdentity: this.options.ensureConnectTunnelIdentity,
+      serverMove: this.options.serverMove,
       threadStorageRootPath: this.options.threadStorageRootPath,
       logger: this.options.logger,
     };
@@ -370,26 +368,6 @@ export class CommandRouter {
     });
   }
 
-  private runInSerialLane<T>({
-    key,
-    lanes,
-    work,
-  }: SerialLaneArgs<T>): Promise<T> {
-    const previousTail = lanes.get(key) ?? Promise.resolve();
-    const next = previousTail.catch(() => undefined).then(work);
-    const done = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    lanes.set(key, done);
-    void done.then(() => {
-      if (lanes.get(key) === done) {
-        lanes.delete(key);
-      }
-    });
-    return next;
-  }
-
   private runInReadWriteLane<T>({
     key,
     lanes,
@@ -445,6 +423,7 @@ export class CommandRouter {
       case "thread.archive":
       case "interactive.resolve":
       case "thread.stop":
+      case "thread.storage.delete":
       case "thread.plan.cancel":
       case "thread.goal.clear":
         return `${command.environmentId}\0thread:${command.threadId}`;

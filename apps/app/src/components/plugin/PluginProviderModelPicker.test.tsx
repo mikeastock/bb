@@ -9,9 +9,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import type { AvailableModel, ProviderInfo, ReasoningLevel } from "@bb/domain";
+import { makeProviderInfo } from "@bb/test-helpers/domain-fixtures";
 import type { SystemExecutionOptionsResponse } from "@bb/server-contract";
 import type { ExperimentalProviderModelPickerValue } from "@get-bb/plugin-sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { systemExecutionOptionsQueryKey } from "@/hooks/queries/query-keys";
 import {
   modelCatalogCacheKey,
@@ -24,13 +25,14 @@ import {
 import { sdk } from "@/lib/sdk";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
 import { PluginProviderModelPicker } from "./PluginProviderModelPicker";
+import { ModelReasoningMenu } from "@/components/pickers/ModelReasoningMenuSplit";
 
 vi.mock("@/lib/sdk", () => ({
   sdk: {
     hosts: { list: vi.fn().mockResolvedValue([]) },
     system: {
       config: vi.fn().mockResolvedValue({ primaryHostId: null }),
-      executionOptions: vi.fn(),
+      executionOptions: vi.fn(() => new Promise<never>(() => undefined)),
     },
   },
 }));
@@ -47,12 +49,10 @@ function provider(
   brandPrefix: string,
   supportsServiceTier: boolean,
 ): ProviderInfo {
-  return {
+  return makeProviderInfo({
     id,
-    pluginId: `provider-${id}`,
     displayName,
     logoUrl: null,
-    available: true,
     maintenance: { health: true, usage: true, installation: false },
     strings: {
       signInHint: "Sign in",
@@ -60,7 +60,6 @@ function provider(
       installUrl: "https://example.com/install",
       brandPrefix,
     },
-    composerActions: [],
     capabilities: {
       supportsThreadArchive: true,
       supportsThreadRename: true,
@@ -71,7 +70,7 @@ function provider(
       permissionModes: ["auto"],
       modelCatalogScope: "host",
     },
-  };
+  });
 }
 
 function model(
@@ -125,6 +124,8 @@ function cacheCatalog(
     response,
   );
 }
+
+beforeAll(() => ModelReasoningMenu.preload());
 
 afterEach(() => {
   cleanup();
@@ -194,6 +195,65 @@ describe("PluginProviderModelPicker", () => {
     });
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByRole("button", { name: "Agent" })).toBeDefined();
+  });
+
+  it("emits a reconciled tier in the first provider change", async () => {
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    const tierProviders = providers.map((entry) =>
+      entry.id === "codex"
+        ? { ...entry, serviceTiers: [{ id: "ultrafast", label: "Ultrafast" }] }
+        : entry,
+    );
+    cacheCatalog(queryClient, "codex", {
+      ...executionOptions([
+        {
+          ...model("gpt-5.5", "OpenAI GPT-5.5", ["high"], true),
+          supportedServiceTiers: [{ id: "ultrafast" }],
+        },
+      ]),
+      providers: tierProviders,
+    });
+    cacheCatalog(queryClient, "cursor", {
+      ...executionOptions([
+        {
+          ...model("cursor-agent", "Cursor Agent", ["high"], true),
+          supportedServiceTiers: [{ id: "fast" }],
+        },
+      ]),
+      providers: tierProviders,
+    });
+    const onChange = vi.fn();
+    function ControlledPicker() {
+      const [value, setValue] = useState<ExperimentalProviderModelPickerValue>({
+        providerId: "codex",
+        model: "gpt-5.5",
+        reasoningLevel: "high",
+        serviceTier: "ultrafast",
+      });
+      return (
+        <PluginProviderModelPicker
+          value={value}
+          onChange={(next) => {
+            onChange(next);
+            setValue(next);
+          }}
+        />
+      );
+    }
+    render(<ControlledPicker />, { wrapper });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Provider, model and reasoning" }),
+    );
+    fireEvent.click(screen.getByTitle("Cursor"));
+    await waitFor(() =>
+      expect(onChange).toHaveBeenCalledWith({
+        providerId: "cursor",
+        model: "cursor-agent",
+        reasoningLevel: "high",
+        serviceTier: "default",
+      }),
+    );
+    expect(onChange).toHaveBeenCalledTimes(1);
   });
 
   it("reconciles model capabilities and drops unsupported service tiers", async () => {
@@ -405,6 +465,7 @@ describe("PluginProviderModelPicker", () => {
         modelLoadError: {
           providerId: "claude-code",
           code: "failed",
+          detail: null,
         },
       }),
     );

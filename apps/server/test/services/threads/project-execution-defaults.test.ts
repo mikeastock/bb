@@ -9,10 +9,12 @@ import {
   seedHostSession,
   seedProjectWithSource,
   seedThread,
+  seedThreadIdentity,
   seedTurnStarted,
 } from "../../helpers/seed.js";
 import { textInput } from "../../helpers/prompt-input.js";
 import { withTestHarness } from "../../helpers/test-app.js";
+import { installFakeGitWorktreeProvider } from "../../helpers/environment-provider.js";
 
 describe("project execution defaults persistence", () => {
   it("does not overwrite project defaults when an app thread reuses an existing environment", async () => {
@@ -116,6 +118,7 @@ describe("project execution defaults persistence", () => {
 
   it("does not overwrite project defaults for a fork/side-chat child spawn", async () => {
     await withTestHarness(async (harness) => {
+      installFakeGitWorktreeProvider();
       const { host } = seedHostSession(harness.deps, {
         id: "host-origin-kind-defaults",
       });
@@ -130,6 +133,10 @@ describe("project execution defaults persistence", () => {
       const parentThread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: parentEnvironment.id,
+      });
+      seedThreadIdentity(harness.deps, {
+        threadId: parentThread.id,
+        providerThreadId: "provider-origin-kind-defaults-source",
       });
       seedTurnStarted(harness.deps, {
         threadId: parentThread.id,

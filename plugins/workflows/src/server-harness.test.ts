@@ -1,4 +1,7 @@
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import {
+  createFakePluginHost,
+  makePluginAgentConfigurationContext,
+} from "@get-bb/plugin-sdk/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import { getCall, getRunRequired, migrations } from "./data.js";
 import plugin from "./server.js";
@@ -47,7 +50,7 @@ describe("workflows plugin", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "workflows",
       agentSkillIds: ["workflows"],
-      settings: { maxActiveRuns: "not-a-number" },
+      settings: { maxActiveRuns: 0 },
     });
     hosts.push(harness);
     await expect(plugin(bb)).resolves.toBeUndefined();
@@ -58,7 +61,7 @@ describe("workflows plugin", () => {
     expect(
       harness.registrations.services.map((service) => service.name),
     ).toEqual(["workflow-worker"]);
-    await harness.setSettings({ maxActiveRuns: "5" });
+    await harness.setSettings({ maxActiveRuns: 5 });
   });
 
   it("registers tool schemas without recursive $refs", async () => {
@@ -242,34 +245,15 @@ describe("workflows plugin", () => {
         },
       });
 
-      const workerConfig = await harness.resolveAgentConfiguration({
-        thread: {
-          id: "child-1",
-          title: null,
-          parentThreadId: "thread-test",
-          sourceThreadId: null,
-        },
-        project: {
-          id: "project-test",
-          kind: "standard",
-          name: "test",
-          gitRemoteUrl: null,
-        },
-        environment: {
-          id: "environment-1",
-          name: null,
-          path: "/tmp/test",
-          workspaceProvisionType: "unmanaged",
-          branchName: null,
-        },
-        host: { id: "host-1", name: "host" },
-        provider: {
-          id: "codex",
-          model: "gpt-test",
-          capabilities: { supportsNativeUserQuestion: false },
-        },
-        origin: { kind: null, pluginId: "workflows" },
-      });
+      const workerConfig = await harness.resolveAgentConfiguration(
+        makePluginAgentConfigurationContext({
+          thread: {
+            id: "child-1",
+            parentThreadId: "thread-test",
+          },
+          origin: { pluginId: "workflows" },
+        }),
+      );
       expect(workerConfig.tools.map((tool) => tool.name)).toEqual([
         "bb_workflow_result",
       ]);
@@ -286,34 +270,9 @@ describe("workflows plugin", () => {
         additionalProperties: false,
       });
 
-      const authorConfig = await harness.resolveAgentConfiguration({
-        thread: {
-          id: "thread-test",
-          title: null,
-          parentThreadId: null,
-          sourceThreadId: null,
-        },
-        project: {
-          id: "project-test",
-          kind: "standard",
-          name: "test",
-          gitRemoteUrl: null,
-        },
-        environment: {
-          id: "environment-1",
-          name: null,
-          path: "/tmp/test",
-          workspaceProvisionType: "unmanaged",
-          branchName: null,
-        },
-        host: { id: "host-1", name: "host" },
-        provider: {
-          id: "codex",
-          model: "gpt-test",
-          capabilities: { supportsNativeUserQuestion: false },
-        },
-        origin: { kind: null, pluginId: null },
-      });
+      const authorConfig = await harness.resolveAgentConfiguration(
+        makePluginAgentConfigurationContext(),
+      );
       expect(authorConfig.tools.map((tool) => tool.name)).toEqual([
         "bb_workflow_run",
       ]);
@@ -1112,7 +1071,6 @@ describe("workflow resume cache integration", () => {
       expect(getRunRequired(test.db, original.id)).toMatchObject({
         status: "succeeded",
         replaySafetyVersion: 1,
-        replayBarrierIndex: null,
       }),
     );
 
@@ -1120,7 +1078,6 @@ describe("workflow resume cache integration", () => {
     await eventually(() =>
       expect(getRunRequired(test.db, resumed.id)).toMatchObject({
         status: "succeeded",
-        replayBarrierIndex: null,
         resultJson:
           '["prefix-value",["left-value","right-value"],"after-value"]',
       }),
@@ -1183,7 +1140,6 @@ describe("workflow resume cache integration", () => {
     await eventually(() =>
       expect(getRunRequired(test.db, original.id)).toMatchObject({
         status: "succeeded",
-        replayBarrierIndex: null,
       }),
     );
 
@@ -1200,7 +1156,6 @@ describe("workflow resume cache integration", () => {
     await eventually(() =>
       expect(getRunRequired(test.db, resumed.id)).toMatchObject({
         status: "succeeded",
-        replayBarrierIndex: null,
         resultJson: '["prefix-old",["left-old","right-old"]]',
       }),
     );
@@ -1245,7 +1200,6 @@ describe("workflow resume cache integration", () => {
     await eventually(() =>
       expect(getRunRequired(test.db, original.id)).toMatchObject({
         status: "succeeded",
-        replayBarrierIndex: null,
         resultJson: '["prefix",["zero-final","one-final"]]',
       }),
     );
@@ -1294,8 +1248,7 @@ describe("workflow resume cache integration", () => {
     );
     test.db
       .prepare(
-        `UPDATE workflow_runs SET replay_safety_version = 0,
-         replay_barrier_index = NULL WHERE id = ?`,
+        "UPDATE workflow_runs SET replay_safety_version = 0 WHERE id = ?",
       )
       .run(original.id);
 
@@ -1498,7 +1451,6 @@ describe("workflow resume cache integration", () => {
     await eventually(() => expect(test.childCount()).toBe(1));
     await test.finish("cache-child-1", "prefix");
     await eventually(() => expect(test.childCount()).toBe(3));
-    expect(getRunRequired(test.db, run.id).replayBarrierIndex).toBeNull();
     firstController.abort();
     await firstWorker;
 

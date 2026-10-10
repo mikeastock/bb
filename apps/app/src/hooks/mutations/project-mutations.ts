@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type {
   CreateProjectRequest,
   CreateProjectSourceRequest,
+  ReorderProjectRequest,
   UpdateProjectRequest,
   UploadedPromptAttachment,
 } from "@bb/server-contract";
@@ -10,6 +11,7 @@ import { registerLocalAttachmentPreview } from "@/lib/attachment-local-previews"
 import {
   applyProjectCreateResult,
   applyProjectDeleteResult,
+  applyProjectUpdateResult,
 } from "../cache-owners/project-cache-owner";
 import {
   invalidateProjectListQueries,
@@ -38,6 +40,10 @@ interface UpdateProjectMutationRequest extends UpdateProjectRequest {
   id: string;
 }
 
+interface ReorderProjectMutationRequest extends ReorderProjectRequest {
+  id: string;
+}
+
 interface UploadPromptAttachmentRequest {
   projectId: string;
   file: File;
@@ -58,17 +64,34 @@ export function useCreateProject() {
   });
 }
 
-export function useUpdateProject() {
+export function useUpdateProject(options?: { showErrorToast?: boolean }) {
   const queryClient = useQueryClient();
 
   return useMutation({
     meta: {
       errorMessage: "Failed to update project.",
+      showErrorToast: options?.showErrorToast ?? true,
     },
     mutationFn: ({ id, ...request }: UpdateProjectMutationRequest) =>
       sdk.projects.update({ projectId: id, ...request }),
-    onSuccess: (_data, variables) => {
+    onSuccess: (project, variables) => {
+      applyProjectUpdateResult({ project, queryClient });
       invalidateProjectUpdateQueries({ projectId: variables.id, queryClient });
+    },
+  });
+}
+
+export function useReorderProject() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    meta: {
+      errorMessage: "Failed to reorder project.",
+    },
+    mutationFn: ({ id, ...request }: ReorderProjectMutationRequest) =>
+      sdk.projects.reorder({ projectId: id, ...request }),
+    onSuccess: () => {
+      invalidateProjectListQueries({ queryClient });
     },
   });
 }

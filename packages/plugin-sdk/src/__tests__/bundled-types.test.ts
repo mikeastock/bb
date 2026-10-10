@@ -47,8 +47,11 @@ describe("bundled plugin SDK declarations", () => {
       new URL("../../bundled-types/bb-plugin-sdk-app.d.ts", import.meta.url),
       "utf8",
     );
-    expect(appDeclarations).not.toContain("PluginCatalogArea");
-    expect(appDeclarations).not.toContain("applyUpdate(args: PluginIdArgs)");
+    expect(appDeclarations).not.toMatch(/from ['"]@bb\//u);
+    expect(appDeclarations).toContain("useSdk(): PluginBrowserBbSdk;");
+    expect(appDeclarations).toContain("interface ThreadSectionsArea");
+    expect(appDeclarations).toContain("threadSections: ThreadSectionsArea;");
+    expect(appDeclarations).toContain("interface PluginCatalogArea");
     expect(declarations).toContain(
       "list(args?: ProviderListArgs): Promise<ProviderListResult>;",
     );
@@ -75,6 +78,7 @@ describe("bundled plugin SDK declarations", () => {
       "bb-plugin-sdk-testing.d.ts",
       "bb-plugin-sdk-testing-app.d.ts",
       "bb-plugin-sdk-testing-host.d.ts",
+      "bb-plugin-sdk-environment-provider.d.ts",
     ];
     const declarations = await Promise.all(
       fileNames.map((fileName) =>
@@ -102,6 +106,9 @@ describe("bundled plugin SDK declarations", () => {
       "interface RenderedSlotLifecycleControls",
     );
     expect(declarations[5]).toContain("interface ExperimentalHostEntryHarness");
+    expect(declarations[6]).toContain(
+      "interface PluginEnvironmentProviderDefinition",
+    );
   });
 
   it("names the canonical event vocabulary in the provider-bridge testing kit", async () => {

@@ -52,6 +52,7 @@ export function threadListEntry(
     status: busy ? "active" : "idle",
     parentThreadId: null,
     sourceThreadId: null,
+    lifecycleOwnerThreadId: null,
     originKind: null,
     originPluginId: null,
     visibility: "visible",
@@ -62,10 +63,7 @@ export function threadListEntry(
     latestAttentionAt: updatedAt,
     createdAt: seedStartedAt(seed, now),
     updatedAt,
-    runtime: {
-      displayStatus: busy ? "active" : "idle",
-      hostReconnectGraceExpiresAt: null,
-    },
+    runtime: { displayStatus: busy ? "active" : "idle" },
     activity: {
       activeWorkflowCount: 0,
       activeBackgroundAgentCount: 0,
@@ -78,8 +76,11 @@ export function threadListEntry(
     environmentHostId: DEMO_HOST_ID,
     environmentName: null,
     environmentBranchName: "main",
-    queuedWork: "none",
+    environmentPath: null,
+    environmentProviderId: null,
+    environmentIsWorktree: null,
     environmentWorkspaceDisplayKind: "other",
+    queuedWork: "none",
   };
 }
 
@@ -94,11 +95,20 @@ export function threadResponse(
     environmentHostId: _environmentHostId,
     environmentName: _environmentName,
     environmentBranchName: _environmentBranchName,
+    environmentPath: _environmentPath,
+    environmentProviderId: _environmentProviderId,
+    environmentIsWorktree: _environmentIsWorktree,
     environmentWorkspaceDisplayKind: _environmentWorkspaceDisplayKind,
     queuedWork: _queuedWork,
     ...thread
   } = threadListEntry(view, now);
-  return { ...thread, activeBackgroundAgentCount: 0, canSpawnChild: true, queuedMessageCount: 0 };
+  return {
+    ...thread,
+    activeBackgroundAgentCount: 0,
+    canRestoreEnvironment: false,
+    canSpawnChild: true,
+    queuedMessageCount: 0,
+  };
 }
 
 const PROJECT_DEFAULT_EXECUTION_OPTIONS = {
@@ -155,6 +165,14 @@ export function hosts(now: number): Host[] {
       name: "demo",
       type: "persistent",
       status: "connected",
+      machineProviderId: null,
+      lifecycle: {
+        phase: "active",
+        suspendedAt: null,
+        message: null,
+        pendingLog: "",
+        teardown: null,
+      },
       maxPermissionMode: "full",
       lastSeenAt: now,
       lastRejectedProtocolVersion: null,
@@ -169,6 +187,8 @@ export const EMPTY_TABS: ThreadTabsResponse = { revision: 0, tabs: [] };
 export const SYSTEM_VERSION: SystemVersionResponse = {
   currentVersion: "0.39.0",
   latestVersion: "0.39.0",
+  currentCommit: null,
+  installKind: "npm",
   source: "npm",
   updateAvailable: false,
   isDevelopment: false,
@@ -186,6 +206,10 @@ export function queuedMessage(args: {
   return {
     id: args.id,
     threadId: args.threadId,
+    origin: null,
+    originPluginId: null,
+    initiator: "user",
+    senderThreadId: null,
     content: args.content,
     model: THREAD_DEFAULT_EXECUTION_OPTIONS.model,
     reasoningLevel: THREAD_DEFAULT_EXECUTION_OPTIONS.reasoningLevel,

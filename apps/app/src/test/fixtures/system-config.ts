@@ -1,4 +1,3 @@
-import { DEFAULTS } from "@bb/config/defaults";
 import {
   defaultAppSettings,
   defaultAppTheme,
@@ -11,11 +10,18 @@ export function makeSystemConfig(
   overrides: Partial<SystemConfigResponse> = {},
 ): SystemConfigResponse {
   return {
+    serverAccess: {
+      providers: [],
+      defaultProviderId: "direct",
+      effectiveUrl: null,
+      urlSource: null,
+    },
     generalSettings: defaultAppSettings,
     keybindings: [],
     defaultKeybindings: [],
     keybindingOverrides: [],
     experiments: defaultExperiments,
+    performanceDiagnosticsAvailable: false,
     appearance: defaultAppTheme,
     customThemes: [],
     pluginThemes: [],
@@ -26,12 +32,6 @@ export function makeSystemConfig(
     primaryHostId: null,
     primaryHostPlatform: null,
     voiceTranscriptionEnabled: false,
-    aiServices: {
-      inference: DEFAULTS.inferenceModel,
-      inferenceFallback: DEFAULTS.inferenceFallbackModel,
-      transcription: DEFAULTS.transcriptionModel,
-      services: [],
-    },
     dataDir: "/tmp/bb-test",
     ...overrides,
   };

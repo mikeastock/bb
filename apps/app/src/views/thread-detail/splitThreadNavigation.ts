@@ -5,7 +5,7 @@ import {
   findPane,
   findPaneByContent,
   findPaneByThread,
-  listPanes,
+  isSamePaneContent,
   MAX_PANES,
   replacePaneContent,
   setFocus,
@@ -14,18 +14,20 @@ import {
 import { decideThreadDrop, type SplitZone } from "@/lib/split-drag";
 import type { PaneContent, SplitLayout } from "@/lib/split-layout";
 import { matchPath } from "react-router-dom";
+import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import {
   APP_ROOT_ROUTE_PATH,
   getPluginDetailRoutePath,
   getPluginPanelRoutePath,
   getRootComposeRoutePath,
   getThreadRoutePath,
+  PLUGIN_DETAIL_ROUTE_PATH,
   PLUGIN_PANEL_ROUTE_PATH,
-  TOOLS_PLUGIN_DETAIL_ROUTE_PATH,
 } from "@/lib/route-paths";
 
 const FIRST_PANE_ID = "pane-1";
 const SPLITTABLE_THREAD_ROUTE_PATH = "/projects/:projectId/threads/:threadId";
+const SPLITTABLE_PERSONAL_THREAD_ROUTE_PATH = "/threads/:threadId";
 
 export function threadPaneContent(thread: ThreadRoutePathArgs): PaneContent {
   return {
@@ -87,7 +89,18 @@ export function paneContentForPathname(pathname: string): PaneContent | null {
       threadId: thread.params.threadId,
     };
   }
-  const detail = matchPath(TOOLS_PLUGIN_DETAIL_ROUTE_PATH, pathname);
+  const personalThread = matchPath(
+    { path: SPLITTABLE_PERSONAL_THREAD_ROUTE_PATH, end: false },
+    pathname,
+  );
+  if (personalThread?.params.threadId) {
+    return {
+      kind: "thread",
+      projectId: PERSONAL_PROJECT_ID,
+      threadId: personalThread.params.threadId,
+    };
+  }
+  const detail = matchPath(PLUGIN_DETAIL_ROUTE_PATH, pathname);
   if (detail?.params.pluginId) {
     return { kind: "plugin-detail", pluginId: detail.params.pluginId };
   }
@@ -125,23 +138,20 @@ export function reconcileLayoutForContent(
   return replacePaneContent(layout, layout.focusedPaneId, content);
 }
 
-export function reconcileRestoredLayoutForContent(
-  layout: SplitLayout | null,
+export function replaceOriginPaneContent(
+  layout: SplitLayout,
+  paneId: string,
+  originContent: PaneContent,
   content: PaneContent,
-): SplitLayout {
-  if (
-    layout === null ||
-    content.kind !== "new-thread" ||
-    findPaneByContent(layout.root, content) !== null ||
-    countPanes(layout.root) >= MAX_PANES
-  ) {
-    return reconcileLayoutForContent(layout, content);
+): SplitLayout | null {
+  const pane = findPane(layout.root, paneId);
+  if (pane === null || !isSamePaneContent(pane.content, originContent)) {
+    return null;
   }
-  const panes = listPanes(layout.root);
-  const rightmostPane = panes[panes.length - 1];
-  return rightmostPane === undefined
-    ? reconcileLayoutForContent(layout, content)
-    : splitPane(layout, rightmostPane.paneId, "right", content);
+  return {
+    ...replacePaneContent(layout, paneId, content),
+    focusedPaneId: layout.focusedPaneId,
+  };
 }
 
 export function focusedPaneRoute(layout: SplitLayout): string | null {

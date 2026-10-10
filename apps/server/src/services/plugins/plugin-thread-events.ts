@@ -1,13 +1,18 @@
-import type { ApplyThreadLifecycleEventOutcome } from "@bb/db";
+import type { EnvironmentRemoval } from "@bb/domain";
+import type { ApplyThreadLifecycleEventOutcome, HostRow } from "@bb/db";
 import type { PendingInteraction, Thread } from "@bb/domain";
 import type { ThreadQueuedMessage } from "@bb/domain";
 import type { PluginThreadEventEmitter } from "./plugin-service.js";
+
+const pendingThreadEvents = new Map<string, ReturnType<typeof setTimeout>>();
 
 let emitter: PluginThreadEventEmitter | undefined;
 
 export function setPluginThreadEventEmitter(
   next: PluginThreadEventEmitter | undefined,
 ): void {
+  for (const timer of pendingThreadEvents.values()) clearTimeout(timer);
+  pendingThreadEvents.clear();
   emitter = next;
 }
 
@@ -21,6 +26,21 @@ export function emitPluginThreadCreated(thread: Thread): void {
  */
 export function emitPluginThreadArchived(thread: Thread): void {
   emitter?.emitThreadArchived(thread);
+}
+
+export function emitPluginThreadUnarchived(thread: Thread): void {
+  emitter?.emitThreadUnarchived(thread);
+}
+
+/**
+ * Called after a thread's parent changed, from the ownership seam shared by
+ * `threads.update` and the release of an archived thread's children.
+ */
+export function emitPluginThreadParentChanged(
+  thread: Thread,
+  previousParentThreadId: string | null,
+): void {
+  emitter?.emitThreadParentChanged(thread, previousParentThreadId);
 }
 
 export function emitPluginThreadDeleted(thread: Thread): void {
@@ -42,6 +62,10 @@ export function emitPluginMessageQueued(entry: ThreadQueuedMessage): void {
 /** Called after a queued row's waits cleared and it dispatched. */
 export function emitPluginMessageDispatched(entry: ThreadQueuedMessage): void {
   emitter?.emitMessageDispatched(entry);
+}
+
+export function emitPluginMessageCancelled(entry: ThreadQueuedMessage): void {
+  emitter?.emitMessageCancelled(entry);
 }
 
 /**
@@ -79,4 +103,30 @@ export function emitPluginThreadLifecycleOutcome(
   } else if (outcome.thread.status === "error") {
     emitter?.emitThreadFailed(outcome.thread);
   }
+}
+
+export function emitPluginThreadEvents(threadId: string): void {
+  if (emitter === undefined || pendingThreadEvents.has(threadId)) return;
+  const timer = setTimeout(() => {
+    pendingThreadEvents.delete(threadId);
+    emitter?.emitThreadEvents(threadId);
+  }, 1_000);
+  timer.unref?.();
+  pendingThreadEvents.set(threadId, timer);
+}
+
+export function emitPluginTerminalInput(
+  terminal: import("@bb/server-contract").TerminalSession,
+): void {
+  emitter?.emitTerminalInput(terminal);
+}
+
+export function emitPluginHostDeleted(host: HostRow): void {
+  emitter?.emitHostDeleted(host);
+}
+
+export function emitPluginEnvironmentRemoved(
+  removal: EnvironmentRemoval,
+): void {
+  emitter?.emitEnvironmentRemoved(removal);
 }

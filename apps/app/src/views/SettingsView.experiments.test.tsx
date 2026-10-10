@@ -1,53 +1,46 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExperimentKey } from "@bb/domain";
 import { ExperimentsSettingsSection } from "./SettingsView";
 
 afterEach(cleanup);
 
-function renderSection(overrides?: {
-  onChangelogPreviewEnabledChange?: (enabled: boolean) => void;
-  onMobileAppEnabledChange?: (enabled: boolean) => void;
-  onTimelineWindowingEnabledChange?: (enabled: boolean) => void;
-}) {
+function renderSection(
+  onExperimentChange: (key: ExperimentKey, enabled: boolean) => void,
+  performanceDiagnosticsAvailable = true,
+) {
   return render(
     <ExperimentsSettingsSection
-      changelogPreviewEnabled={false}
       disabled={false}
-      editMessagesEnabled={false}
-      mobileAppEnabled={false}
-      timelineWindowingEnabled={false}
-      onChangelogPreviewEnabledChange={
-        overrides?.onChangelogPreviewEnabledChange ?? vi.fn()
-      }
-      onEditMessagesEnabledChange={vi.fn()}
-      onMobileAppEnabledChange={overrides?.onMobileAppEnabledChange ?? vi.fn()}
-      onTimelineWindowingEnabledChange={
-        overrides?.onTimelineWindowingEnabledChange ?? vi.fn()
-      }
+      performanceDiagnosticsAvailable={performanceDiagnosticsAvailable}
+      experiments={{
+        changelogPreview: false,
+        serverMove: false,
+        performanceDiagnostics: false,
+      }}
+      onExperimentChange={onExperimentChange}
     />,
   );
 }
 
 describe("ExperimentsSettingsSection", () => {
-  it("reports changelog preview changes", () => {
-    const onChange = vi.fn();
-    renderSection({ onChangelogPreviewEnabledChange: onChange });
-    fireEvent.click(screen.getByLabelText("Changelog preview"));
-    expect(onChange).toHaveBeenCalledWith(true);
+  it("hides performance diagnostics when startup permission is absent", () => {
+    renderSection(vi.fn(), false);
+    expect(
+      screen.queryByLabelText("Server performance diagnostics"),
+    ).toBeNull();
+    expect(screen.getByLabelText("Changelog preview")).toBeTruthy();
+    expect(screen.getByLabelText("Server move")).toBeTruthy();
   });
 
-  it("reports mobile app changes", () => {
+  it.each([
+    ["Changelog preview", "changelogPreview"],
+    ["Server performance diagnostics", "performanceDiagnostics"],
+  ])("reports %s changes", (label, key) => {
     const onChange = vi.fn();
-    renderSection({ onMobileAppEnabledChange: onChange });
-    fireEvent.click(screen.getByLabelText("Mobile app"));
-    expect(onChange).toHaveBeenCalledWith(true);
-  });
-
-  it("reports timeline windowing changes", () => {
-    const onChange = vi.fn();
-    renderSection({ onTimelineWindowingEnabledChange: onChange });
-    fireEvent.click(screen.getByLabelText("Timeline windowing"));
-    expect(onChange).toHaveBeenCalledWith(true);
+    renderSection(onChange);
+    fireEvent.click(screen.getByLabelText(label));
+    expect(onChange).toHaveBeenCalledWith(key, true);
   });
 });

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { completedTurnDisplaySchema } from "./completed-turn-display.js";
 import { isValidGitBranchName } from "./git-checkout.js";
 
 export const MANAGED_BRANCH_PREFIX_MAX_LENGTH = 64;
@@ -15,22 +16,80 @@ export const managedBranchPrefixSchema = z
 export const appSettingsSchema = z
   .object({
     showKeyboardHints: z.boolean(),
+    showGitChanges: z.boolean(),
     steerActiveThreadOnEnter: z.boolean(),
-    showUnhandledProviderEvents: z.boolean(),
+    confirmThreadArchive: z.boolean(),
+    showDiagnosticEvents: z.boolean(),
+    keepHistoryAfterContextClear: z.boolean(),
     providerOrder: z.array(z.string().min(1)),
     defaultProviderId: z.string().min(1).nullable(),
+    providerCompletedTurnDisplay: z.record(
+      z.string().min(1),
+      completedTurnDisplaySchema,
+    ),
     streamerMode: z.boolean(),
+    allowFastServiceTier: z.boolean(),
+    telemetryEnabled: z.boolean(),
     managedBranchPrefix: managedBranchPrefixSchema,
+    machineServerUrl: z
+      .string()
+      .url()
+      .refine((value) => {
+        const url = new URL(value);
+        return (
+          ["http:", "https:"].includes(url.protocol) &&
+          !url.username &&
+          !url.password
+        );
+      })
+      .nullable(),
+    machineGitCredentialsEnabled: z.boolean(),
+    defaultMachineAccess: z.string().min(1).nullable(),
+    onboardingCompletedAt: z.string().min(1).nullable(),
   })
   .strict();
 export type AppSettings = z.infer<typeof appSettingsSchema>;
 
 export const defaultAppSettings: AppSettings = {
   showKeyboardHints: true,
+  showGitChanges: true,
   steerActiveThreadOnEnter: true,
-  showUnhandledProviderEvents: false,
+  confirmThreadArchive: true,
+  showDiagnosticEvents: false,
+  keepHistoryAfterContextClear: false,
   providerOrder: [],
   defaultProviderId: null,
+  providerCompletedTurnDisplay: {},
   streamerMode: false,
+  allowFastServiceTier: true,
+  telemetryEnabled: true,
   managedBranchPrefix: DEFAULT_MANAGED_BRANCH_PREFIX,
+  machineServerUrl: null,
+  defaultMachineAccess: null,
+  machineGitCredentialsEnabled: true,
+  onboardingCompletedAt: null,
 };
+
+export const disabledProviderIdsSchema = z.array(z.string().min(1));
+
+export const appSettingsUpdateSchema = z.union([
+  appSettingsSchema.extend({
+    allowFastServiceTier: z.boolean().optional(),
+    telemetryEnabled: z.boolean().optional(),
+    confirmThreadArchive: z.boolean().optional(),
+    showGitChanges: z.boolean().optional(),
+    keepHistoryAfterContextClear: z.boolean().optional(),
+    showUnhandledProviderEvents: z.boolean().optional(),
+    onboardingCompletedAt: z.string().min(1).nullable().optional(),
+  }),
+  appSettingsSchema.omit({ showDiagnosticEvents: true }).extend({
+    allowFastServiceTier: z.boolean().optional(),
+    telemetryEnabled: z.boolean().optional(),
+    confirmThreadArchive: z.boolean().optional(),
+    showGitChanges: z.boolean().optional(),
+    keepHistoryAfterContextClear: z.boolean().optional(),
+    showUnhandledProviderEvents: z.boolean(),
+    onboardingCompletedAt: z.string().min(1).nullable().optional(),
+  }),
+]);
+export type AppSettingsUpdate = z.infer<typeof appSettingsUpdateSchema>;

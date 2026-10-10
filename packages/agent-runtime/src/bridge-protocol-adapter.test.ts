@@ -10,7 +10,6 @@ function makeAdapter(staticProviderOptions?: Record<string, unknown>) {
       supportsThreadArchive: false,
       supportsThreadRename: false,
       supportsServiceTier: false,
-      supportsNativeUserQuestion: false,
       fork: "checkpoint",
       permissionModes: ["full"],
     },
@@ -162,6 +161,7 @@ describe("handshake gating", () => {
     expect(
       adapter.buildCommandPlan({
         type: "provider/installation/status",
+        checkUpdates: false,
         cwd: "/workspace",
         requirement: "thread_rewind",
       }),
@@ -172,6 +172,7 @@ describe("handshake gating", () => {
         providerId: "fake-bridge",
         cwd: "/workspace",
         requirement: "thread_rewind",
+        checkUpdates: false,
       },
     });
     expect(
@@ -293,7 +294,6 @@ describe("options mapping", () => {
     const options = (plan as { params: { options: Record<string, unknown> } })
       .params.options;
     expect(options).not.toHaveProperty("memoryEnabled");
-    expect(options).not.toHaveProperty("skillRoots");
   });
 });
 
@@ -345,24 +345,6 @@ describe("skills/configure", () => {
 });
 
 describe("translateEvent", () => {
-  const validEvent: ThreadEvent = {
-    type: "turn/started",
-    threadId: "thr_1",
-    providerThreadId: "p_1",
-    scope: { kind: "turn", turnId: "bturn_1" },
-  };
-
-  it("ignores the retired thread/event notification", () => {
-    const adapter = makeAdapter();
-    expect(
-      adapter.translateEvent({
-        jsonrpc: "2.0",
-        method: "thread/event",
-        params: { threadId: "thr_1", event: validEvent },
-      }),
-    ).toStrictEqual([]);
-  });
-
   it("ignores an unknown bridge notification without emitting a timeline event", () => {
     const adapter = makeAdapter();
     expect(
@@ -388,6 +370,27 @@ describe("translateEvent", () => {
         },
       }),
     ).toStrictEqual([]);
+
+    expect(
+      adapter.translateEvent({
+        jsonrpc: "2.0",
+        method: "session/replaced",
+        params: {
+          threadId: "thr_1",
+          providerThreadId: "p_2",
+          reason:
+            "Execution settings changed; the Claude session was rebuilt to apply them.",
+          contextLost: false,
+          showRuntimeNote: true,
+        },
+      }),
+    ).toMatchObject([
+      {
+        type: "provider/warning",
+        summary:
+          "Execution settings changed; the Claude session was rebuilt to apply them.",
+      },
+    ]);
 
     const events = adapter.translateEvent({
       jsonrpc: "2.0",

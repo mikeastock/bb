@@ -3,6 +3,7 @@ import {
   type PromptTextMention,
   type ThreadEvent,
 } from "@bb/domain";
+import type { TimelineConversationAttachments } from "@bb/server-contract";
 import type { EventMeta } from "./event-decode.js";
 import type { AcceptedClientRequest } from "./accepted-client-request-context.js";
 import type {
@@ -27,6 +28,7 @@ export function parsePromptInput(
   imageUrls: string[];
   localImagePaths: string[];
   localFilePaths: string[];
+  localFileDetails: TimelineConversationAttachments["localFileDetails"];
   mentions: PromptTextMention[];
 } | null {
   if (!Array.isArray(input) || input.length === 0) return null;
@@ -38,6 +40,8 @@ export function parsePromptInput(
   const imageUrls: string[] = [];
   const localImagePaths: string[] = [];
   const localFilePaths: string[] = [];
+  const localFileDetails: TimelineConversationAttachments["localFileDetails"] =
+    [];
   const mentions: PromptTextMention[] = [];
   let textOffset = 0;
 
@@ -82,6 +86,12 @@ export function parsePromptInput(
         localFiles += 1;
         if (part.path.length > 0) {
           localFilePaths.push(part.path);
+          if (part.name)
+            localFileDetails.push({
+              path: part.path,
+              name: part.name,
+              sizeBytes: part.sizeBytes ?? null,
+            });
         }
         break;
     }
@@ -100,6 +110,7 @@ export function parsePromptInput(
     imageUrls,
     localImagePaths,
     localFilePaths,
+    localFileDetails,
     mentions,
   };
 }
@@ -114,8 +125,6 @@ function shouldRenderClientRequestedInput(
     case "idle":
     case "active":
     case "stopping":
-    // A pending thread's first message is queued and has not been accepted,
-    // so the requested input is the only record of it there is to show.
     case "pending":
       return true;
     default:
@@ -130,8 +139,6 @@ export function shouldPreservePendingMessages(
   switch (threadStatus) {
     case "starting":
     case "active":
-    // The queued first message is exactly what must survive: nothing has been
-    // accepted yet, so dropping it would leave the timeline empty.
     case "pending":
       return true;
     case "error":
@@ -157,6 +164,9 @@ function buildAttachments(
     ...(parsed.localFilePaths.length > 0
       ? { localFilePaths: parsed.localFilePaths }
       : {}),
+    ...(parsed.localFileDetails.length > 0
+      ? { localFileDetails: parsed.localFileDetails }
+      : {}),
   };
 }
 
@@ -176,6 +186,7 @@ interface ParsePendingSteerFromClientRequestArgs extends ParseUserFromClientRequ
 }
 
 interface ParseRejectedUsersFromClientRequestArgs {
+  requestMeta: EventMeta;
   decoded: ThreadEvent;
   meta: EventMeta;
   options?: BuildEventProjectionMessagesOptions;
@@ -259,9 +270,11 @@ function resolveClientUserMessageTurnId(
 }
 
 interface BuildClientUserMessageArgs {
+  sourceSeq: number;
   acceptedClientRequest?: AcceptedClientRequest;
   decoded: ClientTurnRequestedEvent;
-  idSuffix?: string;
+  inputGroupIndex: number;
+  visibleMessageIndex: number;
   input: ReadonlyArray<PromptInput>;
   meta: EventMeta;
   requestStatus: EventProjectionTurnRequest["status"];
@@ -270,7 +283,9 @@ interface BuildClientUserMessageArgs {
 function buildClientUserMessage({
   acceptedClientRequest,
   decoded,
-  idSuffix,
+  inputGroupIndex,
+  visibleMessageIndex,
+  sourceSeq,
   input,
   meta,
   requestStatus,
@@ -306,9 +321,13 @@ function buildClientUserMessage({
     id: messageId(
       decoded.threadId,
       "user-seed",
-      idSuffix ? `${meta.seq}-${idSuffix}` : `${meta.seq}`,
+      visibleMessageIndex > 0
+        ? `${meta.seq}-${visibleMessageIndex}`
+        : `${meta.seq}`,
     ),
     threadId: decoded.threadId,
+    messageSeq: meta.seq,
+    sourceEvent: { seq: sourceSeq, part: inputGroupIndex },
     sourceSeqStart: rowMeta.seq,
     sourceSeqEnd: rowMeta.seq,
     createdAt: rowMeta.createdAt,
@@ -326,8 +345,37 @@ function buildClientUserMessage({
   };
 }
 
-function clientUserMessageIdSuffix(messageIndex: number): string | undefined {
-  return messageIndex > 0 ? String(messageIndex) : undefined;
+function buildClientUserMessagesForInputGroups({
+  sourceSeq,
+  acceptedClientRequest,
+  decoded,
+  meta,
+  requestStatus,
+}: {
+  sourceSeq: number;
+  acceptedClientRequest: AcceptedClientRequest | undefined;
+  decoded: ClientTurnRequestedEvent;
+  meta: EventMeta;
+  requestStatus: EventProjectionTurnRequest["status"];
+}): EventProjectionUserMessage[] {
+  const groups = decoded.inputGroups ?? [decoded.input];
+  const messages: EventProjectionUserMessage[] = [];
+  for (const [inputGroupIndex, input] of groups.entries()) {
+    if (!parsePromptInput(input)) continue;
+    messages.push(
+      buildClientUserMessage({
+        acceptedClientRequest,
+        decoded,
+        inputGroupIndex,
+        visibleMessageIndex: messages.length,
+        sourceSeq,
+        input,
+        meta,
+        requestStatus,
+      }),
+    );
+  }
+  return messages;
 }
 
 export function parseUsersFromClientRequest(
@@ -349,24 +397,13 @@ export function parseUsersFromClientRequest(
     return [];
   }
 
-  const groups = decoded.inputGroups ?? [decoded.input];
-  const messages: EventProjectionUserMessage[] = [];
-  for (const input of groups) {
-    const parsedInput = parsePromptInput(input);
-    if (!parsedInput) continue;
-    const visibleMessageIndex = messages.length;
-    messages.push(
-      buildClientUserMessage({
-        acceptedClientRequest,
-        decoded,
-        idSuffix: clientUserMessageIdSuffix(visibleMessageIndex),
-        input,
-        meta,
-        requestStatus: acceptedClientRequest ? "accepted" : "pending",
-      }),
-    );
-  }
-  return messages;
+  return buildClientUserMessagesForInputGroups({
+    sourceSeq: meta.seq,
+    acceptedClientRequest,
+    decoded,
+    meta,
+    requestStatus: acceptedClientRequest ? "accepted" : "pending",
+  });
 }
 
 export function parsePendingSteersFromClientRequest(
@@ -383,22 +420,13 @@ export function parsePendingSteersFromClientRequest(
     return [];
   }
 
-  const groups = decoded.inputGroups ?? [decoded.input];
-  const messages: EventProjectionUserMessage[] = [];
-  for (const input of groups) {
-    if (!parsePromptInput(input)) continue;
-    const visibleMessageIndex = messages.length;
-    messages.push(
-      buildClientUserMessage({
-        decoded,
-        idSuffix: clientUserMessageIdSuffix(visibleMessageIndex),
-        input,
-        meta,
-        requestStatus: "pending",
-      }),
-    );
-  }
-  return messages;
+  return buildClientUserMessagesForInputGroups({
+    sourceSeq: meta.seq,
+    acceptedClientRequest: undefined,
+    decoded,
+    meta,
+    requestStatus: "pending",
+  });
 }
 
 export function parseAcceptedSteersFromClientRequest(
@@ -420,29 +448,19 @@ export function parseAcceptedSteersFromClientRequest(
     return [];
   }
 
-  const groups = decoded.inputGroups ?? [decoded.input];
-  const messages: EventProjectionUserMessage[] = [];
-  for (const input of groups) {
-    if (!parsePromptInput(input)) continue;
-    const visibleMessageIndex = messages.length;
-    messages.push(
-      buildClientUserMessage({
-        acceptedClientRequest,
-        decoded,
-        idSuffix: clientUserMessageIdSuffix(visibleMessageIndex),
-        input,
-        meta,
-        requestStatus: "accepted",
-      }),
-    );
-  }
-  return messages;
+  return buildClientUserMessagesForInputGroups({
+    sourceSeq: meta.seq,
+    acceptedClientRequest,
+    decoded,
+    meta,
+    requestStatus: "accepted",
+  });
 }
 
 export function parseRejectedUsersFromClientRequest(
   args: ParseRejectedUsersFromClientRequestArgs,
 ): EventProjectionUserMessage[] {
-  const { decoded, meta, options } = args;
+  const { decoded, meta, options, requestMeta } = args;
   if (decoded.type !== "client/turn/requested") {
     return [];
   }
@@ -450,22 +468,13 @@ export function parseRejectedUsersFromClientRequest(
     return [];
   }
 
-  const groups = decoded.inputGroups ?? [decoded.input];
-  const messages: EventProjectionUserMessage[] = [];
-  for (const input of groups) {
-    if (!parsePromptInput(input)) continue;
-    const visibleMessageIndex = messages.length;
-    messages.push(
-      buildClientUserMessage({
-        decoded,
-        idSuffix: clientUserMessageIdSuffix(visibleMessageIndex),
-        input,
-        meta,
-        requestStatus: "rejected",
-      }),
-    );
-  }
-  return messages;
+  return buildClientUserMessagesForInputGroups({
+    sourceSeq: requestMeta.seq,
+    acceptedClientRequest: undefined,
+    decoded,
+    meta,
+    requestStatus: "rejected",
+  });
 }
 
 export function parseProviderUserMessage(
@@ -488,6 +497,8 @@ export function parseProviderUserMessage(
     kind: "user",
     id: messageId(decoded.threadId, "provider-input", decoded.item.id),
     threadId: decoded.threadId,
+    messageSeq: meta.seq,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -522,6 +533,7 @@ export function parseLegacyUserMessage(
     kind: "assistant-text",
     id: messageId(decoded.threadId, "assistant", `legacy:${meta.seq}`),
     threadId: decoded.threadId,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,

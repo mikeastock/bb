@@ -16,6 +16,9 @@ import {
 } from "./FilePreview";
 import { SOURCE_CODE_MAX_LINES } from "@/components/code/source-code-budget";
 import { SecondaryPanelFilePreview } from "./ThreadStorageFilePreview";
+import { CompactViewportOverrideProvider } from "@bb/shared-ui/hooks/use-compact-viewport";
+import { HttpError } from "@/lib/api";
+import { BbHttpError } from "@bb/sdk/browser";
 import {
   PierreWorkerPoolGateContext,
   type PierreWorkerPoolGate,
@@ -307,6 +310,9 @@ describe("FilePreview", () => {
       />,
     );
 
+    await waitFor(() => {
+      expect(pierreMock.state.statsCallback).not.toBeNull();
+    });
     expect(screen.queryByTestId("pierre-file")).toBeNull();
 
     act(() => {
@@ -460,7 +466,7 @@ describe("FilePreview", () => {
     expect(screen.queryByRole("button", { name: "Load full file" })).toBeNull();
   });
 
-  it("caps code previews by size even when they have few lines", () => {
+  it("caps code previews by size even when they have few lines", async () => {
     const longLine = "x".repeat(200_000);
     const contents = [longLine, longLine, longLine, "tail"].join("\n");
 
@@ -477,10 +483,13 @@ describe("FilePreview", () => {
       />,
     );
 
+    expect(
+      await screen.findByRole("button", { name: "Load full file" }),
+    ).toBeTruthy();
+    await screen.findByTestId("pierre-file");
     expect(pierreMock.state.lastFile?.contents).toBe(
       [longLine, longLine].join("\n"),
     );
-    expect(screen.getByRole("button", { name: "Load full file" })).toBeTruthy();
   });
 
   it("shows the whole file when a line link points past the capped prefix", async () => {
@@ -523,7 +532,7 @@ describe("FilePreview", () => {
           iframe: {
             sandbox: "allow-scripts",
             title: "docs/progress-vis.html",
-            url: "/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html",
+            url: "/api/v1/threads/thread-1/thread-storage/files/docs/progress-vis.html",
           },
           lineRange: null,
         }}
@@ -535,11 +544,75 @@ describe("FilePreview", () => {
     );
 
     expect(openSpy).toHaveBeenCalledWith(
-      `${window.location.origin}/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html`,
+      `${window.location.origin}/api/v1/threads/thread-1/thread-storage/files/docs/progress-vis.html`,
       "_blank",
       "noopener,noreferrer",
     );
     openSpy.mockRestore();
+  });
+
+  it("keeps compact file actions available without crowding the preview controls", async () => {
+    const onRefresh = vi.fn();
+    const onOpenInEditor = vi.fn();
+    const view = render(
+      <CompactViewportOverrideProvider isCompactViewport>
+        <FilePreview
+          path="reports/gallery.html"
+          onRefresh={onRefresh}
+          onOpenInEditor={onOpenInEditor}
+          state={{
+            kind: "html",
+            file: { name: "gallery.html", contents: "<h1>Gallery</h1>" },
+            iframe: {
+              sandbox: "allow-scripts",
+              title: "Gallery",
+              url: "/gallery.html",
+            },
+            lineRange: null,
+          }}
+        />
+      </CompactViewportOverrideProvider>,
+    );
+    expect(screen.getByRole("button", { name: "Preview" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Raw" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Copy HTML source" }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Refresh file" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "File actions" }));
+    const refresh = await screen.findByRole("menuitem", {
+      name: "Refresh file",
+    });
+    expect(
+      screen.getByRole("menuitem", { name: "Copy HTML source" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("menuitem", { name: "Copy file path" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("menuitem", { name: "Open in external browser" }),
+    ).toBeTruthy();
+    expect(view.container.closest('[inert], [aria-hidden="true"]')).toBeNull();
+    fireEvent.click(refresh);
+    expect(onRefresh).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "File actions" }));
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Open in editor" }),
+    );
+    expect(onOpenInEditor).toHaveBeenCalledWith("reports/gallery.html");
+    fireEvent.click(screen.getByRole("button", { name: "Raw" }));
+    fireEvent.click(screen.getByRole("button", { name: "File actions" }));
+    const wrap = await screen.findByRole("menuitemcheckbox", {
+      name: "Wrap lines",
+    });
+    expect(wrap.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(wrap);
+    fireEvent.click(screen.getByRole("button", { name: "File actions" }));
+    expect(
+      (
+        await screen.findByRole("menuitemcheckbox", { name: "Wrap lines" })
+      ).getAttribute("aria-checked"),
+    ).toBe("true");
   });
 
   it("enlarges the HTML file actions for narrow coarse pointers", () => {
@@ -553,7 +626,7 @@ describe("FilePreview", () => {
           iframe: {
             sandbox: "allow-scripts",
             title: "docs/progress-vis.html",
-            url: "/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html",
+            url: "/api/v1/threads/thread-1/thread-storage/files/docs/progress-vis.html",
           },
           lineRange: null,
         }}
@@ -573,7 +646,9 @@ describe("FilePreview", () => {
         true,
       );
       expect(
-        actionButton.classList.contains("max-md:pointer-coarse:[&_svg]:size-5"),
+        actionButton.classList.contains(
+          "max-md:pointer-coarse:[&_[data-icon-root]]:size-5",
+        ),
       ).toBe(true);
     }
   });
@@ -589,10 +664,14 @@ describe("FilePreview", () => {
         <FilePreview
           path="docs/progress-vis.html"
           state={{
-            kind: "iframe",
-            sandbox: "allow-scripts",
-            title: "docs/progress-vis.html",
-            url: "/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html",
+            kind: "html",
+            file: { name: "progress-vis.html", contents: "<h1>Progress</h1>" },
+            iframe: {
+              sandbox: "allow-scripts",
+              title: "docs/progress-vis.html",
+              url: "/api/v1/threads/thread-1/thread-storage/files/docs/progress-vis.html",
+            },
+            lineRange: null,
           }}
         />,
       );
@@ -602,7 +681,7 @@ describe("FilePreview", () => {
       );
 
       expect(openExternalUrl).toHaveBeenCalledWith(
-        `${window.location.origin}/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html`,
+        `${window.location.origin}/api/v1/threads/thread-1/thread-storage/files/docs/progress-vis.html`,
       );
     } finally {
       delete (window as unknown as { bbDesktop?: unknown }).bbDesktop;
@@ -743,27 +822,6 @@ describe("FilePreview", () => {
     ).toBeNull();
   });
 
-  it("caps oversized CSV previews and reports the visible data-row count", () => {
-    const columnCount = 105;
-    const dataRowCount = 501;
-    const header = Array.from({ length: columnCount }, (_, i) => `c${i + 1}`);
-    const lines = [header.join(",")];
-    for (let rowIndex = 0; rowIndex < dataRowCount; rowIndex += 1) {
-      lines.push(header.map((name) => `${name}r${rowIndex + 1}`).join(","));
-    }
-
-    const preview = buildCsvPreviewData(lines.join("\n"));
-
-    expect(preview.rows.length).toBe(501);
-    expect(preview.rows.at(-1)?.[0]).toBe("c1r500");
-    expect(preview.columnCount).toBe(100);
-    expect(preview.truncatedRows).toBe(true);
-    expect(preview.truncatedColumns).toBe(true);
-    expect(getCsvTruncationNote(preview, preview.rows.length - 1)).toBe(
-      "Showing the first 500 rows and 100 columns.",
-    );
-  });
-
   it("does not report truncation for a CSV exactly at the row cap", () => {
     const lines = ["name"];
     for (let rowIndex = 0; rowIndex < 500; rowIndex += 1) {
@@ -778,6 +836,7 @@ describe("FilePreview", () => {
   });
 
   it("mounts only the CSV rows near the viewport, not the whole 500x100 window", () => {
+    vi.useFakeTimers();
     mockCsvTableLayout();
     const columnCount = 120;
     const header = Array.from({ length: columnCount }, (_, i) => `col_${i}`);
@@ -810,6 +869,7 @@ describe("FilePreview", () => {
     if (!(scrollBox instanceof HTMLElement)) throw new Error("no scroll box");
     scrollBox.scrollTop = 499 * CSV_TEST_ROW_HEIGHT_PX;
     fireEvent.scroll(scrollBox);
+    act(() => vi.runOnlyPendingTimers());
     expect(screen.getByText("r499c0")).not.toBeNull();
     expect(screen.queryByText("r0c0")).toBeNull();
     expect(table.querySelectorAll("tbody tr[data-index]").length).toBeLessThan(
@@ -844,17 +904,188 @@ describe("FilePreview", () => {
     expect(screen.getByRole("cell", { name: "10" })).not.toBeNull();
   });
 
-  it("does not show the file preview actions menu for non-text previews", () => {
+  it("states the reason a file preview failed", () => {
     render(
-      <FilePreview
-        path="docs/screenshots/right-panel.png"
-        state={{ kind: "image", url: "/preview/right-panel.png" }}
+      <SecondaryPanelFilePreview
+        activePath="docs/huge.bin"
+        error={
+          new HttpError({
+            status: 413,
+            message: "File is too large to preview",
+            code: "file_too_large",
+            body: {
+              code: "file_too_large",
+              message: "File is too large to preview",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
       />,
     );
 
+    expect(screen.getByRole("alert").textContent).toBe(
+      "File is too large to preview",
+    );
+  });
+
+  it("states the reason an SDK-sourced file preview failed", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="docs/notes.md"
+        error={
+          new BbHttpError({
+            status: 502,
+            code: "host_unavailable",
+            message: "Host is not connected",
+            body: {
+              code: "host_unavailable",
+              message: "Host is not connected",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("Host is not connected");
+  });
+
+  it.each([false, true])(
+    "shows a confirmed missing file even with cached content (%s)",
+    (cached) => {
+      render(
+        <SecondaryPanelFilePreview
+          activePath="does-not-exist.md"
+          error={new HttpError({ status: 404, message: "Not found" })}
+          filePreview={
+            cached
+              ? {
+                  kind: "text",
+                  path: "does-not-exist.md",
+                  content: "Previously loaded content",
+                  mimeType: "text/markdown",
+                  url: "/preview/does-not-exist.md",
+                }
+              : undefined
+          }
+          isLoading={false}
+        />,
+      );
+
+      expect(screen.getByRole("alert").textContent).toBe("File not found.");
+    },
+  );
+
+  it("keeps the dedicated not-found message for a 404 from the SDK", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="does-not-exist.md"
+        error={
+          new BbHttpError({
+            status: 404,
+            code: "ENOENT",
+            message: "Path does not exist: /workspace/does-not-exist.md",
+            body: {
+              code: "ENOENT",
+              message: "Path does not exist: /workspace/does-not-exist.md",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("File not found.");
+  });
+
+  it("falls back to the generic failure message when the error carries none", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="does-not-exist.md"
+        error={new Error("   ")}
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("Failed to load file");
+  });
+
+  it("renders HTML over the preview render limit as source instead of an iframe", () => {
+    const content = `<html>${"a".repeat(5 * 1024 * 1024)}</html>`;
+    const view = render(
+      <SecondaryPanelFilePreview
+        activePath="reports/large.html"
+        filePreview={{
+          kind: "text",
+          content,
+          mimeType: "text/html",
+          path: "reports/large.html",
+          url: "/api/v1/threads/thread-1/thread-storage/files/reports/large.html",
+        }}
+        htmlPreviewUrl="/api/v1/threads/thread-1/thread-storage/files/reports/large.html"
+        isLoading={false}
+      />,
+    );
+
+    expect(view.container.querySelector("iframe")).toBeNull();
+  });
+
+  it("offers Download instead of rendering HTML too large to preview", () => {
+    const view = render(
+      <SecondaryPanelFilePreview
+        activePath="reports/huge.html"
+        filePreview={{
+          kind: "unsupported",
+          mimeType: "text/html",
+          path: "reports/huge.html",
+          reason: "too-large",
+          sizeBytes: 30 * 1024 * 1024,
+          url: "/api/v1/threads/thread-1/thread-storage/files/reports/huge.html",
+        }}
+        htmlPreviewUrl="/api/v1/threads/thread-1/thread-storage/files/reports/huge.html"
+        isLoading={false}
+      />,
+    );
+
+    expect(view.container.querySelector("iframe")).toBeNull();
     expect(
-      screen.queryByRole("button", { name: "File preview actions" }),
-    ).toBeNull();
+      screen.getByText("This file is too large to preview."),
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("link", { name: "Download" }).getAttribute("href"),
+    ).toBe("/api/v1/threads/thread-1/thread-storage/files/reports/huge.html");
+  });
+
+  it("links Download to the file's raw URL under its basename", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="qa/report-with-images.zip"
+        filePreview={{
+          kind: "unsupported",
+          mimeType: "application/zip",
+          path: "qa/report-with-images.zip",
+          reason: "binary",
+          sizeBytes: 2048,
+          url: "/api/v1/projects/p1/files/raw?path=qa%2Freport-with-images.zip",
+        }}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("application/zip · 2.0 KB")).not.toBeNull();
+    expect(
+      screen.getByText("This file type can't be previewed."),
+    ).not.toBeNull();
+    const download = screen.getByRole("link", { name: "Download" });
+    expect(download.getAttribute("href")).toBe(
+      "/api/v1/projects/p1/files/raw?path=qa%2Freport-with-images.zip",
+    );
+    expect(download.getAttribute("download")).toBe("report-with-images.zip");
   });
 
   it("passes cache keys for loaded text previews to Pierre", async () => {
@@ -893,6 +1124,60 @@ describe("FilePreview", () => {
       expect(pierreMock.state.lastFile?.cacheKey).toBeTruthy();
       expect(pierreMock.state.lastFile?.cacheKey).not.toBe(firstCacheKey);
     });
+  });
+
+  it("tracks preview loading across view changes, document revisions, and URLs", () => {
+    vi.useFakeTimers();
+    const preview = (revision: string, url = "/gallery.html") => (
+      <FilePreview
+        path="gallery.html"
+        state={{
+          kind: "html",
+          file: {
+            name: "gallery.html",
+            contents: "<h1>Gallery</h1>",
+            cacheKey: revision,
+          },
+          iframe: { sandbox: "allow-scripts", title: "Gallery", url },
+          lineRange: null,
+        }}
+      />
+    );
+    const view = render(
+      <FilePreview
+        path="gallery.html"
+        state={{ kind: "loading" }}
+        isRefreshing
+        onRefresh={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("status")).toBeNull();
+    act(() => vi.advanceTimersByTime(200));
+    const loadingStatus = screen.getByRole("status");
+    expect(loadingStatus.textContent).toBe("Loading preview…");
+    view.rerender(preview("first"));
+    expect(screen.getByRole("status")).toBe(loadingStatus);
+    const frame = screen.getByTitle("Gallery");
+    fireEvent.click(screen.getByRole("button", { name: "Raw" }));
+    expect(screen.queryByRole("status")).toBeNull();
+    fireEvent.load(frame);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByTitle("Gallery")).toBe(frame);
+
+    view.rerender(preview("second"));
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.getByRole("status")).toBeTruthy();
+    fireEvent.load(screen.getByTitle("Gallery"));
+    expect(screen.queryByRole("status")).toBeNull();
+
+    view.rerender(preview("second", "/gallery.html?retry=1"));
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.getByRole("status")).toBeTruthy();
+    fireEvent.load(screen.getByTitle("Gallery"));
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("reloads an HTML iframe only when the fetched source changes", () => {

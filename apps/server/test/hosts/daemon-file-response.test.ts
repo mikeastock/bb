@@ -57,6 +57,20 @@ describe("createDaemonFileContentResponse", () => {
     expect(changed.status).toBe(200);
   });
 
+  it("answers 304 when the daemon omitted unchanged content", async () => {
+    const response = createDaemonFileContentResponse({
+      path: IMAGE_RESULT.path,
+      contentEncoding: IMAGE_RESULT.contentEncoding,
+      mimeType: IMAGE_RESULT.mimeType,
+      sizeBytes: IMAGE_RESULT.sizeBytes,
+      sha256: IMAGE_RESULT.sha256,
+      notModified: true,
+    });
+    expect(response.status).toBe(304);
+    expect(response.headers.get("etag")).toBe('"abc123"');
+    expect((await response.arrayBuffer()).byteLength).toBe(0);
+  });
+
   it("omits Last-Modified when the daemon has no mtime", () => {
     const response = createDaemonFileContentResponse({
       path: IMAGE_RESULT.path,
@@ -71,11 +85,15 @@ describe("createDaemonFileContentResponse", () => {
 });
 
 describe("requestMatchesEntityTag", () => {
-  it("matches wildcard, exact, and weak-prefixed tags", () => {
+  it("compares weakly across wildcard, exact, and listed tags", () => {
     expect(requestMatchesEntityTag(undefined, '"a"')).toBe(false);
     expect(requestMatchesEntityTag("*", '"a"')).toBe(true);
     expect(requestMatchesEntityTag('"a"', '"a"')).toBe(true);
     expect(requestMatchesEntityTag('W/"a"', '"a"')).toBe(true);
+    expect(requestMatchesEntityTag('"a"', 'W/"a"')).toBe(true);
+    expect(requestMatchesEntityTag('"b", W/"a"', 'W/"a"')).toBe(true);
     expect(requestMatchesEntityTag('"b", "c"', '"a"')).toBe(false);
+    expect(requestMatchesEntityTag('W/"b"', 'W/"a"')).toBe(false);
+    expect(requestMatchesEntityTag('"ab"', 'W/"a"')).toBe(false);
   });
 });

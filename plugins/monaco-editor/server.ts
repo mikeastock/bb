@@ -72,6 +72,10 @@ export const rpcContract = defineRpcContract({
   },
 });
 
+function hostPathApi(hostPath: string): path.PlatformPath {
+  return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(hostPath) ? path.win32 : path.posix;
+}
+
 function isBundleStale(moduleDir: string, bundleDir: string): boolean {
   const builtAtMs = statSync(path.join(bundleDir, "editor.js")).mtimeMs;
   const entryDir = path.join(moduleDir, "monaco-bundle");
@@ -139,13 +143,6 @@ export default async function plugin(bb: BbPluginApi) {
     return assetLease;
   }
 
-  async function threadStorageRoot(): Promise<string> {
-    const override = process.env.BB_THREAD_STORAGE;
-    if (override && override.trim().length > 0) return path.resolve(override);
-    const { dataDir } = await bb.sdk.system.config();
-    return path.join(dataDir, "thread-storage");
-  }
-
   async function resolveTarget(
     source: z.infer<typeof sourceSchema>,
     filePath: string,
@@ -154,8 +151,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (source.threadId === null) {
         throw new Error("This thread-storage file has no thread");
       }
-      const rootPath = path.join(await threadStorageRoot(), source.threadId);
-      return { path: path.join(rootPath, filePath), rootPath };
+      const { hostId, storageRootPath } = await bb.sdk.threads.storageLocation({
+        threadId: source.threadId,
+      });
+      return {
+        path: hostPathApi(storageRootPath).join(storageRootPath, filePath),
+        rootPath: storageRootPath,
+        hostId,
+      };
     }
     if (source.environmentId === null && source.kind === "workspace") {
       if (source.projectId === null) {
@@ -175,7 +178,7 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error("This project has no matching source checkout");
       }
       return {
-        path: path.join(checkout.path, filePath),
+        path: hostPathApi(checkout.path).join(checkout.path, filePath),
         rootPath: checkout.path,
         hostId: checkout.hostId,
       };
@@ -200,14 +203,14 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("This environment has no workspace path");
     }
     return {
-      path: path.join(environment.path, filePath),
+      path: hostPathApi(environment.path).join(environment.path, filePath),
       rootPath: environment.path,
       ...(environment.hostId ? { hostId: environment.hostId } : {}),
     };
   }
 
   function relativeTo(root: string, target: string): string {
-    const api = path.win32.isAbsolute(root) ? path.win32 : path.posix;
+    const api = hostPathApi(root);
     return api.relative(root, target) || api.basename(target);
   }
 
@@ -245,6 +248,7 @@ export default async function plugin(bb: BbPluginApi) {
         path: target.rootPath,
         includeFiles: true,
         includeDirectories: true,
+        includeHidden: true,
         limit: MAX_TREE_ENTRIES,
         ...(target.hostId !== undefined ? { hostId: target.hostId } : {}),
       });

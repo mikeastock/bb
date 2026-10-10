@@ -9,10 +9,10 @@ import type {
   PluginCatalogEntrySelector,
   PluginCatalogService,
 } from "../services/plugin-catalog/plugin-catalog-service.js";
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+import type { PluginInstallJobs } from "../services/plugins/plugin-install-jobs.js";
+import { errorMessage } from "../services/lib/error-log-fields.js";
+import { hashedAssetCacheControl } from "./plugin-image-response.js";
+import { respondWithInstallJob } from "./plugin-install-jobs.js";
 
 function entrySelector(
   entryId: string | undefined,
@@ -28,6 +28,7 @@ function entrySelector(
 export function registerPluginCatalogRoutes(
   app: Hono,
   catalog: PluginCatalogService,
+  installJobs: PluginInstallJobs,
 ): void {
   app.get("/plugin-catalog", (context) =>
     context.json({ catalog: catalog.status() }),
@@ -37,6 +38,7 @@ export function registerPluginCatalogRoutes(
     context.json({
       results: await catalog.search(context.req.query("q") ?? ""),
       collections: catalog.collections(),
+      categories: catalog.categories(),
     }),
   );
 
@@ -50,10 +52,10 @@ export function registerPluginCatalogRoutes(
     }
     return context.body(new Uint8Array(icon.bytes), 200, {
       "content-type": icon.contentType,
-      "cache-control":
-        context.req.query("h") === icon.hash
-          ? "public, max-age=31536000, immutable"
-          : "no-store",
+      "cache-control": hashedAssetCacheControl(
+        context.req.query("h"),
+        icon.hash,
+      ),
       "content-security-policy":
         "default-src 'none'; style-src 'unsafe-inline'; sandbox",
       "x-content-type-options": "nosniff",
@@ -74,7 +76,7 @@ export function registerPluginCatalogRoutes(
     try {
       return context.json({ plan: await catalog.installPlan(selector) });
     } catch (error) {
-      return context.json({ error: message(error) }, 422);
+      return context.json({ error: errorMessage(error) }, 422);
     }
   });
 
@@ -90,14 +92,25 @@ export function registerPluginCatalogRoutes(
         422,
       );
     }
+    let entry: ReturnType<PluginCatalogService["describeEntry"]>;
     try {
-      return context.json({
-        ok: true as const,
-        plugin: await catalog.install(body.data),
-      });
+      entry = catalog.describeEntry(body.data);
     } catch (error) {
-      return context.json({ error: message(error) }, 422);
+      return context.json({ error: errorMessage(error) }, 422);
     }
+    const input = body.data;
+    const job = installJobs.start({
+      target: {
+        kind: "catalog",
+        entryId: entry.entryId,
+        marketplace: entry.marketplace,
+      },
+      displayName: entry.displayName,
+      run: () => catalog.install(input),
+    });
+    return respondWithInstallJob(context, installJobs, job, (error) => ({
+      error,
+    }));
   });
 
   app.get("/marketplaces", (context) =>
@@ -116,7 +129,7 @@ export function registerPluginCatalogRoutes(
         marketplace: await catalog.addMarketplace(body.data.source),
       });
     } catch (error) {
-      return context.json({ error: message(error) }, 422);
+      return context.json({ error: errorMessage(error) }, 422);
     }
   });
 
@@ -131,7 +144,7 @@ export function registerPluginCatalogRoutes(
         results: await catalog.refreshMarketplaces(body.data),
       });
     } catch (error) {
-      return context.json({ error: message(error) }, 422);
+      return context.json({ error: errorMessage(error) }, 422);
     }
   });
 
@@ -152,7 +165,7 @@ export function registerPluginCatalogRoutes(
         convertedPluginIds: removed.convertedPluginIds,
       });
     } catch (error) {
-      return context.json({ error: message(error) }, 422);
+      return context.json({ error: errorMessage(error) }, 422);
     }
   });
 }

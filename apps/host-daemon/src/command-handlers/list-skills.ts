@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveDataDirSkillsRootPath } from "@bb/config/skill-storage-paths";
+import {
+  EMPTY_PROVIDER_NATIVE_ROOTS,
+  EMPTY_PROVIDER_RESOLVED_NATIVE_ROOTS,
+  providerNativeRootsAreEmpty,
+  type ProviderNativeRoots,
+} from "@bb/domain";
 import type {
+  DiscoveredSkill,
   HostDaemonOnlineRpcResult,
   SkillRootKind,
 } from "@bb/host-daemon-contract";
@@ -14,6 +21,7 @@ import {
 import {
   type CommandScanRoot,
   discoverSkills,
+  SKILL_FILE_NAME,
   type SkillScanRoot,
 } from "../command-discovery.js";
 import {
@@ -22,9 +30,9 @@ import {
 } from "./list-commands.js";
 import { writeHostFile } from "./file-write.js";
 
-const SKILL_FILE_NAME = "SKILL.md";
-
 type SkillRootResolution = DeclaredScanRootResolution;
+
+const SHARED_SKILLS_PROVIDER_ID = "bb-shared";
 
 function createBbSkillScanRoot(
   rootPath: string,
@@ -45,7 +53,10 @@ function resolveBbSkillScanRoots(
   resolution: SkillRootResolution,
 ): SkillScanRoot[] {
   const roots: SkillScanRoot[] = [];
-  if (resolution.cwd !== null) {
+  if (
+    resolution.cwd !== null &&
+    resolution.providerId !== SHARED_SKILLS_PROVIDER_ID
+  ) {
     roots.push(
       createBbSkillScanRoot(
         path.join(resolution.cwd, ".bb", "skills"),
@@ -73,7 +84,7 @@ function classifySkillRoot(
   if (root.skillIdentitySeed === undefined) {
     return null;
   }
-  const shared = resolution.providerId === "bb-shared";
+  const shared = resolution.providerId === SHARED_SKILLS_PROVIDER_ID;
   return {
     identitySeed: root.skillIdentitySeed,
     rootKind: shared
@@ -99,6 +110,26 @@ export async function resolveSkillScanRoots(
     skillRoots.push({ ...root, ...classification });
   }
   return skillRoots;
+}
+
+export async function listSharedSkills(args: {
+  cwd: string;
+  roots: ProviderNativeRoots;
+}): Promise<DiscoveredSkill[]> {
+  if (providerNativeRootsAreEmpty(args.roots)) {
+    return [];
+  }
+  const roots = await resolveSkillScanRoots({
+    cwd: args.cwd,
+    homeDir: os.homedir(),
+    providerId: SHARED_SKILLS_PROVIDER_ID,
+    nativeRoots: {
+      skills: args.roots,
+      commands: EMPTY_PROVIDER_NATIVE_ROOTS,
+      resolved: EMPTY_PROVIDER_RESOLVED_NATIVE_ROOTS,
+    },
+  });
+  return discoverSkills({ roots });
 }
 
 export async function listHostSkills(

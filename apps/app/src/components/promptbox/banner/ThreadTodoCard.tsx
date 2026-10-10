@@ -3,8 +3,9 @@ import type {
   ThreadTimelinePendingTodoItemStatus,
   ThreadTimelinePendingTodos,
 } from "@bb/domain";
-import { AnimatedBody } from "@/components/promptbox/banner/AnimatedBody";
+import { AnimatedDisclosureBody } from "@/components/promptbox/banner/AnimatedBody";
 import {
+  PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
   PROMPT_STACK_CARD_ROW_HEIGHT,
   PromptStackCard,
 } from "@/components/promptbox/banner/PromptStackCard";
@@ -16,6 +17,11 @@ import {
 } from "@bb/shared-ui/activity-row-styles";
 import { Icon } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
+import {
+  PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+  PromptStackHoverChevron,
+  useDisclosureFocusHandoff,
+} from "@bb/shared-ui/prompt-stack-disclosure";
 
 const STATUS_SORT_RANK: Record<ThreadTimelinePendingTodoItemStatus, number> = {
   in_progress: 0,
@@ -42,7 +48,7 @@ const BODY_ID = "thread-todo-card-body";
 const TOGGLE_ID = "thread-todo-card-toggle";
 const TODO_HEADER_BUTTON_CLASS = activityRowClass(
   "active",
-  "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80",
+  PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
 );
 const TODO_ACTIVE_ROW_CLASS = "shadow-none ring-0";
 const TODO_ACTIVE_ICON_CLASS = "text-foreground";
@@ -144,6 +150,7 @@ export function ThreadTodoCard({
   isExpanded,
   onToggle,
 }: ThreadTodoCardProps) {
+  const focus = useDisclosureFocusHandoff(isExpanded, onToggle);
   const items = pendingTodos?.items ?? [];
   if (items.length === 0) {
     return null;
@@ -162,8 +169,12 @@ export function ThreadTodoCard({
           aria-expanded={isExpanded}
           aria-controls={BODY_ID}
           aria-label={`To-do list: ${summary.aria}`}
-          onClick={onToggle}
-          className={TODO_HEADER_BUTTON_CLASS}
+          ref={focus.triggerRef}
+          onClick={focus.onTriggerClick}
+          className={cn(
+            TODO_HEADER_BUTTON_CLASS,
+            PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+          )}
         >
           <Icon
             name="ListTodo"
@@ -178,25 +189,20 @@ export function ThreadTodoCard({
           >
             {summary.visible}
           </span>
-          <Icon
-            name="ChevronDown"
-            className={cn(
-              activityIconClass("active"),
-              "size-3.5 shrink-0 transition-transform duration-200",
-              isExpanded && "rotate-180",
-            )}
-            aria-hidden="true"
-          />
+          <PromptStackHoverChevron isExpanded={isExpanded} />
         </button>
       </div>
-      <AnimatedBody
+      <AnimatedDisclosureBody
         id={BODY_ID}
         labelledBy={TOGGLE_ID}
         isExpanded={isExpanded}
         collapsedBorder="none"
+        collapseLabel="Collapse to-do list"
+        collapseRef={focus.collapseRef}
+        onCollapse={focus.onCollapseClick}
       >
         <TodoBody items={items} />
-      </AnimatedBody>
+      </AnimatedDisclosureBody>
     </PromptStackCard>
   );
 }

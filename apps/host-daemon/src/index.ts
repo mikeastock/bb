@@ -5,8 +5,10 @@ import { loadHostDaemonStartConfig } from "@bb/config/host-daemon";
 import { loadHostDaemonEntrypointConfig } from "@bb/config/host-daemon-entrypoint";
 import {
   installSafeProcessDiagnostics,
+  installSocketTypeOfServiceGuard,
   writeSafeProcessDiagnosticReport,
 } from "@bb/process-utils";
+import { hasMachineSuspensionMarker } from "./suspension-marker.js";
 
 interface ReportStartupFailureArgs {
   diagnosticsLogsDir: string;
@@ -43,25 +45,26 @@ function reportStartupFailure(args: ReportStartupFailureArgs): void {
     args.error instanceof Error
       ? (args.error.stack ?? args.error.message)
       : String(args.error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  process.stderr.write(`${message}\n`, () => process.exit(1));
 }
 
 async function runHostDaemonEntrypoint(): Promise<void> {
   const hostDaemonEntrypointConfig = loadHostDaemonEntrypointConfig();
+  const hostDaemonStartConfig = loadHostDaemonStartConfig({});
+  if (await hasMachineSuspensionMarker(hostDaemonStartConfig.dataDir)) {
+    return;
+  }
   const hostDaemonModule = await import("./start-host-daemon.js");
   const daemon = await hostDaemonModule.startHostDaemon({
     bbExecutableDirectory: hostDaemonEntrypointConfig.BB_CLI_DIR,
     bridgeBundleDir:
       hostDaemonEntrypointConfig.BB_BRIDGE_DIR ??
       resolveEntrypointBridgeBundleDir(),
-    machineCredential: hostDaemonEntrypointConfig.BB_CONNECT_MACHINE_CREDENTIAL,
-    connectMachineId: hostDaemonEntrypointConfig.BB_CONNECT_MACHINE_ID,
+    serverHeaders: hostDaemonEntrypointConfig.BB_SERVER_HEADERS,
     autoUpdate: hostDaemonEntrypointConfig.BB_HOST_DAEMON_AUTO_UPDATE,
+    supervised: hostDaemonEntrypointConfig.BB_HOST_DAEMON_SUPERVISED,
     enrollKey: hostDaemonEntrypointConfig.BB_HOST_ENROLL_KEY,
     hostId: hostDaemonEntrypointConfig.BB_HOST_ID,
-    hostName: hostDaemonEntrypointConfig.BB_HOST_NAME,
-    hostType: hostDaemonEntrypointConfig.BB_HOST_TYPE,
   });
   await daemon.waitUntilStopped();
 }
@@ -77,6 +80,7 @@ if (isMainModule) {
     logsDir: diagnosticsLogsDir,
     processName: "host-daemon",
   });
+  installSocketTypeOfServiceGuard();
   const handleMainFailure: MainFailureHandler = (error) => {
     reportStartupFailure({ diagnosticsLogsDir, error });
   };

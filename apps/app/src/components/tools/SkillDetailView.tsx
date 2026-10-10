@@ -1,7 +1,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
-import { formatHomePathForDisplay } from "@bb/shared-ui/lib/utils";
+import { HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS } from "@bb/shared-ui/hover-reveal";
+import { cn, formatHomePathForDisplay } from "@bb/shared-ui/lib/utils";
 import { ResourceInfiniteScrollSentinel } from "@bb/shared-ui/resource-pagination";
 import {
   ResourceDefinitionSection,
@@ -20,6 +21,7 @@ import {
 import { FilePreview } from "@/components/secondary-panel/FilePreview.js";
 import { ProvenancePill } from "@/components/tools/ProvenancePill";
 import { useClipboardCopy } from "@/lib/clipboard";
+import type { MarkdownLinkRouting } from "@/components/ui/markdown-link-routing";
 
 type SkillDetailTitleBadge = {
   label: string;
@@ -45,6 +47,7 @@ interface SkillDetailViewProps {
   onSelectFile: (path: string) => void;
   contentState: SkillDetailContentState;
   footer?: ReactNode;
+  markdownLinkRouting?: MarkdownLinkRouting;
 }
 
 function SkillPath({ path, href }: { path: string; href?: string }) {
@@ -83,7 +86,10 @@ function SkillPath({ path, href }: { path: string; href?: string }) {
               <span className="truncate font-mono">{displayPath}</span>
               <Icon
                 name={copied ? "Check" : "Copy"}
-                className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+                className={cn(
+                  "size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100",
+                  HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS,
+                )}
                 aria-hidden
               />
             </button>
@@ -160,10 +166,12 @@ function ScrollingSkillContent({
   path,
   content,
   markdown,
+  markdownLinkRouting,
 }: {
   path: string;
   content: string;
   markdown: boolean;
+  markdownLinkRouting?: MarkdownLinkRouting;
 }) {
   const chunks = useMemo(
     () => (markdown ? splitMarkdownIntoChunks(content) : [content]),
@@ -183,6 +191,7 @@ function ScrollingSkillContent({
             key={index}
             path={path}
             headerMode="none"
+            markdownLinkRouting={markdownLinkRouting}
             state={{
               kind: "ready",
               file: {
@@ -195,6 +204,7 @@ function ScrollingSkillContent({
           />
         ))}
         <ResourceInfiniteScrollSentinel
+          itemCount={shownChunks.length}
           hasMore={visibleChunkCount < chunks.length}
           onLoadMore={() =>
             setVisibleChunkCount((current) =>
@@ -220,6 +230,7 @@ export function SkillDetailView({
   onSelectFile,
   contentState,
   footer,
+  markdownLinkRouting,
 }: SkillDetailViewProps) {
   const directoryPath = getSkillDirectoryPath(path);
   const selectedDisplayPath = formatHomePathForDisplay(selectedPath);
@@ -292,6 +303,7 @@ export function SkillDetailView({
               path={selectedPath}
               content={contentState.content}
               markdown={selectedFileIsMarkdown}
+              markdownLinkRouting={markdownLinkRouting}
             />
           )}
         </ResourceDefinitionSection>

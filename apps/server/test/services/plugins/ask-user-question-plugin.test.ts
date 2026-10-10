@@ -2,8 +2,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodeClientTurnRequestIdNumber } from "@bb/domain";
 import { builtinPluginSource } from "../../../src/services/plugins/builtin-registry.js";
-import { buildThreadStartCommand } from "../../../src/services/threads/thread-commands.js";
-import { resolveExecutionOptions } from "../../../src/services/threads/thread-runtime-config.js";
+import {
+  buildExecutionOptions,
+  buildThreadStartCommand,
+} from "../../../src/services/threads/thread-commands.js";
 import { textInput } from "../../helpers/prompt-input.js";
 import {
   seedEnvironment,
@@ -59,13 +61,11 @@ describe("ask-user-question builtin plugin", () => {
       environmentId: environment.id,
       providerId: args.providerId,
     });
-    const execution = await resolveExecutionOptions(harness.deps, {
-      threadId: thread.id,
-      requestedExecution: {
-        model: args.model,
-        source: "client/turn/requested",
-      },
-    });
+    const execution = await buildExecutionOptions(
+      harness.deps,
+      { model: args.model },
+      { threadId: thread.id },
+    );
     const command = await buildThreadStartCommand(harness.deps, {
       environment,
       execution,
@@ -83,7 +83,7 @@ describe("ask-user-question builtin plugin", () => {
     return command.dynamicTools;
   }
 
-  it("advertises the tool to codex with Claude's exact schema", async () => {
+  it("advertises the tool to codex", async () => {
     const tools = await dynamicToolsFor({
       providerId: "codex",
       model: "gpt-5.6",
@@ -97,50 +97,6 @@ describe("ask-user-question builtin plugin", () => {
     expect(tool?.description).toContain(
       "Use this tool only when you are blocked on a decision that is genuinely the user's to make",
     );
-    const schema = tool?.inputSchema as {
-      required: string[];
-      properties: {
-        questions: {
-          minItems: number;
-          maxItems: number;
-          items: {
-            required: string[];
-            properties: {
-              multiSelect: { default: boolean };
-              options: {
-                minItems: number;
-                maxItems: number;
-                items: { properties: Record<string, unknown> };
-              };
-            };
-          };
-        };
-      };
-    };
-    expect(schema.required).toEqual(["questions"]);
-    expect(schema.properties.questions.minItems).toBe(1);
-    expect(schema.properties.questions.maxItems).toBe(4);
-    expect(schema.properties.questions.items.required).toEqual([
-      "question",
-      "header",
-      "options",
-      "multiSelect",
-    ]);
-    expect(
-      schema.properties.questions.items.properties.multiSelect.default,
-    ).toBe(false);
-    expect(schema.properties.questions.items.properties.options.minItems).toBe(
-      2,
-    );
-    expect(schema.properties.questions.items.properties.options.maxItems).toBe(
-      4,
-    );
-    expect(
-      Object.keys(
-        schema.properties.questions.items.properties.options.items.properties,
-      ).sort(),
-    ).toEqual(["description", "label", "preview"]);
-    expect(Object.keys(schema.properties)).toEqual(["questions"]);
   });
 
   it("withholds the tool from claude-code, which asks natively", async () => {

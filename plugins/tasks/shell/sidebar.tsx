@@ -12,20 +12,20 @@ import {
   PresetDialog,
   savePresetDraft,
 } from "../views/manage/preset-dialog.js";
-import { Icon } from "@bb/shared-ui/icon";
-import { DelayedLoading } from "@bb/shared-ui/delayed-loading";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { Icon } from "@/components/ui/icon";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 interface SidebarRowProps {
   active?: boolean;
-  onClick?: () => void;
+  onClick: () => void;
   children: ReactNode;
   title?: string;
 }
@@ -38,11 +38,11 @@ function SidebarRow({ active, onClick, children, title }: SidebarRowProps) {
       title={title}
       className={cn(
         "flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-md:pointer-coarse:h-9",
-        onClick ? "cursor-pointer" : "cursor-default",
+        "cursor-pointer",
         active
           ? "bg-sidebar-accent font-medium text-foreground"
           : "text-muted-foreground",
-        onClick && !active && "hover:bg-state-hover hover:text-foreground",
+        !active && "hover:bg-state-hover hover:text-foreground",
       )}
     >
       {children}
@@ -236,7 +236,6 @@ export function TasksSidebar({
                 onClick={() => openProject(project.id)}
               />
             ))}
-            {}
             {!indent
               ? children.map((child) => renderFolder(child, true))
               : null}
@@ -289,7 +288,6 @@ export function TasksSidebar({
               </>
             ) : null}
             {rootFolders.map((folder) => renderFolder(folder, false))}
-            {}
             {(projects ?? []).length > 0 ? (
               <div className="mt-1.5">
                 <SidebarRow onClick={onNewProject} title="New project">
@@ -310,7 +308,7 @@ export function TasksSidebar({
                         setPresetDialog({ key: Date.now(), editing: preset })
                       }
                     >
-                      <Icon name="Brain" className="size-3.5 shrink-0" />
+                      <Icon name="Bot" className="size-3.5 shrink-0" />
                       <span className="min-w-0 flex-1 truncate">
                         {preset.name}
                       </span>

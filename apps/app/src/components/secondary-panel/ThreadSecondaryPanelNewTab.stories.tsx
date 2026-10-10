@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import type { Host } from "@bb/domain";
+import { makeHost } from "@bb/test-helpers/domain-fixtures";
 import type {
   ThreadStoragePathListResponse,
   WorkspacePathEntry,
@@ -29,7 +30,7 @@ import {
 } from "@/lib/fixed-panel-tabs-state";
 import {
   getFileNameFromPath,
-  resolveRightPanelFileVisual,
+  resolveRightPanelFileIconName,
 } from "./rightPanelFileVisuals";
 import {
   resolveTerminalHost,
@@ -49,30 +50,24 @@ const MULTIPLE_HOSTS_THREAD_ID = "thr_new_tab_multiple_hosts_story";
 const RECENTS_THREAD_ID = "thr_new_tab_recents_story";
 const LONG_RECENTS_THREAD_ID = "thr_new_tab_long_recents_story";
 const SEARCH_THREAD_ID = "thr_new_tab_search_story";
+const ACTION_SEARCH_THREAD_ID = "thr_new_tab_action_search_story";
 const STORY_TERMINAL_ID = "term_new_tab_story";
 
-const MAC_STUDIO: Host = {
+const MAC_STUDIO = makeHost({
   id: "host_mac_studio",
   name: "Mac Studio",
-  type: "persistent",
-  status: "connected",
-  lastSeenAt: null,
-  maxPermissionMode: "full",
-  lastRejectedProtocolVersion: null,
-  createdAt: 0,
-  updatedAt: 0,
-};
-const MACBOOK_PRO: Host = {
+});
+const MACBOOK_PRO = makeHost({
   ...MAC_STUDIO,
   id: "host_macbook_pro",
   name: "MacBook Pro",
-};
-const BUILD_SERVER: Host = {
+});
+const BUILD_SERVER = makeHost({
   ...MAC_STUDIO,
   id: "host_build_server",
   name: "Build server",
   status: "disconnected",
-};
+});
 
 const noop = () => {};
 
@@ -549,10 +544,7 @@ function NewTabPanelStory({
         <Icon name="Terminal" className="size-3.5" aria-hidden />
       ) : (
         <Icon
-          name={
-            resolveRightPanelFileVisual({ path: outcome.selection.path })
-              .iconName
-          }
+          name={resolveRightPanelFileIconName(outcome.selection.path)}
           className="size-3.5"
           aria-hidden
         />
@@ -687,6 +679,20 @@ export function NewTab() {
           <NewTabPanelStory
             currentThreadId={SEARCH_THREAD_ID}
             initialQuery="review"
+            projectId={PROJECT_ID}
+            recentItems={RECENT_ROW_ITEMS}
+            showOpenBrowser
+            threadStoragePaths={THREAD_STORAGE_PATH_RESULTS}
+            workspacePaths={WORKSPACE_PATH_RESULTS}
+          />
+        </StoryRow>
+        <StoryRow
+          label="action search"
+          hint="matching actions lead the results; Enter opens the first one"
+        >
+          <NewTabPanelStory
+            currentThreadId={ACTION_SEARCH_THREAD_ID}
+            initialQuery="start"
             projectId={PROJECT_ID}
             recentItems={RECENT_ROW_ITEMS}
             showOpenBrowser

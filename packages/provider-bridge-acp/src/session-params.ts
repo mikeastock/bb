@@ -12,7 +12,7 @@ import {
   type AcpBridgePermissionCli,
   type AcpBridgeReasoningCli,
 } from "./bridge-protocol.js";
-import { agentModelFamilyId } from "./bridge/model-catalog.js";
+import { cursorParameterizedSelection } from "./cursor-model-selection.js";
 import type { AcpLaunchSpec } from "./launch-spec.js";
 
 export interface AcpSessionExecutionOptions {
@@ -67,8 +67,8 @@ export interface AcpSessionParams {
   cwd: string;
   agent: { command: string; args: string[] };
   dialectId?: string | undefined;
-  modelSelection?: AcpModelSelection;
-  launchReasoningLevel?: ReasoningLevel;
+  modelSelection?: AcpModelSelection | undefined;
+  launchReasoningLevel?: ReasoningLevel | undefined;
   reasoningCli?: AcpBridgeReasoningCli;
   nativeReasoning?: AcpBridgeNativeReasoning;
   parameterizedModelPicker: boolean;
@@ -205,52 +205,43 @@ export function buildAcpModelListParams(
   };
 }
 
-interface CursorParameterizedSelection {
-  modelId: string;
-  reasoningLevel?: ReasoningLevel;
-}
-
-const CURSOR_LEGACY_FAMILY_SELECTIONS: Readonly<
-  Record<string, CursorParameterizedSelection>
-> = {
-  "claude-4-sonnet": { modelId: "claude-sonnet-4" },
-  "claude-4.5-opus": { modelId: "claude-opus-4-5" },
-  "claude-4.5-sonnet": { modelId: "claude-sonnet-4-5" },
-  "claude-4.6-opus": { modelId: "claude-opus-4-6" },
-  "claude-4.6-sonnet": { modelId: "claude-sonnet-4-6" },
-  "gemini-3.6-flash-minimal": {
-    modelId: "gemini-3.6-flash",
-    reasoningLevel: "low",
-  },
-  "gpt-5.1-codex-max": { modelId: "gpt-5.1" },
-};
-
-function cursorParameterizedSelection(
-  model: string,
-  reasoningLevel: ReasoningLevel | undefined,
-): CursorParameterizedSelection {
-  const familyId = model === "auto" ? "default" : agentModelFamilyId(model);
-  const bareFamilyId = familyId.startsWith("cursor-")
-    ? familyId.slice("cursor-".length)
-    : familyId;
-  const selection = CURSOR_LEGACY_FAMILY_SELECTIONS[bareFamilyId] ?? {
-    modelId: bareFamilyId,
-  };
-  return selection.reasoningLevel !== undefined || reasoningLevel === undefined
-    ? selection
-    : { ...selection, reasoningLevel };
-}
-
-function buildAcpModelSelectionParam(
+export function buildAcpModelSelectionParams(
   launchSpec: AcpLaunchSpec,
-  options: AcpSessionExecutionOptions,
+  options: Pick<
+    AcpSessionExecutionOptions,
+    "model" | "reasoningLevel" | "serviceTier"
+  >,
   parameterizedModelPicker: boolean,
   dialectId: string | undefined,
-): { modelSelection?: AcpModelSelection } {
+): Pick<AcpSessionParams, "modelSelection" | "launchReasoningLevel"> {
+  const modelSelection = buildAcpModelSelection(
+    launchSpec,
+    options,
+    parameterizedModelPicker,
+    dialectId,
+  );
+  return {
+    ...(modelSelection !== undefined ? { modelSelection } : {}),
+    ...(launchSpec.reasoningCli !== undefined &&
+    options.reasoningLevel !== undefined
+      ? { launchReasoningLevel: options.reasoningLevel }
+      : {}),
+  };
+}
+
+function buildAcpModelSelection(
+  launchSpec: AcpLaunchSpec,
+  options: Pick<
+    AcpSessionExecutionOptions,
+    "model" | "reasoningLevel" | "serviceTier"
+  >,
+  parameterizedModelPicker: boolean,
+  dialectId: string | undefined,
+): AcpModelSelection | undefined {
   const model = options.model;
   const listCommand = buildAcpModelListCommand(launchSpec);
   if (!model || model === ACP_DEFAULT_MODEL_ID) {
-    return {};
+    return undefined;
   }
   if (
     parameterizedModelPicker ||
@@ -267,26 +258,22 @@ function buildAcpModelSelectionParam(
               : {}),
           };
     return {
-      modelSelection: {
-        ...modelSelection,
-        ...(parameterizedModelPicker && options.serviceTier !== undefined
-          ? { serviceTier: options.serviceTier }
-          : {}),
-      },
+      ...modelSelection,
+      ...(parameterizedModelPicker && options.serviceTier !== undefined
+        ? { serviceTier: options.serviceTier }
+        : {}),
     };
   }
   return {
-    modelSelection: {
-      listCommand,
-      selectFlag: launchSpec.modelCli.selectFlag,
-      model,
-      ...(options.reasoningLevel !== undefined
-        ? { reasoningLevel: options.reasoningLevel }
-        : {}),
-      ...(options.serviceTier === "fast"
-        ? { serviceTier: options.serviceTier }
-        : {}),
-    },
+    listCommand,
+    selectFlag: launchSpec.modelCli.selectFlag,
+    model,
+    ...(options.reasoningLevel !== undefined
+      ? { reasoningLevel: options.reasoningLevel }
+      : {}),
+    ...(options.serviceTier === "fast"
+      ? { serviceTier: options.serviceTier }
+      : {}),
   };
 }
 
@@ -325,7 +312,7 @@ export function buildAcpSessionParams(
       args: [...launchSpec.args],
     },
     ...(args.dialectId === undefined ? {} : { dialectId: args.dialectId }),
-    ...buildAcpModelSelectionParam(
+    ...buildAcpModelSelectionParams(
       launchSpec,
       options,
       args.parameterizedModelPicker,
@@ -340,10 +327,6 @@ export function buildAcpSessionParams(
       : {}),
     ...(launchSpec.permissionCli !== undefined
       ? { permissionCli: launchSpec.permissionCli }
-      : {}),
-    ...(launchSpec.reasoningCli !== undefined &&
-    options.reasoningLevel !== undefined
-      ? { launchReasoningLevel: options.reasoningLevel }
       : {}),
     permissionMode: options.permissionMode,
     workspaceWriteRoots: [cwd, ...args.additionalWorkspaceWriteRoots],

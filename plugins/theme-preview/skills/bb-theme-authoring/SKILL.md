@@ -1,6 +1,6 @@
 ---
 name: bb-theme-authoring
-description: Create or edit a bb theme (the app's colour palette) as a custom CSS theme and verify it live in the Theme Preview panel. Use whenever the user asks for a new bb theme, a palette change, a light/dark variant, or wants to iterate on how bb looks.
+description: "Create or edit BB color themes and inspect them in the Theme Preview panel."
 ---
 
 # Authoring a bb theme
@@ -41,11 +41,10 @@ Every declaration is a `--token: value;` custom property.
 
 ```css
 :root, .light {
-  --canvas: #f4f4f4;          /* the app background */
-  --ink: #0a0a0a;             /* body text */
-  --primary: #2e6f95;         /* links, focus ring, accents */
+  --canvas: #f4f4f4;
+  --ink: #0a0a0a;
+  --primary: #2e6f95;
   --primary-foreground: #ffffff;
-  /* …more tokens… */
 }
 
 .dark {
@@ -69,7 +68,7 @@ base theme. The anchors that drive the most are `--canvas`, `--ink`,
 | Accent and state | `--primary` `--primary-foreground` `--file-accent` `--timeline-accent` `--surface-selected` `--state-hover` `--state-active` `--sidebar-accent` |
 | Status | `--success` `--warning` `--warning-text` `--destructive` `--destructive-text` `--pr-merged` `--diff-added` `--diff-removed` |
 | Lines | `--border` `--border-hairline` `--border-seam` `--sidebar-border` `--input` `--ring` |
-| Type | `--font-sans` `--font-mono` (declare once in `:root`) |
+| Type | `--font-sans` `--font-mono` `--font-terminal` (declare once in `:root`) |
 
 How bb uses them (from bb's own components, so you can predict the result):
 sidebar rows hover with `--sidebar-accent`, the open thread's row is
@@ -77,6 +76,8 @@ sidebar rows hover with `--sidebar-accent`, the open thread's row is
 (bb has no primary-filled button; `--primary` is links, focus and accents),
 the composer sits on the canvas with a 1px `--border`, code blocks and message
 bubbles are a faint recessed wash with `--border-seam`.
+The integrated terminal uses `--font-terminal`, independently of
+`--font-mono`.
 
 Element-scoped blocks are allowed — for example `.dark .fixed.bg-sidebar { … }`
 to give only the sidebar a different value — but keep palette values in the
@@ -113,15 +114,5 @@ thread; Theme Preview does not block or automatically adjust the theme.
 
 Keep dark-mode text below ~12:1 on near-black surfaces; higher blooms on OLED.
 
-## Shipping a theme in a plugin
-
-A plugin can contribute themes via its manifest instead of the theme dir:
-
-```json
-"bb": { "themes": [{ "id": "mine", "name": "Mine", "css": "./themes/mine.css" }] }
-```
-
-bb lists it as `plugin:<pluginId>:mine`. Theme Preview resolves the CSS through
-the manifest, so chips and live reload work the same way. Install with
-`bb plugin install path:<dir> --yes`, reload with `bb plugin reload <pluginId>`
-after CSS edits.
+For manifest-contributed themes, read
+[references/plugin-themes.md](references/plugin-themes.md).

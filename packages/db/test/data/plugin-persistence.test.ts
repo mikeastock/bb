@@ -6,6 +6,10 @@ import {
   getInstalledPluginRegistration,
   getInstalledPlugin,
   listPluginArtifacts,
+  listPluginArtifactsAtOrUnderPath,
+  listPluginArtifactsUnderPath,
+  listPluginKvKeys,
+  setPluginKvValue,
   upsertInstalledPlugin,
   type DbConnection,
 } from "../../src/index.js";
@@ -52,6 +56,7 @@ describe("normalized plugin persistence", () => {
       rootDir: "/plugins/linear",
       version: "1.2.3",
       enabled: true,
+      enabledFollowsDefault: false,
     };
     upsertInstalledPlugin(db, linearPlugin);
     createPluginArtifact(db, {
@@ -121,6 +126,7 @@ describe("normalized plugin persistence", () => {
       rootDir: "/cache/repo/abcdef1234567",
       version: "1.4.2",
       enabled: true,
+      enabledFollowsDefault: false,
     };
     upsertInstalledPlugin(db, {
       ...common,
@@ -188,6 +194,7 @@ describe("normalized plugin persistence", () => {
       rootDir: "/cache/repo/abcdef1234567",
       version: "1.0.0",
       enabled: true,
+      enabledFollowsDefault: false,
     };
     upsertInstalledPlugin(db, retainedPlugin);
     createPluginArtifact(db, {
@@ -207,5 +214,42 @@ describe("normalized plugin persistence", () => {
 
     expect(deleteInstalledPlugin(db, "retained")).toBe(true);
     expect(listPluginArtifacts(db, "retained")).toHaveLength(1);
+  });
+
+  it("matches LIKE metacharacters in key and path prefixes literally", () => {
+    for (const key of ["a_b/1", "axb/2", "50%/3", "50x/4", "c\\d/5", "cxd/6"]) {
+      setPluginKvValue(db, "kv-plugin", key, "value");
+    }
+    expect(listPluginKvKeys(db, "kv-plugin", "a_b")).toEqual(["a_b/1"]);
+    expect(listPluginKvKeys(db, "kv-plugin", "50%")).toEqual(["50%/3"]);
+    expect(listPluginKvKeys(db, "kv-plugin", "c\\")).toEqual(["c\\d/5"]);
+
+    for (const [id, path] of [
+      ["root", "/cache/a_b"],
+      ["child", "/cache/a_b/child"],
+      ["sibling", "/cache/axb/child"],
+    ] as const) {
+      createPluginArtifact(db, {
+        id,
+        pluginId: "path-plugin",
+        sourceKind: "npm",
+        npmResolvedVersion: "1.0.0",
+        gitResolvedCommit: null,
+        gitCheckoutRoot: null,
+        path,
+        integrity: "sha512-example",
+        contentHash: null,
+        validationResult: "valid",
+        validatedAt: 100,
+      });
+    }
+    expect(
+      listPluginArtifactsUnderPath(db, "/cache/a_b", "/").map(({ id }) => id),
+    ).toEqual(["child"]);
+    expect(
+      listPluginArtifactsAtOrUnderPath(db, "/cache/a_b", "/").map(
+        ({ id }) => id,
+      ),
+    ).toEqual(["root", "child"]);
   });
 });

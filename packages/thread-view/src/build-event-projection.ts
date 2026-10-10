@@ -22,6 +22,7 @@ import {
 import { parseFileEditFromItemEvent } from "./file-edit-parsing.js";
 import { parseWebActivityLifecycleEvent } from "./web-activity-lifecycle.js";
 import { parseOperationMessage } from "./parse-operation-message.js";
+import { normalizeProvisioningFailures } from "./normalize-provisioning-failures.js";
 import { parseErrorMessage } from "./parse-error-message.js";
 import {
   normalizeEventProjection,
@@ -54,14 +55,17 @@ import {
   onExecBegin,
   onExecEnd,
   onExecOutput,
+} from "./tool-activity-projection.js";
+import {
   onWebActivityBegin,
   onWebActivityEnd,
-} from "./tool-activity-projection.js";
+} from "./tool-activity-web-projection.js";
 import {
   finalizeOpenCompactionsForTurn,
   onCompactionBegin,
   onCompactionEnd,
   upsertPermissionGrantLifecycleMessage,
+  upsertPluginFormLifecycleMessage,
   upsertUserQuestionLifecycleMessage,
   upsertFileEdit,
   upsertProvisioningOperation,
@@ -120,7 +124,6 @@ interface BuildDetailedProjectionArgs {
   activeThinking: ActiveThinking | null;
   activeWorkflows: EventProjectionWorkflowMessage[];
   activeBackgroundCommands: EventProjectionWorkflowMessage[];
-  contextOnlyToolCallIds?: ReadonlySet<string>;
   events: ThreadEventWithMeta[];
   messages: EventProjectionMessage[];
   turnMessageDetail: BuildEventProjectionOptions["turnMessageDetail"];
@@ -160,6 +163,7 @@ function isEventProjectionCallMessage(
     case "extension":
     case "file-edit":
     case "file-read":
+    case "image-generation":
     case "image-view":
     case "plan-steps":
     case "search":
@@ -171,6 +175,7 @@ function isEventProjectionCallMessage(
     case "error":
     case "operation":
     case "permission-grant-lifecycle":
+    case "plugin-form-lifecycle":
     case "user":
     case "user-question-lifecycle":
     case "workflow":
@@ -565,7 +570,6 @@ function buildFlatProjectionData(
   args: BuildFlatProjectionDataArgs,
 ): BuildFlatProjectionDataResult {
   const state = createProjectionState();
-  const shouldTrackActiveThinking = args.includeActiveThinking;
 
   const orderedEvents = args.events;
   const acceptedClientRequestById = buildAcceptedClientRequestById({
@@ -669,7 +673,7 @@ function buildFlatProjectionData(
           scope: decoded.scope,
         });
         onTurnCompleted({
-          completedAt: meta.createdAt,
+          meta,
           state,
           turnId: completedTurnId,
           status: decoded.status,
@@ -713,6 +717,7 @@ function buildFlatProjectionData(
       if (clientRequest) {
         for (const rejectedMessage of parseRejectedUsersFromClientRequest({
           decoded: clientRequest.event,
+          requestMeta: clientRequest.meta,
           meta,
           options: args.options,
         })) {
@@ -775,7 +780,6 @@ function buildFlatProjectionData(
         eventParentToolCallId,
         eventTurnId,
         meta,
-        shouldTrackActiveThinking,
         state,
       })
     ) {
@@ -907,7 +911,11 @@ function buildFlatProjectionData(
       continue;
     }
 
-    const compactionEvent = parseCompactionLifecycleEvent(decoded, meta);
+    const compactionEvent = parseCompactionLifecycleEvent(
+      decoded,
+      meta,
+      eventParentToolCallId,
+    );
     if (compactionEvent) {
       flushToolActivityBeforeNonToolMessage(state);
       if (compactionEvent.kind === "begin") {
@@ -931,8 +939,7 @@ function buildFlatProjectionData(
     }
 
     const operation = parseOperationMessage(decoded, meta, {
-      includeProviderUnhandledOperations:
-        args.options?.includeProviderUnhandledOperations,
+      includeDiagnosticOperations: args.options?.includeDiagnosticOperations,
       providerDisplayName: args.options?.providerDisplayName,
       threadName: args.options?.threadName ?? "",
     });
@@ -957,6 +964,10 @@ function buildFlatProjectionData(
         upsertUserQuestionLifecycleMessage(state, operation);
         continue;
       }
+      if (operation.kind === "plugin-form-lifecycle") {
+        upsertPluginFormLifecycleMessage(state, operation);
+        continue;
+      }
       state.messages.push(operation);
       continue;
     }
@@ -970,7 +981,9 @@ function buildFlatProjectionData(
   }
 
   finalizeProjectionState({ state, options: args.options });
-  const messages = sortEventProjectionMessagesBySource(state.messages);
+  const messages = sortEventProjectionMessagesBySource(
+    normalizeProvisioningFailures(orderedEvents, state.messages),
+  );
   const callMessageById = buildCallMessageById(messages);
   enrichBackgroundAgentModels(messages, callMessageById);
   return {
@@ -993,19 +1006,14 @@ function buildDetailedProjection(
     events: args.events,
     messages: args.messages,
   });
-  const semanticProjection = normalizeEventProjection(
-    {
-      ...projection,
-      state: {
-        activeThinking: args.activeThinking,
-        activeWorkflows: args.activeWorkflows,
-        activeBackgroundCommands: args.activeBackgroundCommands,
-      },
+  const semanticProjection = normalizeEventProjection({
+    ...projection,
+    state: {
+      activeThinking: args.activeThinking,
+      activeWorkflows: args.activeWorkflows,
+      activeBackgroundCommands: args.activeBackgroundCommands,
     },
-    {
-      contextOnlyToolCallIds: args.contextOnlyToolCallIds,
-    },
-  );
+  });
   return applyProjectionTurnMessageDetail(
     semanticProjection,
     args.turnMessageDetail,
@@ -1028,7 +1036,6 @@ function buildFullEventProjection(
     activeThinking: flatProjection.activeThinking,
     activeWorkflows: flatProjection.activeWorkflows,
     activeBackgroundCommands: flatProjection.activeBackgroundCommands,
-    contextOnlyToolCallIds: options.contextOnlyToolCallIds,
     events,
     messages: flatProjection.messages,
     turnMessageDetail: options.turnMessageDetail,
@@ -1063,7 +1070,6 @@ export function buildEventProjectionEntries(
     activeThinking: null,
     activeWorkflows: flatProjection.activeWorkflows,
     activeBackgroundCommands: flatProjection.activeBackgroundCommands,
-    contextOnlyToolCallIds: options.contextOnlyToolCallIds,
     events: orderedEvents,
     messages: flatProjection.messages,
     turnMessageDetail: options.turnMessageDetail,

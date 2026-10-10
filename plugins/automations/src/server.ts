@@ -6,6 +6,7 @@ import { automationRpcContract, createRpcHandlers } from "./rpc.js";
 import {
   closeAutomationRunForSettledThread,
   disableAutomationsForDeletedThreadEvent,
+  errorMessage,
   reconcileRunningAutomationRuns,
 } from "./run.js";
 import { registerAutomationCli } from "./cli.js";
@@ -56,23 +57,20 @@ export default async function plugin(bb: BbPluginApi) {
         await reconcileRunningAutomationRuns(bb, db);
       } catch (error) {
         bb.log.error(
-          `Automation startup reconciliation failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `Automation startup reconciliation failed: ${errorMessage(error)}`,
         );
       }
+      let serverHostId: string | null = null;
       while (!signal.aborted) {
         try {
+          serverHostId ??= (await bb.sdk.system.config()).primaryHostId;
           await sweepDueAutomations(bb, db, {
             pluginDataDir,
             serverUrl: resolveServerUrl(),
+            serverHostId,
           });
         } catch (error) {
-          bb.log.error(
-            `Automation sweep failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
+          bb.log.error(`Automation sweep failed: ${errorMessage(error)}`);
         }
         await sleep(SWEEP_INTERVAL_MS, signal);
       }

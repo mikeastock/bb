@@ -6,6 +6,19 @@ import {
   installTestPluginRuntime,
   renderSlot,
 } from "@get-bb/plugin-sdk/testing/app";
+import { makeTask, rpcInput } from "../../test-fixtures.js";
+
+if (!globalThis.ResizeObserver) {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
 
 if (!window.matchMedia) {
   window.matchMedia = (query: string) => ({
@@ -50,34 +63,58 @@ function projectRow(linkedBbProjectId: string | null) {
   };
 }
 
-const task = {
+const task = makeTask({
   id: "01HZZZZZZZZZZZZZZZZZZZZZT5",
   projectId: PROJECT_ID,
   number: 5,
   key: "TSK-5",
   title: "Ship the rail",
-  description: "",
-  status: "todo",
-  priority: "none",
-  dueDate: null,
-  parentTaskId: null,
   position: 1,
-  createdAt: "2026-07-15T00:00:00.000Z",
-  updatedAt: "2026-07-15T00:00:00.000Z",
-  labelIds: [],
+});
+
+const HOME_PROJECT = {
+  ...projectRow(null),
+  id: "01HZZZZZZZZZZZZZZZZZZZZZP2",
+  name: "Home",
+  prefix: "HOME",
+  color: "purple",
 };
 
-function railProps(linkedBbProjectId: string | null) {
+function railProps(
+  linkedBbProjectId: string | null,
+  onMoveToProject: (projectId: string) => void = () => {},
+) {
+  const project = projectRow(linkedBbProjectId);
   return {
     task,
-    project: projectRow(linkedBbProjectId),
+    project,
+    projects: [project, HOME_PROJECT],
     labels: [],
     threads: [],
     presets: [],
     onUpdate: () => {},
+    onMoveToProject,
     onError: () => {},
   };
 }
+
+describe("project rail control", () => {
+  it("moves the task only when a different project is picked", async () => {
+    const moves: string[] = [];
+    const slot = renderSlot(
+      { component: RailHarness },
+      railProps(null, (projectId) => moves.push(projectId)),
+      { rpc: { listBbProjects: () => ({ bbProjects: [] }) } },
+    );
+    fireEvent.click(slot.getByRole("button", { name: "Move to project" }));
+    fireEvent.click(await slot.findByRole("option", { name: /Tasks Plugin/ }));
+    expect(moves).toEqual([]);
+
+    fireEvent.click(slot.getByRole("button", { name: "Move to project" }));
+    fireEvent.click(await slot.findByRole("option", { name: /Home/ }));
+    expect(moves).toEqual([HOME_PROJECT.id]);
+  });
+});
 
 describe("dispatch target rail control", () => {
   it("links a discovered bb project", async () => {
@@ -87,7 +124,8 @@ describe("dispatch target rail control", () => {
         listBbProjects: () => ({
           bbProjects: [{ id: BB_PROJECT_ID, name: "bb monorepo" }],
         }),
-        updateProject: (input: Record<string, unknown>) => {
+        updateProject: (raw: unknown) => {
+          const input = rpcInput(raw);
           updateCalls.push(input);
           return {
             project: {
@@ -118,7 +156,8 @@ describe("dispatch target rail control", () => {
           listBbProjects: () => ({
             bbProjects: [{ id: BB_PROJECT_ID, name: "bb monorepo" }],
           }),
-          updateProject: (input: Record<string, unknown>) => {
+          updateProject: (raw: unknown) => {
+            const input = rpcInput(raw);
             updateCalls.push(input);
             return {
               project: {

@@ -2,34 +2,37 @@
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Host } from "@bb/domain";
+import { makeHost } from "@bb/test-helpers/domain-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MachinePickerUI } from "./MachinePicker";
+import type { MachineProviderPresentation } from "@/components/plugin/MachineProviderIcon";
 
 const HOUR_MS = 60 * 60 * 1000;
 
-const thisMachine: Host = {
+const thisMachine = makeHost({
   id: "host_local",
   name: "MacBook Pro",
-  type: "persistent",
-  status: "connected",
-  lastSeenAt: null,
-  maxPermissionMode: "full",
-  lastRejectedProtocolVersion: null,
-  createdAt: 0,
-  updatedAt: 0,
-};
-const studio: Host = {
+});
+const studio = makeHost({
   ...thisMachine,
   id: "host_studio",
   name: "Mac Studio",
-};
-const devVm: Host = {
+});
+const devVm = makeHost({
   ...thisMachine,
   id: "host_vm",
   name: "dev-vm",
   status: "disconnected",
   lastSeenAt: Date.now() - 2 * HOUR_MS,
-};
+});
+const manyHosts = [
+  thisMachine,
+  studio,
+  devVm,
+  makeHost({ ...thisMachine, id: "host_build", name: "Build server" }),
+  makeHost({ ...thisMachine, id: "host_office", name: "Office Mac Studio" }),
+  makeHost({ ...thisMachine, id: "host_travel", name: "Travel laptop" }),
+] as const;
 
 afterEach(() => {
   cleanup();
@@ -40,6 +43,7 @@ function renderMachineMenu(overrides?: {
   hosts?: readonly Host[];
   selectedHostId?: string | null;
   onChange?: (hostId: string) => void;
+  machineProviders?: readonly MachineProviderPresentation[];
 }) {
   render(
     <MachinePickerUI
@@ -49,15 +53,70 @@ function renderMachineMenu(overrides?: {
       selectedHostId={overrides?.selectedHostId ?? thisMachine.id}
       onChange={overrides?.onChange ?? vi.fn()}
       modal={false}
+      machineProviders={overrides?.machineProviders}
     />,
   );
-  fireEvent.pointerDown(screen.getByRole("button", { name: "Machine" }), {
-    button: 0,
-  });
+  fireEvent.click(screen.getByRole("button", { name: "Machine" }));
 }
 
 describe("MachinePickerUI", () => {
-  it("keeps a long machine menu inside a short viewport and scrolls it", () => {
+  it("shows search only when there are more than five machines", () => {
+    const result = render(
+      <MachinePickerUI
+        hosts={manyHosts.slice(0, 5)}
+        localDaemonHostId={thisMachine.id}
+        primaryHostId={thisMachine.id}
+        selectedHostId={thisMachine.id}
+        onChange={vi.fn()}
+        modal={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Machine" }));
+
+    expect(
+      screen.queryByRole("combobox", { name: "Search machines" }),
+    ).toBeNull();
+
+    result.rerender(
+      <MachinePickerUI
+        hosts={manyHosts}
+        localDaemonHostId={thisMachine.id}
+        primaryHostId={thisMachine.id}
+        selectedHostId={thisMachine.id}
+        onChange={vi.fn()}
+        modal={false}
+      />,
+    );
+
+    expect(
+      screen.getByRole("combobox", { name: "Search machines" }),
+    ).toBeTruthy();
+  });
+
+  it("fuzzy-searches machine names and host ids, then resets after selection", () => {
+    const onChange = vi.fn();
+    renderMachineMenu({ hosts: manyHosts, onChange });
+    const search = screen.getByRole("combobox", { name: "Search machines" });
+
+    fireEvent.change(search, { target: { value: "OMS" } });
+    expect(screen.queryByRole("option", { name: /^Mac Studio$/u })).toBeNull();
+    expect(
+      screen.getByRole("option", { name: /Office Mac Studio/u }),
+    ).toBeTruthy();
+
+    fireEvent.change(search, { target: { value: "host_travel" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith("host_travel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Machine" }));
+    expect(
+      screen.getByRole<HTMLInputElement>("combobox", {
+        name: "Search machines",
+      }).value,
+    ).toBe("");
+  });
+
+  it("shows an empty result and returns the results viewport to the top", () => {
     renderMachineMenu({
       hosts: Array.from({ length: 20 }, (_, index) => ({
         ...thisMachine,
@@ -66,12 +125,25 @@ describe("MachinePickerUI", () => {
       })),
     });
 
-    const menu = screen.getByRole("menu");
-    expect(menu.className).toContain(
-      "max-h-[min(var(--radix-dropdown-menu-content-available-height),calc(100dvh-0.5rem))]",
+    const dialog = screen.getByRole("dialog", { name: "Machine" });
+    expect(dialog.className).toContain(
+      "max-h-[min(var(--radix-popover-content-available-height),calc(100dvh-0.5rem))]",
     );
-    expect(menu.className).toContain("overflow-y-auto");
-    expect(menu.className).toContain("overscroll-contain");
+    expect(dialog.className).toContain("overflow-hidden");
+
+    const list = document.querySelector<HTMLElement>("[cmdk-list]");
+    expect(list).not.toBeNull();
+    expect(list?.className).toContain("overflow-y-auto");
+    expect(list?.className).toContain("overscroll-contain");
+
+    if (list === null) return;
+    list.scrollTop = 120;
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Search machines" }),
+      { target: { value: "missing" } },
+    );
+    expect(list.scrollTop).toBe(0);
+    expect(screen.getByText("No machines found")).toBeTruthy();
   });
 
   it("names the selected machine in the trigger and badges this machine in the menu", () => {
@@ -87,14 +159,14 @@ describe("MachinePickerUI", () => {
     const onChange = vi.fn();
     renderMachineMenu({ onChange });
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Mac Studio/u }));
+    fireEvent.click(screen.getByRole("option", { name: /Mac Studio/u }));
     expect(onChange).toHaveBeenCalledWith(studio.id);
   });
 
   it("disables an offline machine and shows when it was last seen", () => {
     renderMachineMenu();
 
-    const offlineItem = screen.getByRole("menuitem", { name: /dev-vm/u });
+    const offlineItem = screen.getByRole("option", { name: /dev-vm/u });
     expect(offlineItem.getAttribute("aria-disabled")).toBe("true");
     expect(screen.getByText(/last seen 2h ago/u)).toBeTruthy();
   });
@@ -105,5 +177,32 @@ describe("MachinePickerUI", () => {
     expect(
       screen.getByRole("button", { name: "Machine" }).textContent,
     ).toContain("MacBook Pro");
+  });
+
+  it("includes provider-made hosts in machine pickers", () => {
+    const modalHost = makeHost({
+      id: "host_modal",
+      name: "Modal sandbox 3f9a",
+      type: "ephemeral",
+      machineProviderId: "modal-sandbox",
+    });
+    renderMachineMenu({
+      hosts: [thisMachine, studio, modalHost],
+      selectedHostId: modalHost.id,
+      machineProviders: [
+        {
+          id: "modal-sandbox",
+          displayName: "Modal Sandbox",
+          icon: "Cloud",
+          logoUrl: null,
+        },
+      ],
+    });
+
+    expect(screen.getAllByText("Modal sandbox 3f9a")).toHaveLength(2);
+    const trigger = screen.getByRole("button", { name: "Machine" });
+    expect(trigger.querySelector('[data-icon="Cloud"]')).not.toBeNull();
+    expect(trigger.querySelector('[data-icon="Laptop"]')).toBeNull();
+    expect(screen.queryByText("Modal Sandbox")).toBeNull();
   });
 });

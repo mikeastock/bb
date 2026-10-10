@@ -14,62 +14,36 @@ import {
   type PluginComposerPlusMenuSelection,
 } from "@/components/plugin/PluginComposerActions";
 import { useResolvedComposerPlusMenuItems } from "@/components/plugin/composer-slot-hooks";
-import { useOptionalPluginComposerView } from "@/components/plugin/plugin-composer-host";
+import { useOptionalPluginComposerStaticView } from "@/components/plugin/plugin-composer-host";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { COARSE_POINTER_PROMPT_ICON_ACTION_BUTTON_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
 import { CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS } from "@bb/shared-ui/chrome-style-tokens";
-import { CREATE_PLUGIN_PROMPT } from "@bb/client-core";
 import type { ProviderPromptActionCommand } from "@bb/client-core";
 
-type PromptBoxActionKind = "skills" | "plan" | "goal" | "automation" | "plugin";
+type PromptBoxActionKind = "skills" | "plan" | "goal";
 
 export interface PromptBoxAction {
   kind: PromptBoxActionKind;
   text: string;
   command?: ProviderPromptActionCommand;
-  label?: string;
-  disabled?: boolean;
 }
 
 interface PromptBoxActionsMenuProps {
   actions?: readonly PromptBoxAction[];
-  isAttaching?: boolean;
   onAttach?: () => void;
   onAction: (action: PromptBoxAction) => void;
   pluginItems?: readonly PluginComposerPlusMenuContribution[];
 }
 
-export function ComposerPlusMenuSlot({
-  includePluginContributions = true,
-  ...props
-}: Omit<PromptBoxActionsMenuProps, "pluginItems"> & {
-  includePluginContributions?: boolean;
-}) {
-  const view = useOptionalPluginComposerView();
+export function ComposerPlusMenuSlot(
+  props: Omit<PromptBoxActionsMenuProps, "pluginItems">,
+) {
+  const view = useOptionalPluginComposerStaticView();
   const pluginItems = useResolvedComposerPlusMenuItems(
-    includePluginContributions ? (view?.scope.kind ?? null) : null,
+    view?.scope.kind ?? null,
   );
   return <PromptBoxActionsMenu {...props} pluginItems={pluginItems} />;
 }
-
-export const AUTOMATION_PROMPT_ACTION: PromptBoxAction = {
-  kind: "automation",
-  command: { trigger: "/", name: "automation", trailingText: " " },
-  text: "/automation ",
-};
-
-export const CREATE_PLUGIN_PROMPT_ACTION: PromptBoxAction = {
-  kind: "plugin",
-  text: CREATE_PLUGIN_PROMPT,
-};
-
-const PROMPT_ACTION_ORDER: readonly PromptBoxActionKind[] = [
-  "skills",
-  "plan",
-  "goal",
-  "automation",
-  "plugin",
-];
 
 const PROMPT_ACTION_PRESENTATION = {
   skills: {
@@ -84,30 +58,16 @@ const PROMPT_ACTION_PRESENTATION = {
     label: "Goal",
     icon: "Target",
   },
-  automation: {
-    label: "Automation",
-    icon: "Repeat",
-  },
-  plugin: {
-    label: "Plugin",
-    icon: "ElectricPlugs",
-  },
 } as const satisfies Record<
   PromptBoxActionKind,
   { label: string; icon: IconName }
 >;
 
-export function withAppPromptActions(
-  actions: readonly PromptBoxAction[],
-): PromptBoxAction[] {
-  const appActions = [AUTOMATION_PROMPT_ACTION, CREATE_PLUGIN_PROMPT_ACTION];
-  return [
-    ...actions,
-    ...appActions.filter(
-      (appAction) => !actions.some((action) => action.kind === appAction.kind),
-    ),
-  ];
-}
+const PROMPT_ACTION_ORDER: readonly PromptBoxActionKind[] = [
+  "skills",
+  "plan",
+  "goal",
+];
 
 function orderedPromptActions(
   actions: readonly PromptBoxAction[],
@@ -120,7 +80,6 @@ function orderedPromptActions(
 
 export function PromptBoxActionsMenu({
   actions = [],
-  isAttaching = false,
   onAttach,
   onAction,
   pluginItems = [],
@@ -209,18 +168,14 @@ export function PromptBoxActionsMenu({
         {onAttach ? (
           <>
             <DropdownMenuItem
-              disabled={isAttaching}
               onSelect={() => {
                 selectedItemRef.current = true;
                 onAttach();
               }}
             >
               <Icon
-                name={isAttaching ? "Spinner" : "Paperclip"}
-                className={cn(
-                  "size-4 text-muted-foreground",
-                  isAttaching && "animate-spin",
-                )}
+                name="Paperclip"
+                className="size-4 text-muted-foreground"
                 aria-hidden
               />
               Attach files
@@ -233,7 +188,6 @@ export function PromptBoxActionsMenu({
           return (
             <DropdownMenuItem
               key={action.kind}
-              disabled={action.disabled}
               onSelect={() => {
                 selectedItemRef.current = true;
                 onAction(action);
@@ -244,32 +198,21 @@ export function PromptBoxActionsMenu({
                 className="size-4 text-muted-foreground"
                 aria-hidden
               />
-              {action.label ?? presentation.label}
+              {presentation.label}
             </DropdownMenuItem>
           );
         })}
-        {pluginItems.length > 0 ? <DropdownMenuSeparator /> : null}
-        {pluginItems.map((contribution, index) => {
-          const contributingPluginCount = new Set(
-            pluginItems.map((candidate) => candidate.pluginId),
-          ).size;
-          const previous = pluginItems[index - 1];
-          const startsPluginGroup =
-            contributingPluginCount >= 2 &&
-            previous?.pluginId !== contribution.pluginId;
-          return (
-            <PluginComposerPlusMenuEntry
-              key={contribution.key}
-              contribution={contribution}
-              showPluginLabel={startsPluginGroup}
-              onSelected={(selection) => {
-                selectedItemRef.current = true;
-                pluginSelectionRef.current = selection;
-                queueMicrotask(() => restorePluginComposerFocus(selection));
-              }}
-            />
-          );
-        })}
+        {pluginItems.map((contribution) => (
+          <PluginComposerPlusMenuEntry
+            key={contribution.key}
+            contribution={contribution}
+            onSelected={(selection) => {
+              selectedItemRef.current = true;
+              pluginSelectionRef.current = selection;
+              queueMicrotask(() => restorePluginComposerFocus(selection));
+            }}
+          />
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

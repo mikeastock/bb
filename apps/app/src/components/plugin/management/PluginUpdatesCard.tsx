@@ -3,16 +3,18 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { UPDATE_ACTION_ICON } from "@bb/domain/update-state";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
+import { usePluginNotificationAction } from "@/components/plugin/PluginNotificationDescription";
 import { appToast } from "@/components/ui/app-toast";
-import { invalidatePluginList } from "@/hooks/cache-owners/plugin-cache-owner";
-import { applyPluginUpdate } from "@/hooks/queries/plugin-catalog-queries";
+import { applyPluginUpdateJob } from "@/hooks/cache-owners/plugin-cache-owner";
+import { startPluginUpdate } from "@/hooks/queries/plugin-update-job-queries";
 import type { PluginListItem } from "@/hooks/queries/plugin-settings-queries";
 import { pluginAdminErrorMessage } from "@/lib/plugin-admin-error";
 import { DetailsDisclosure, displayPluginVersion } from "./plugin-ui";
 import { UpdatePluginDialog } from "./UpdatePluginDialog";
 
 export function pluginHasUpdateSurfaces(plugin: PluginListItem): boolean {
-  if (plugin.source.startsWith("builtin:")) return false;
+  if (plugin.source.startsWith("builtin:") || plugin.source.startsWith("path:"))
+    return false;
   return plugin.provenance === "direct" || plugin.provenance === "catalog";
 }
 
@@ -38,33 +40,19 @@ export function PluginDetailReleaseControl({
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const queryClient = useQueryClient();
-  const name = plugin.name ?? plugin.id;
+  const notificationAction = usePluginNotificationAction();
   const availableVersion = plugin.updateState.availableVersion;
   const failure = plugin.updateState.lastFailure;
   const retry = useMutation({
-    mutationFn: () => applyPluginUpdate(fetch, plugin.id),
-    onSuccess: (result) => {
-      invalidatePluginList({ queryClient });
-      if (result.outcome === "rolled-back") {
-        appToast.error(`Updating ${name} failed`, {
-          description:
-            result.detail ??
-            `${displayPluginVersion(plugin.version)} was restored.`,
-        });
-      } else if (result.applied) {
-        appToast.success(`${name} updated`, {
-          description:
-            result.to === null
-              ? undefined
-              : `Now running ${displayPluginVersion(result.to.display)}.`,
-        });
-      } else {
-        appToast.message(`${name} is already up to date`);
-      }
+    meta: { showErrorToast: false },
+    mutationFn: () => startPluginUpdate(plugin.id),
+    onSuccess: (job) => {
+      applyPluginUpdateJob({ queryClient, job });
     },
     onError: (error) => {
-      appToast.error(`Updating ${name} failed`, {
-        description: pluginAdminErrorMessage(error),
+      appToast.error("Plugin update failed", {
+        description: `${plugin.name ?? plugin.id} — ${pluginAdminErrorMessage(error)}`,
+        action: notificationAction(plugin.id, "installed"),
       });
     },
   });

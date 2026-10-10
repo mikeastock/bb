@@ -1,6 +1,11 @@
 import * as React from "react";
 
 import { useLatestRef } from "@/hooks/useLatestRef";
+import {
+  findTouchById,
+  hasTextSelectionWithin,
+  isHorizontallyScrollableElement,
+} from "./gesture-dom";
 
 const DRAG_INTENT_PX = 12;
 const DRAG_SETTLE_MS = 220;
@@ -46,14 +51,6 @@ type Options = {
 
 type Point = { x: number; y: number };
 
-function getTouch(touches: TouchList, id: number): Touch | null {
-  for (let index = 0; index < touches.length; index += 1) {
-    const touch = touches.item(index);
-    if (touch?.identifier === id) return touch;
-  }
-  return null;
-}
-
 function isTouchEvent(event: Event): event is TouchEvent {
   return "touches" in event && "changedTouches" in event;
 }
@@ -62,8 +59,8 @@ function trackedPoint(event: Event, session: DragSession): Point | null {
   if (session.input === "touch") {
     if (!isTouchEvent(event)) return null;
     const touch =
-      getTouch(event.touches, session.id) ??
-      getTouch(event.changedTouches, session.id);
+      findTouchById(event.touches, session.id) ??
+      findTouchById(event.changedTouches, session.id);
     return touch === null ? null : { x: touch.clientX, y: touch.clientY };
   }
   if (
@@ -79,20 +76,10 @@ function trackedPoint(event: Event, session: DragSession): Point | null {
   return { x: event.clientX, y: event.clientY };
 }
 
-function isScrollable(element: Element): boolean {
-  const view = element.ownerDocument.defaultView;
-  if (view === null || !(element instanceof view.HTMLElement)) return false;
-  const overflow = view.getComputedStyle(element).overflowX;
-  return (
-    (overflow === "auto" || overflow === "scroll" || overflow === "overlay") &&
-    element.scrollWidth > element.clientWidth + 1
-  );
-}
-
 function startsInHorizontalScroller(session: DragSession): boolean {
   let element = session.target;
   while (element !== null) {
-    if (isScrollable(element)) return true;
+    if (isHorizontallyScrollableElement(element)) return true;
     if (element === session.boundary) return false;
     element = element.parentElement;
   }
@@ -143,8 +130,9 @@ export function useHorizontalDismissDrag(options: Options) {
         settleTimeoutRef.current = null;
         if (dismiss && current.dismissTiming === "settled") {
           optionsRef.current.onDismiss();
+        } else {
+          optionsRef.current.onClear();
         }
-        optionsRef.current.onClear();
       }, DRAG_SETTLE_MS);
     },
     [clearSettle, optionsRef],
@@ -156,6 +144,10 @@ export function useHorizontalDismissDrag(options: Options) {
       if (session === null) return;
       const point = trackedPoint(event, session);
       if (point === null) return;
+      if (!session.dragging && hasTextSelectionWithin(session.boundary)) {
+        clearSession();
+        return;
+      }
       const direction = optionsRef.current.direction === "left" ? -1 : 1;
       const deltaX = point.x - session.startX;
       const deltaY = point.y - session.startY;
@@ -255,6 +247,7 @@ export function useHorizontalDismissDrag(options: Options) {
       target: EventTarget | null,
       boundary: Element,
     ) => {
+      if (hasTextSelectionWithin(boundary)) return;
       const view = boundary.ownerDocument.defaultView;
       if (
         (optionsRef.current.direction === "left" &&

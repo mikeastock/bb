@@ -4,27 +4,52 @@ import {
   interactionResponseSchema,
   toolInputSchema,
 } from "./contracts.js";
-import {
-  TOOL_DESCRIPTION,
-  TOOL_INPUT_JSON_SCHEMA,
-  buildTimeoutMessage,
-} from "./tool-definition.js";
+import { TOOL_DESCRIPTION, buildTimeoutMessage } from "./tool-definition.js";
 import {
   assertInteractionPayloadFits,
   buildInteractionPayload,
   buildInteractionTitle,
   buildToolResult,
+  describeAnswers,
   validateToolInput,
 } from "./translate.js";
 
 export const TOOL_NAME = "AskUserQuestion";
-export const RENDERER_ID = ASK_USER_QUESTION_RENDERER_ID;
+
+const QUESTION_TIMEOUT_OPTIONS = new Map([
+  ["30 minutes", 30 * 60 * 1000],
+  ["1 hour", 60 * 60 * 1000],
+  ["4 hours", 4 * 60 * 60 * 1000],
+  ["8 hours", 8 * 60 * 60 * 1000],
+  ["24 hours", 24 * 60 * 60 * 1000],
+  ["3 days", 3 * 24 * 60 * 60 * 1000],
+  ["7 days", 7 * 24 * 60 * 60 * 1000],
+]);
+
+function questionTimeoutMs(value: string): number {
+  const timeoutMs = QUESTION_TIMEOUT_OPTIONS.get(value);
+  if (timeoutMs === undefined) {
+    throw new Error(`Unsupported question timeout: ${value}`);
+  }
+  return timeoutMs;
+}
 
 function errorResult(message: string): PluginAgentToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
 export default function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    questionTimeout: {
+      type: "select",
+      label: "Question timeout",
+      description:
+        "How long a question card stays open waiting for your answer.",
+      options: [...QUESTION_TIMEOUT_OPTIONS.keys()],
+      default: "30 minutes",
+    },
+  });
+
   bb.agents.registerTool({
     name: TOOL_NAME,
     description: TOOL_DESCRIPTION,
@@ -47,21 +72,35 @@ export default function plugin(bb: BbPluginApi) {
         );
       }
 
+      const { questionTimeout } = await settings.get();
       const askedAt = Date.now();
       let result;
       try {
         result = await bb.ui.requestInput(
           {
             threadId: ctx.threadId,
-            rendererId: RENDERER_ID,
+            rendererId: ASK_USER_QUESTION_RENDERER_ID,
             title: buildInteractionTitle(payload),
             payload,
+            timeoutMs: questionTimeoutMs(questionTimeout),
+            presentation: {
+              label: { pending: "Asking a question", completed: "Asked" },
+              icon: { glyph: "MessageQuestion" },
+            },
+            describeSubmission: (value) => {
+              const parsed = interactionResponseSchema.safeParse(value);
+              if (!parsed.success) return {};
+              return describeAnswers(
+                payload,
+                buildToolResult(payload, parsed.data),
+              );
+            },
           },
           { signal: ctx.signal },
         );
       } catch (error) {
         return errorResult(
-          `The question could not be shown (${error instanceof Error ? error.message : String(error)}). Only one prompt can await the user at a time — put all of your questions in a single AskUserQuestion call, or continue with your best judgement.`,
+          `The question could not be shown (${error instanceof Error ? error.message : String(error)}). Continue with your best judgement.`,
         );
       }
 
@@ -94,7 +133,7 @@ export default function plugin(bb: BbPluginApi) {
       return { tools: [], skills: [] };
     }
     return {
-      tools: [{ name: TOOL_NAME, parameters: TOOL_INPUT_JSON_SCHEMA }],
+      tools: [TOOL_NAME],
       skills: [],
     };
   });

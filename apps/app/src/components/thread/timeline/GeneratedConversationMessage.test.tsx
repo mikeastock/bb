@@ -10,20 +10,14 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import type { PromptTextMention, ThreadListEntry } from "@bb/domain";
-import type { TimelineTitleLink } from "@bb/thread-view";
 import { ConversationMessageContent } from "./ConversationMessageContent";
 import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
 import { RouteNavigationProvider } from "@/components/ui/app-route-anchor";
 import type { TimelineTitleActionResolver } from "./TimelineTitleView";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
+import { makeThreadListEntry as makeThreadListEntryFixture } from "@bb/test-helpers/domain-fixtures";
 import { GENERATED_MESSAGE_COLLAPSED_PREVIEW_CHAR_CAP } from "@bb/client-core";
 import { generatedConversationCollapsedPreview } from "./GeneratedConversationMessage";
-
-function resolveThreadLink(link: TimelineTitleLink): string | null {
-  return link.kind === "thread"
-    ? `/projects/proj_demo/threads/${link.threadId}`
-    : null;
-}
 
 const MARKDOWN_BODY = [
   "# Final report",
@@ -58,10 +52,8 @@ function renderChildCompleted(text = MARKDOWN_BODY) {
         <ConversationMessageContent
           role="user"
           initiator="system"
-          originKind={null}
           senderThreadId={null}
           senderThreadTitle={null}
-          resolveSegmentLinkHref={resolveThreadLink}
           systemMessageKind="child-completed"
           systemMessageSubject={{
             kind: "thread",
@@ -71,7 +63,10 @@ function renderChildCompleted(text = MARKDOWN_BODY) {
           attachments={null}
           mentions={mentions}
           text={text}
+          timestamp={0}
+          threadId="thr_parent"
           turnRequest={{ kind: "message", status: "accepted" }}
+          workspaceRootPath="/workspace"
           projectId="proj_demo"
         />
       </RouteNavigationProvider>
@@ -85,6 +80,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("GeneratedConversationMessage images", () => {
+  it("routes images in generated system messages through the current thread", () => {
+    renderChildCompleted("![report](reports/result.png)");
+
+    expect(
+      screen.getByRole("img", { name: "report" }).getAttribute("src"),
+    ).toBe(
+      "/api/v1/threads/thr_parent/host-files/workspace/reports/result.png",
+    );
+  });
+});
+
 const AGENT_BODY = "# notes\nedited path:src/app.ts here";
 const AGENT_PATH_TOKEN = "path:src/app.ts";
 const AGENT_PATH_START = AGENT_BODY.indexOf(AGENT_PATH_TOKEN);
@@ -96,48 +103,17 @@ const RAW_THREAD_BODY = `Continue in ${RAW_THREAD_ID}; exact code reference \`${
 function threadListEntry(
   overrides: Partial<ThreadListEntry> = {},
 ): ThreadListEntry {
-  return {
+  return makeThreadListEntryFixture({
     id: "thr_test",
     projectId: "proj_demo",
-    environmentId: null,
-    providerId: "codex",
     title: "Thread",
     titleFallback: "Thread",
-    sectionId: null,
-    status: "idle",
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    childOrigin: null,
-    archivedAt: null,
-    pinnedAt: null,
-    pinSortKey: null,
-    deletedAt: null,
     lastReadAt: 0,
     latestAttentionAt: 1,
     createdAt: 1,
     updatedAt: 1,
-    activity: {
-      activeWorkflowCount: 0,
-      activeBackgroundAgentCount: 0,
-      activeBackgroundCommandCount: 0,
-      activePlanModeCount: 0,
-      activeGoalCount: 0,
-    },
-    hasPendingInteraction: false,
-    environmentHostId: null,
-    environmentName: null,
-    environmentBranchName: null,
-    queuedWork: "none",
-    environmentWorkspaceDisplayKind: "other",
-    runtime: {
-      displayStatus: "idle",
-      hostReconnectGraceExpiresAt: null,
-    },
     ...overrides,
-  };
+  });
 }
 
 function renderAgentMessage(
@@ -191,17 +167,16 @@ function renderAgentMessage(
           <ConversationMessageContent
             role="user"
             initiator="agent"
-            originKind={null}
             senderThreadId="thr_agent"
             senderThreadTitle={senderThreadTitle}
             senderIsPluginSideChat={senderIsPluginSideChat}
             onTitleAction={onTitleAction}
-            resolveSegmentLinkHref={resolveThreadLink}
             systemMessageKind="unlabeled"
             systemMessageSubject={null}
             attachments={null}
             mentions={mentions}
             text={text}
+            timestamp={0}
             turnRequest={{ kind: "message", status: "accepted" }}
             projectId="proj_demo"
           />
@@ -308,9 +283,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     expect(sourcePill?.querySelector('[data-icon="UserRound"]')).not.toBeNull();
     expect(sourcePill?.querySelector('[data-icon="MessageSquare"]')).toBeNull();
     expect(sourcePill?.tagName).toBe("A");
-    expect(sourcePill?.getAttribute("href")).toBe(
-      "/projects/proj_demo/threads/thr_agent",
-    );
+    expect(sourcePill?.getAttribute("href")).toBe("/threads/thr_agent");
   });
 
   it("renders agent Markdown and its offset-based path mention", () => {
@@ -594,7 +567,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     expect(screen.queryByText("**Ready** to merge.")).toBeNull();
 
     const toggle = screen.getByRole("button", {
-      name: /Replying to side chat/u,
+      name: /Message from side chat/u,
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
 
@@ -614,7 +587,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     ).not.toBeNull();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Replying to side chat/u }),
+      screen.getByRole("button", { name: /Message from side chat/u }),
     );
 
     expect(

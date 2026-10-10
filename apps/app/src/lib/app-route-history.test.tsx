@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import {
   cleanup,
@@ -15,8 +16,6 @@ import { SidebarHistoryNavigationControls } from "@/components/sidebar/SidebarHi
 import { useBbNavigate } from "./plugin-sdk-hooks";
 import {
   AUTOMATIONS_PLUGIN_ID,
-  AUTOMATIONS_PLUGIN_PANEL_PATH,
-  getPluginPanelRoutePath,
   getAutomationDetailRoutePath,
   getAutomationEditRoutePath,
   getAutomationsRoutePath,
@@ -32,12 +31,12 @@ const TOOL_SKILL_DETAIL_ROUTE = getSkillDetailRoutePath({
 });
 
 const TOOL_ROUTE_SEQUENCE = [
-  "/extensions/skills",
-  "/extensions/skills/registry",
+  "/skills",
+  "/skills/registry",
   TOOL_SKILL_DETAIL_ROUTE,
-  "/extensions/skills/registry/moss-skills%2Fmoss-notes",
-  "/extensions/plugins",
-  "/extensions/plugins/github",
+  "/skills/registry/moss-skills%2Fmoss-notes",
+  "/plugins",
+  "/plugins/github",
 ] as const;
 
 function HistoryHarness() {
@@ -97,6 +96,8 @@ function SidebarControlsHarness() {
     </div>
   );
 }
+
+const AUTOMATIONS_PLUGIN_PANEL_PATH = "automations";
 
 const AUTOMATION_ROUTE = {
   projectId: "proj_standard",
@@ -192,8 +193,8 @@ async function expectSidebarButtonState(
 ) {
   await waitFor(() => {
     expect(
-      (screen.getByRole("button", { name: label }) as HTMLButtonElement)
-        .disabled,
+      screen.getByRole("button", { name: label }).getAttribute("aria-disabled") ===
+        "true",
     ).toBe(disabled);
   });
 }
@@ -210,7 +211,7 @@ describe("useRouteStateHistoryNavigation", () => {
         <RemountableHistoryHarness />
       </MemoryRouter>,
     );
-    await clickAndExpectPath("/extensions/skills", "/extensions/skills");
+    await clickAndExpectPath("/skills", "/skills");
     expect(screen.getByTestId("can-go-back").textContent).toBe("true");
 
     fireEvent.click(screen.getByRole("button", { name: "toggle-harness" }));
@@ -220,7 +221,7 @@ describe("useRouteStateHistoryNavigation", () => {
 
     expect(screen.getByTestId("path").textContent).toBe("/");
     expect(screen.getByTestId("can-go-back").textContent).toBe("true");
-    await clickAndExpectPath("Back", "/extensions/skills");
+    await clickAndExpectPath("Back", "/skills");
   });
 
   it("tracks every Tools route for sidebar back and forward controls", async () => {
@@ -237,28 +238,28 @@ describe("useRouteStateHistoryNavigation", () => {
     expect(screen.getByTestId("can-go-back").textContent).toBe("true");
     expect(screen.getByTestId("can-go-forward").textContent).toBe("false");
 
-    await clickAndExpectPath("Back", "/extensions/plugins");
+    await clickAndExpectPath("Back", "/plugins");
     await clickAndExpectPath(
       "Back",
-      "/extensions/skills/registry/moss-skills%2Fmoss-notes",
+      "/skills/registry/moss-skills%2Fmoss-notes",
     );
     await clickAndExpectPath("Back", TOOL_SKILL_DETAIL_ROUTE);
-    await clickAndExpectPath("Back", "/extensions/skills/registry");
-    await clickAndExpectPath("Back", "/extensions/skills");
+    await clickAndExpectPath("Back", "/skills/registry");
+    await clickAndExpectPath("Back", "/skills");
     await clickAndExpectPath("Back", "/");
 
     expect(screen.getByTestId("can-go-back").textContent).toBe("false");
     expect(screen.getByTestId("can-go-forward").textContent).toBe("true");
 
-    await clickAndExpectPath("Forward", "/extensions/skills");
-    await clickAndExpectPath("Forward", "/extensions/skills/registry");
+    await clickAndExpectPath("Forward", "/skills");
+    await clickAndExpectPath("Forward", "/skills/registry");
     await clickAndExpectPath("Forward", TOOL_SKILL_DETAIL_ROUTE);
     await clickAndExpectPath(
       "Forward",
-      "/extensions/skills/registry/moss-skills%2Fmoss-notes",
+      "/skills/registry/moss-skills%2Fmoss-notes",
     );
-    await clickAndExpectPath("Forward", "/extensions/plugins");
-    await clickAndExpectPath("Forward", "/extensions/plugins/github");
+    await clickAndExpectPath("Forward", "/plugins");
+    await clickAndExpectPath("Forward", "/plugins/github");
   });
 
   it("updates the actual sidebar arrow buttons after Tools route clicks", async () => {
@@ -271,22 +272,24 @@ describe("useRouteStateHistoryNavigation", () => {
     await expectSidebarButtonState("Go back", true);
     await expectSidebarButtonState("Go forward", true);
 
-    await clickAndExpectPath("/extensions/skills", "/extensions/skills");
+    await clickAndExpectPath("/skills", "/skills");
 
     await expectSidebarButtonState("Go back", false);
     await expectSidebarButtonState("Go forward", true);
 
     await clickAndExpectPath(TOOL_SKILL_DETAIL_ROUTE, TOOL_SKILL_DETAIL_ROUTE);
-    await clickAndExpectPath("Go back", "/extensions/skills");
+    await clickAndExpectPath("Go back", "/skills");
 
     await expectSidebarButtonState("Go forward", false);
   });
 
   it("redirects remounted automation edit routes without duplicate history entries", async () => {
     render(
-      <MemoryRouter initialEntries={[getAutomationsRoutePath()]}>
-        <RemountablePluginNavigationHarness />
-      </MemoryRouter>,
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={[getAutomationsRoutePath()]}>
+          <RemountablePluginNavigationHarness />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     const detailPath = getAutomationDetailRoutePath(AUTOMATION_ROUTE);
@@ -303,23 +306,5 @@ describe("useRouteStateHistoryNavigation", () => {
     await clickAndExpectPath("Remount plugin", editPath);
     await clickAndExpectPath("Redirect edit to compose", "/");
     await clickAndExpectPath("Native back", getAutomationsRoutePath());
-  });
-
-  it("keeps Automations on its plugin panel route", async () => {
-    render(
-      <MemoryRouter initialEntries={["/"]}>
-        <RemountablePluginNavigationHarness />
-      </MemoryRouter>,
-    );
-
-    const editSubPath = `${AUTOMATION_ROUTE.projectId}/${AUTOMATION_ROUTE.automationId}/edit`;
-    await clickAndExpectPath(
-      "Open direct edit",
-      getPluginPanelRoutePath({
-        pluginId: AUTOMATIONS_PLUGIN_ID,
-        path: AUTOMATIONS_PLUGIN_PANEL_PATH,
-        subPath: editSubPath,
-      }),
-    );
   });
 });

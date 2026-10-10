@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   BUNDLED_MARKETPLACE_NAME,
+  entryOverview,
   entryScreenshotUrls,
   entryRepositoryUrl,
   entrySourceDisplay,
@@ -15,7 +17,6 @@ import {
   resolvedEntrySource,
   type MarketplaceEntry,
 } from "../../../src/services/plugin-catalog/marketplace-manifest.js";
-import { BUNDLED_CURATED_MARKETPLACE } from "../../../src/services/plugin-catalog/curated-marketplace.js";
 
 const MANIFEST_URL = "https://getbb.app/marketplace/v1/marketplace.json";
 const MANIFEST_V2_URL = "https://getbb.app/marketplace/v2/marketplace.json";
@@ -175,6 +176,31 @@ describe("marketplace manifest schema", () => {
         }),
       ).toEqual([
         "https://getbb.app/marketplace/v2/screenshots/widgets/widgets.png",
+      ]);
+    });
+
+    it("keeps an overview text at the cap and drops a longer one with a warning", () => {
+      const warnings: string[] = [];
+      const atCap = `${"é".repeat(4000)}\n`;
+      const parsed = parseMarketplaceManifest(
+        manifestV2([
+          entry({ overview: atCap }),
+          entry({ id: "long", overview: `${"a".repeat(4001)}\n` }),
+        ]),
+        "manifest",
+      );
+      const [capped, long] = parsed.plugins;
+      if (capped === undefined || long === undefined) {
+        throw new Error("entries missing");
+      }
+      expect(entryOverview(capped, (message) => warnings.push(message))).toBe(
+        atCap,
+      );
+      expect(entryOverview(long, (message) => warnings.push(message))).toBe(
+        undefined,
+      );
+      expect(warnings).toEqual([
+        expect.stringContaining('entry "long" overview text was skipped'),
       ]);
     });
 
@@ -374,7 +400,7 @@ describe("marketplace manifest schema", () => {
         ),
       ).toEqual({
         kind: "local",
-        path: "/checkout/icons/widgets.svg",
+        path: join("/checkout", "icons", "widgets.svg"),
         relativePath: "icons/widgets.svg",
       });
       expect(
@@ -663,11 +689,5 @@ describe("marketplace manifest schema", () => {
         expect(() => parse([entry({ engines })])).toThrow(/engines/u);
       }
     });
-  });
-
-  it("validates the bundled seed snapshot", () => {
-    expect(() =>
-      parseMarketplaceManifest(BUNDLED_CURATED_MARKETPLACE, "bundled snapshot"),
-    ).not.toThrow();
   });
 });

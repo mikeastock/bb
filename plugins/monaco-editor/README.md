@@ -8,9 +8,14 @@ panel's file search, and `bb thread open`.
 
 ## Features
 
-- **Edit and save.** <kbd>⌘S</kbd> writes the file. If it changed on disk
+- **Edit and save.** Tap the **Save** icon in the file bar, or press <kbd>⌘S</kbd>
+  (<kbd>Ctrl+S</kbd> on Linux and Windows), to write the file. Edits stay
+  unsaved until you save. If it changed on disk
   since you opened it — often because the agent edited it — the save stops and
-  offers Reload or Overwrite rather than clobbering the change.
+  offers **Keep disk version** or **Save my edits**. After keeping the disk
+  version, **Undo** restores your discarded draft without writing to disk.
+  The conflict choices return so saving the draft still requires an explicit
+  decision. Undo stays available until you edit, save, reload, or leave the file.
 - **Find in file** with <kbd>⌘F</kbd>, plus Monaco's usual editing: multiple
   cursors, block selection, bracket matching, code folding.
 - **Syntax highlighting** for ~86 common file types.
@@ -35,7 +40,7 @@ pnpm exec turbo run typecheck test --filter=bb-plugin-monaco-editor
 ```
 
 `scripts/stage-assets.mjs` builds the Monaco bundle the editor loads, into
-`dist/monaco`. Packaging runs it (`apps/server/scripts/copy-builtin-plugins.ts`),
+`dist/monaco`. Packaging runs it (`bb-plugin-build prepare-bundled`),
 since only a builtin's `dist/` ships. A source checkout never runs that path —
 the dev server loads builtins straight from `plugins/<name>` — so the plugin
 builds the bundle itself when it is missing or older than `monaco-bundle/`,
@@ -58,7 +63,10 @@ the API plus its contribution modules (find, folding, word navigation,
 sorting, …) and every Monarch grammar. What it leaves out is the language
 *services* for CSS, HTML, JSON, and TypeScript — completion and type checking
 this plugin has no use for. esbuild proves what is reachable, so the result is
-4.6 MB rather than the 24 MB of Monaco's prebuilt tree.
+4.6 MB rather than the 24 MB of Monaco's prebuilt tree. Monaco's icon webfont
+is inlined as a data URL, so the bundle stays the three files the loader
+fetches from the preview URL: `editor.js`, `editor.css`, and
+`editor.worker.js`.
 
 Do not trim that entry to `editor.api` to save the difference. The API without
 the contributions still opens files and still types, so the editor looks fine
@@ -69,7 +77,9 @@ script asserts each of those is present for that reason.
 
 The plugin claims the extensions listed in `lib/languages.ts` — common code,
 config, and text formats. Binaries like `png` and `pdf` are left to BB's own
-preview, which renders them properly.
+preview, which renders them properly. So are Markdown files (`md`,
+`markdown`): they open in BB's rendered preview, and Monaco still highlights
+them when you open one from its file tree.
 
 To change any file type back, use **Settings → File openers**, which offers
 Automatic, BB's built-in preview, or Monaco per extension. Right-clicking a

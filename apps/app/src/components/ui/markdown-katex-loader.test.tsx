@@ -16,8 +16,8 @@ afterEach(() => {
 });
 
 describe("MarkdownPreview lazy KaTeX", () => {
-  it("does not load the KaTeX chunk for content without $$ math", async () => {
-    const { container } = render(
+  it("loads KaTeX only for math and shares it across mounted previews", async () => {
+    const plain = render(
       <MarkdownPreview
         content={"Plain prose with $5 and $x$ and \\$10 escaped."}
       />,
@@ -27,18 +27,32 @@ describe("MarkdownPreview lazy KaTeX", () => {
     });
 
     expect(katexChunkLoads.count).toBe(0);
-    expect(container.textContent).toContain("$5");
-  });
+    expect(plain.container.textContent).toContain("$5");
+    plain.unmount();
 
-  it("loads the chunk once and re-renders every mounted preview with KaTeX", async () => {
     const first = render(<MarkdownPreview content={"One: $$a^2$$"} />);
     const second = render(<MarkdownPreview content={"Two: $$b^2$$"} />);
+    const mathPieces =
+      "Intro.\n\n$$\n\\frac{1}{2}\n$$\n\nMiddle paragraph.\n\n";
+    const incremental = render(
+      <MarkdownPreview content={"Intro.\n\n"} incrementalBlocks />,
+    );
+    incremental.rerender(
+      <MarkdownPreview content={mathPieces} incrementalBlocks />,
+    );
+    expect(incremental.container.querySelector(".katex-display")).toBeNull();
 
     await waitFor(() => {
       expect(first.container.querySelector(".katex")).not.toBeNull();
       expect(second.container.querySelector(".katex")).not.toBeNull();
+      expect(
+        incremental.container.querySelector(".katex-display"),
+      ).not.toBeNull();
     });
     expect(katexChunkLoads.count).toBe(1);
+    expect(incremental.container.innerHTML).toBe(
+      render(<MarkdownPreview content={mathPieces} />).container.innerHTML,
+    );
 
     const third = render(<MarkdownPreview content={"Three: $$c^2$$"} />);
     expect(third.container.querySelector(".katex")).not.toBeNull();

@@ -1,7 +1,6 @@
-import { access } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import {
   resolveCurrentDevInstanceConfig,
   toDevProcessEnv,
@@ -9,6 +8,7 @@ import {
 } from "@bb/config/runtime";
 import { migrateLegacyDevData } from "../lib/legacy-dev-data-migration.js";
 import { runScriptProcess } from "../lib/process-helpers.js";
+import { repoRoot, runMainIfEntrypoint } from "../lib/script-entry.js";
 
 interface PortAvailabilityCheck {
   label: string;
@@ -22,13 +22,13 @@ interface DevCommand {
 
 export type DevLaunchMode = "vite" | "worktree";
 
+export type DevCloud = "local" | "staging";
+
+export const STAGING_CLOUD_URL = "https://vibecodethis.site";
+
 const LOOPBACK_HOST = "127.0.0.1";
 
-const commandDir = dirname(fileURLToPath(import.meta.url));
-const packageRoot = resolve(commandDir, "..", "..");
-const repoRoot = resolve(packageRoot, "..", "..");
-
-export function createDevTurboCommand(): DevCommand {
+function createDevTurboCommand(): DevCommand {
   return {
     args: [
       "exec",
@@ -48,7 +48,10 @@ export function createDevTurboCommand(): DevCommand {
   };
 }
 
-export function createStartWorktreeCommand(): DevCommand {
+export function createStartWorktreeCommand(
+  dryRun = false,
+  performanceDiagnostics = false,
+): DevCommand {
   return {
     args: [
       "--conditions=source",
@@ -56,6 +59,8 @@ export function createStartWorktreeCommand(): DevCommand {
       "tsx",
       resolve(repoRoot, "scripts", "start-bb.mjs"),
       "--worktree-runtime-policy",
+      ...(dryRun ? ["--dryrun"] : []),
+      ...(performanceDiagnostics ? ["--perf-diagnostics"] : []),
     ],
     command: process.execPath,
   };
@@ -69,12 +74,26 @@ export function resolveDevLaunchMode(args: string[]): DevLaunchMode {
     return "worktree";
   }
   throw new Error(
-    `[dev] Unknown arguments: ${args.join(" ")}. Expected no arguments or --worktree.`,
+    `[dev] Unknown arguments: ${args.join(" ")}. Expected no arguments, --staging, or --worktree.`,
   );
+}
+
+export function resolveDevCloud(args: {
+  staging: boolean;
+  mode: DevLaunchMode;
+}): DevCloud {
+  if (!args.staging) {
+    return "local";
+  }
+  if (args.mode !== "vite") {
+    throw new Error("[dev] --staging is supported by pnpm dev only.");
+  }
+  return "staging";
 }
 
 export function toDevLaunchProcessEnv(args: {
   baseEnv: NodeJS.ProcessEnv;
+  cloud: DevCloud;
   config: DevInstanceConfig;
   mode: DevLaunchMode;
 }): NodeJS.ProcessEnv {
@@ -82,6 +101,9 @@ export function toDevLaunchProcessEnv(args: {
     baseEnv: args.baseEnv,
     config: args.config,
   });
+  if (args.cloud === "staging") {
+    env.BB_DEV_CONNECT_BASE_URL = STAGING_CLOUD_URL;
+  }
   if (args.mode === "vite") {
     return env;
   }
@@ -92,7 +114,11 @@ export function toDevLaunchProcessEnv(args: {
   return env;
 }
 
-function formatConfig(config: DevInstanceConfig, mode: DevLaunchMode): string {
+function formatConfig(
+  config: DevInstanceConfig,
+  mode: DevLaunchMode,
+  cloud: DevCloud,
+): string {
   const prefix = mode === "worktree" ? "[start:worktree]" : "[dev]";
   const appUrl =
     mode === "worktree"
@@ -104,6 +130,9 @@ function formatConfig(config: DevInstanceConfig, mode: DevLaunchMode): string {
     `${prefix} App ${appUrl}`,
     `${prefix} Server ${config.serverUrl}`,
     `${prefix} Host daemon http://127.0.0.1:${config.ports.hostDaemonPort}`,
+    ...(cloud === "staging"
+      ? [`${prefix} bb account and Connect use ${STAGING_CLOUD_URL}`]
+      : []),
   ].join("\n");
 }
 
@@ -151,24 +180,52 @@ async function resolveExistingRepoRoot(): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  const mode = resolveDevLaunchMode(process.argv.slice(2));
-  const resolvedRepoRoot = await resolveExistingRepoRoot();
-  const config = resolveCurrentDevInstanceConfig(resolvedRepoRoot);
-  const migration = await migrateLegacyDevData({
-    config,
-    output: process.stdout,
-  });
-  if (migration.skippedReason === "legacy-dev-process-running") {
+  const args = process.argv.slice(2);
+  const dryRun = args.includes("--dryrun");
+  const mode = resolveDevLaunchMode(
+    args.filter(
+      (arg) =>
+        arg !== "--dryrun" &&
+        arg !== "--staging" &&
+        arg !== "--perf-diagnostics",
+    ),
+  );
+  if (args.includes("--perf-diagnostics") && mode !== "worktree") {
     throw new Error(
-      "[dev] Legacy ~/.bb-dev data was found, but an old dev server or host-daemon is still running. Stop the old dev process and rerun pnpm dev to migrate it.",
+      "--perf-diagnostics is supported by pnpm start and pnpm start:worktree.",
     );
   }
-  await assertPortsAvailable(config, mode);
-  process.stdout.write(`${formatConfig(config, mode)}\n`);
+  const cloud = resolveDevCloud({ staging: args.includes("--staging"), mode });
+  if (dryRun && mode !== "worktree") {
+    throw new Error(
+      "--dryrun is supported by pnpm start and pnpm start:worktree.",
+    );
+  }
+  const resolvedRepoRoot = await resolveExistingRepoRoot();
+  const config = resolveCurrentDevInstanceConfig(resolvedRepoRoot);
+  if (!dryRun) {
+    const migration = await migrateLegacyDevData({
+      config,
+      output: process.stdout,
+    });
+    if (migration.skippedReason === "legacy-dev-process-running") {
+      throw new Error(
+        "[dev] Legacy ~/.bb-dev data was found, but an old dev server or host-daemon is still running. Stop the old dev process and rerun pnpm dev to migrate it.",
+      );
+    }
+    await assertPortsAvailable(config, mode);
+    await mkdir(config.dataDir, { recursive: true });
+    await writeFile(
+      resolve(config.dataDir, "bb-dev-instance.json"),
+      JSON.stringify({ repoRoot: config.repoRoot }),
+      "utf8",
+    );
+    process.stdout.write(`${formatConfig(config, mode, cloud)}\n`);
+  }
 
   const command =
     mode === "worktree"
-      ? createStartWorktreeCommand()
+      ? createStartWorktreeCommand(dryRun, args.includes("--perf-diagnostics"))
       : createDevTurboCommand();
   process.exitCode = await runScriptProcess({
     args: command.args,
@@ -176,6 +233,7 @@ async function main(): Promise<void> {
     cwd: config.repoRoot,
     env: toDevLaunchProcessEnv({
       baseEnv: process.env,
+      cloud,
       config,
       mode,
     }),
@@ -183,14 +241,4 @@ async function main(): Promise<void> {
   });
 }
 
-if (
-  process.argv[1] != null &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
-  void main().catch((error) => {
-    const message =
-      error instanceof Error ? (error.stack ?? error.message) : String(error);
-    process.stderr.write(`${message}\n`);
-    process.exitCode = 1;
-  });
-}
+runMainIfEntrypoint(import.meta.url, main);

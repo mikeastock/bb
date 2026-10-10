@@ -5,24 +5,11 @@ import {
   type PluginRpcResult,
 } from "@get-bb/plugin-sdk/app";
 import type { memoryRpcContract } from "./server.js";
-import { Button } from "@bb/shared-ui/button";
-import { Input } from "@bb/shared-ui/input";
-import { Switch } from "@bb/shared-ui/switch";
-import { Textarea } from "@bb/shared-ui/textarea";
-
-const MEMORY_KINDS = [
-  "fact",
-  "preference",
-  "decision",
-  "procedure",
-  "episode",
-  "reference",
-] as const;
-type MemoryKind = (typeof MEMORY_KINDS)[number];
-
-function isMemoryKind(value: string): value is MemoryKind {
-  return MEMORY_KINDS.some((candidate) => candidate === value);
-}
+import { isMemoryKind, MEMORY_KINDS } from "./memory-kinds.js";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 
 type MemoryRecord = PluginRpcResult<
   (typeof memoryRpcContract)["listMemories"]
@@ -48,8 +35,8 @@ function MemoryEditor({
   const [error, setError] = useState<string | null>(null);
 
   return (
-    <div className="space-y-3 rounded-md border border-border bg-muted/20 p-3">
-      <div className="grid gap-3 lg:grid-cols-2">
+    <div className="@container/memory-editor space-y-3 rounded-md border border-border bg-muted/20 p-3">
+      <div className="grid gap-3 @min-[36rem]/memory-editor:grid-cols-2">
         <label className="space-y-1 text-xs text-muted-foreground">
           Summary
           <Input
@@ -83,7 +70,7 @@ function MemoryEditor({
           }
         />
       </label>
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 @min-[32rem]/memory-editor:grid-cols-3">
         <label className="space-y-1 text-xs text-muted-foreground">
           Kind
           <select

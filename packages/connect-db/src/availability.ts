@@ -1,9 +1,7 @@
 import { eq } from "drizzle-orm";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
-import { type HandleValidationError, validateSubdomain } from "./constants.js";
+import { type HandleValidationError, validateLabel } from "./constants.js";
 import { labelClaim } from "./schema.js";
-
-export type LabelClaim = typeof labelClaim.$inferSelect;
 
 // oxlint-disable-next-line typescript/no-explicit-any
 export type ConnectDb = BaseSQLiteDatabase<
@@ -28,7 +26,7 @@ export async function checkLabelAvailability(
 ): Promise<LabelAvailability> {
   const label = rawLabel.trim().toLowerCase();
 
-  const invalid = validateSubdomain(label);
+  const invalid = validateLabel(label);
   if (invalid) return { available: false, reason: "invalid", error: invalid };
 
   const claim = await db

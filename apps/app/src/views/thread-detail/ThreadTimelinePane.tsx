@@ -30,6 +30,7 @@ export function ThreadTimelinePane({
       footer={footer}
       scrollOverlay={
         <ThreadTableOfContents
+          contextBoundarySeq={surface.contextBoundarySeq}
           threadId={surface.threadId}
           timelineRows={surface.timelineRows}
           hasOlderTimelineRows={surface.hasOlderTimelineRows}

@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { permissionModeSchema } from "@bb/domain";
+import {
+  hostTypeSchema,
+  jsonValueSchema,
+  permissionModeSchema,
+} from "@bb/domain";
 import {
   pathsExistRequestSchema,
   providerCliInstallEventSchema,
@@ -30,6 +34,23 @@ export const hostDirectoryListingSchema = z.object({
 });
 export type HostDirectoryListing = z.infer<typeof hostDirectoryListingSchema>;
 
+export const hostDiscoveredRepoSchema = z.object({
+  path: z.string().min(1),
+  name: z.string().min(1),
+  lastActivityAt: z.string().datetime(),
+  originUrl: z.string().min(1).nullable(),
+  projectId: z.string().min(1).nullable(),
+});
+export type HostDiscoveredRepo = z.infer<typeof hostDiscoveredRepoSchema>;
+
+export const hostDiscoveredReposResponseSchema = z.object({
+  repos: z.array(hostDiscoveredRepoSchema),
+  truncated: z.boolean(),
+});
+export type HostDiscoveredReposResponse = z.infer<
+  typeof hostDiscoveredReposResponseSchema
+>;
+
 export const hostCloneDefaultPathQuerySchema = z.object({
   projectId: z.string().min(1),
 });
@@ -48,6 +69,36 @@ export const createHostJoinCodeRequestSchema = z.object({}).strict();
 export type CreateHostJoinCodeRequest = z.infer<
   typeof createHostJoinCodeRequestSchema
 >;
+
+export const createMachineRequestSchema = z
+  .object({
+    machineProviderId: z.string().min(1),
+    inputs: jsonValueSchema.nullable(),
+    key: z.string().min(1).optional(),
+  })
+  .strict();
+export type CreateMachineRequest = z.infer<typeof createMachineRequestSchema>;
+
+export const hostEnrollmentCommandResponseSchema = z
+  .object({
+    command: z.string().min(1),
+    windowsCommand: z.string().min(1),
+    expiresAt: z.number().int().positive(),
+  })
+  .nullable();
+export type HostEnrollmentCommandResponse = z.infer<
+  typeof hostEnrollmentCommandResponseSchema
+>;
+
+export const hostReconnectResponseSchema = z
+  .object({
+    command: z.string().min(1),
+    windowsCommand: z.string().min(1),
+    expiresAt: z.number().int().positive(),
+    hostId: z.string().min(1),
+  })
+  .strict();
+export type HostReconnectResponse = z.infer<typeof hostReconnectResponseSchema>;
 
 export const createHostJoinCodeResponseSchema = z.object({
   joinCode: z.string().min(1),
@@ -74,9 +125,12 @@ export type UpdateHostPermissionCeilingRequest = z.infer<
   typeof updateHostPermissionCeilingRequestSchema
 >;
 
-export const hostRetryUpdateResponseSchema = z
+export const hostActionResponseSchema = z
   .object({ ok: z.literal(true) })
   .strict();
+export type HostActionResponse = z.infer<typeof hostActionResponseSchema>;
+
+export const hostRetryUpdateResponseSchema = hostActionResponseSchema;
 export type HostRetryUpdateResponse = z.infer<
   typeof hostRetryUpdateResponseSchema
 >;
@@ -103,3 +157,9 @@ export type HostProviderCliInstallRequest = ProviderCliInstallRequest;
 
 export const hostProviderCliInstallEventSchema = providerCliInstallEventSchema;
 export type HostProviderCliInstallEvent = ProviderCliInstallEvent;
+
+export const hostListQuerySchema = z.object({
+  includeCreating: z.enum(["true", "false"]).optional(),
+  type: hostTypeSchema.optional(),
+});
+export type HostListQuery = z.input<typeof hostListQuerySchema>;

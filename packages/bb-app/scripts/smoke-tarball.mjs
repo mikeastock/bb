@@ -1,4 +1,5 @@
 import { fork, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync } from "node:fs";
 import {
   copyFile,
@@ -10,8 +11,9 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createManagedProcessStop } from "./managed-process.mjs";
 
 const HTTP_WAIT_TIMEOUT_MS = 60_000;
 const HTTP_WAIT_INTERVAL_MS = 250;
@@ -46,12 +48,12 @@ const EXPECTED_RUNNING_BUILTIN_PLUGINS = [
 // version.ts); this script imports nothing from the workspace so it can run
 // against a packed tarball.
 const PROVIDER_BRIDGE_PROTOCOL_VERSION = 2;
-// A canonical turn/start carries a client request id (`creq_` + ten
-// Crockford-ish characters, @bb/domain's clientTurnRequestIdSchema).
-const SMOKE_CLIENT_REQUEST_ID = "creq_smkptest23";
 const BRIDGE_WAIT_TIMEOUT_MS = 10_000;
 const PROCESS_STOP_TIMEOUT_MS = 5_000;
+const PORT_COLLISION_MAX_ATTEMPTS = 3;
 const DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST = "127.0.0.1";
+const PORT_COLLISION_PATTERN =
+  /(?:EADDRINUSE|Host daemon local API port \d+ is already in use)/u;
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptsDir, "..");
@@ -59,6 +61,22 @@ const tempRoot = await mkdtemp(join(tmpdir(), "bb-app-tarball-"));
 const smokeProcessEnv = {
   BB_TELEMETRY: "false",
 };
+const stopManagedProcess = createManagedProcessStop(PROCESS_STOP_TIMEOUT_MS);
+
+function formatElapsed(startedAt) {
+  return `${((performance.now() - startedAt) / 1000).toFixed(1)}s`;
+}
+
+async function timed(label, run) {
+  const startedAt = performance.now();
+  try {
+    return await run();
+  } finally {
+    process.stdout.write(
+      `bb-app tarball smoke: ${label} ${formatElapsed(startedAt)}\n`,
+    );
+  }
+}
 
 function delay(ms) {
   return new Promise((resolvePromise) => {
@@ -103,8 +121,46 @@ function waitForProcessExit(childProcess) {
   });
 }
 
+function resolveLaunch(command, args) {
+  if (
+    process.platform === "win32" &&
+    (command === "npm" || command === "npx")
+  ) {
+    return {
+      command: process.execPath,
+      args: [
+        join(
+          dirname(process.execPath),
+          "node_modules",
+          "npm",
+          "bin",
+          `${command}-cli.js`,
+        ),
+        ...args,
+      ],
+    };
+  }
+  if (
+    process.platform === "win32" &&
+    basename(dirname(command)) === ".bin" &&
+    extname(command) === ""
+  ) {
+    const commandLine = [`${command}.cmd`, ...args]
+      .map((part) => `"${part}"`)
+      .join(" ");
+    return {
+      command: process.env.ComSpec ?? "cmd.exe",
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command, args };
+}
+
 async function runCommand({ args, command, cwd = tempRoot, env = {}, label }) {
-  const childProcess = spawn(command, args, {
+  const launch = resolveLaunch(command, args);
+  const childProcess = spawn(launch.command, launch.args, {
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
     cwd,
     env: {
       ...process.env,
@@ -125,7 +181,9 @@ async function runCommand({ args, command, cwd = tempRoot, env = {}, label }) {
 
 function spawnManagedProcess({ args, command, env = {}, label }) {
   const detached = process.platform !== "win32";
-  const childProcess = spawn(command, args, {
+  const launch = resolveLaunch(command, args);
+  const childProcess = spawn(launch.command, launch.args, {
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
     cwd: tempRoot,
     detached,
     env: {
@@ -144,9 +202,11 @@ function spawnManagedProcess({ args, command, env = {}, label }) {
   };
 }
 
+class PortCollisionError extends Error {}
+
 function reserveFreePort() {
   return new Promise((resolvePromise, reject) => {
-    const server = createServer();
+    const server = createServer((socket) => socket.destroy());
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
@@ -160,36 +220,100 @@ function reserveFreePort() {
   });
 }
 
-async function getFreePorts(count) {
-  const reservations = [];
-  try {
-    // Keep every listener open until the whole set is allocated. Closing each
-    // one immediately lets the OS hand the same port to the next request.
-    for (let index = 0; index < count; index += 1) {
-      reservations.push(await reserveFreePort());
-    }
-    return reservations.map(({ port }) => port);
-  } finally {
-    await Promise.all(
-      reservations.map(
-        ({ server }) =>
-          new Promise((resolvePromise, reject) => {
-            server.close((error) => {
-              if (error) {
-                reject(error);
-                return;
-              }
-              resolvePromise();
-            });
-          }),
-      ),
-    );
+async function closePortReservation(reservation) {
+  if (!reservation.server.listening) {
+    return;
+  }
+  await new Promise((resolvePromise, reject) => {
+    reservation.server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolvePromise();
+    });
+  });
+}
+
+async function waitForAllCleanup(promises) {
+  const results = await Promise.allSettled(promises);
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Smoke cleanup failed");
   }
 }
 
-async function waitForHttp({ label, processRef, url }) {
+async function closePortReservations(reservations) {
+  await waitForAllCleanup(reservations.map(closePortReservation));
+}
+
+async function reserveFreePorts(count) {
+  const reservations = [];
+  try {
+    for (let index = 0; index < count; index += 1) {
+      reservations.push(await reserveFreePort());
+    }
+    return reservations;
+  } catch (error) {
+    await closePortReservations(reservations);
+    throw error;
+  }
+}
+
+async function readPortCollisionDetails(processRef, logPaths) {
+  const sections = [formatProcessOutput(processRef.output)];
+  for (const logPath of logPaths) {
+    try {
+      const contents = await readFile(logPath, "utf8");
+      if (contents.trim()) {
+        sections.push(`${logPath}:\n${contents}`);
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  const details = sections.filter(Boolean).join("\n\n");
+  return PORT_COLLISION_PATTERN.test(details) ? details : null;
+}
+
+async function retryPortCollisions(label, run) {
+  for (let attempt = 1; attempt <= PORT_COLLISION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await run(attempt);
+    } catch (error) {
+      if (
+        !(error instanceof PortCollisionError) ||
+        attempt === PORT_COLLISION_MAX_ATTEMPTS
+      ) {
+        throw error;
+      }
+      process.stdout.write(
+        `bb-app tarball smoke: ${label} port collision on attempt ${attempt}; retrying with fresh reservations\n`,
+      );
+    }
+  }
+}
+
+async function waitForHttp({
+  acceptResponse = () => true,
+  label,
+  portCollisionLogPaths = [],
+  processRef,
+  url,
+}) {
   const deadline = Date.now() + HTTP_WAIT_TIMEOUT_MS;
   while (Date.now() <= deadline) {
+    const portCollisionDetails = await readPortCollisionDetails(
+      processRef,
+      portCollisionLogPaths,
+    );
+    if (portCollisionDetails !== null) {
+      throw new PortCollisionError(
+        `${label} encountered a selected-port collision\n${portCollisionDetails}`,
+      );
+    }
     if (
       processRef.childProcess.exitCode !== null ||
       processRef.childProcess.signalCode !== null
@@ -200,7 +324,7 @@ async function waitForHttp({ label, processRef, url }) {
     }
     try {
       const response = await fetch(url);
-      if (response.ok) {
+      if (response.ok && (await acceptResponse(response))) {
         return;
       }
     } catch {
@@ -213,12 +337,42 @@ async function waitForHttp({ label, processRef, url }) {
   );
 }
 
-async function waitForHostPluginWorker({ pluginId, processRef }) {
+async function acceptServerHealthResponse(response, expectedLaunchId) {
+  const body = await response.json();
+  return (
+    isRecord(body) &&
+    body.ok === true &&
+    (expectedLaunchId === undefined || body.launchId === expectedLaunchId)
+  );
+}
+
+async function acceptHostDaemonStatusResponse(response, expectedServerUrl) {
+  const body = await response.json();
+  return (
+    isRecord(body) &&
+    body.connected === true &&
+    body.serverUrl === expectedServerUrl
+  );
+}
+
+async function waitForHostPluginWorker({ dataDir, pluginId, processRef }) {
+  const logPath = join(dataDir, "logs", "host-daemon-stdio.log");
+  let daemonOutput = "";
   const deadline = Date.now() + HOST_PLUGIN_WORKER_TIMEOUT_MS;
   while (Date.now() <= deadline) {
+    try {
+      daemonOutput = await readFile(logPath, "utf8");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
     if (
-      processRef.output.stdout.includes("Host plugin worker ready") &&
-      processRef.output.stdout.includes(pluginId)
+      daemonOutput
+        .split("\n")
+        .some(
+          (line) =>
+            line.includes("Host plugin worker ready") &&
+            line.includes(pluginId),
+        )
     ) {
       return;
     }
@@ -227,50 +381,14 @@ async function waitForHostPluginWorker({ pluginId, processRef }) {
       processRef.childProcess.signalCode !== null
     ) {
       throw new Error(
-        `${processRef.label} exited before host plugin ${pluginId} started\n${formatProcessOutput(processRef.output)}`,
+        `${processRef.label} exited before host plugin ${pluginId} started\n${formatProcessOutput(processRef.output)}\n${logPath}:\n${daemonOutput}`,
       );
     }
     await delay(HTTP_WAIT_INTERVAL_MS);
   }
   throw new Error(
-    `Timed out waiting for host plugin ${pluginId} on ${processRef.label}\n${formatProcessOutput(processRef.output)}`,
+    `Timed out waiting for host plugin ${pluginId} on ${processRef.label}\n${formatProcessOutput(processRef.output)}\n${logPath}:\n${daemonOutput}`,
   );
-}
-
-async function stopManagedProcess(processRef) {
-  if (processRef.detached) {
-    try {
-      process.kill(-processRef.childProcess.pid, "SIGINT");
-    } catch (error) {
-      if (
-        !(error instanceof Error && "code" in error && error.code === "ESRCH")
-      ) {
-        throw error;
-      }
-    }
-  }
-
-  if (
-    processRef.childProcess.exitCode !== null ||
-    processRef.childProcess.signalCode !== null
-  ) {
-    return;
-  }
-  if (!processRef.detached) {
-    processRef.childProcess.kill("SIGINT");
-  }
-  const stopped = await Promise.race([
-    waitForProcessExit(processRef.childProcess).then(() => true),
-    delay(PROCESS_STOP_TIMEOUT_MS).then(() => false),
-  ]);
-  if (!stopped) {
-    if (processRef.detached) {
-      process.kill(-processRef.childProcess.pid, "SIGTERM");
-    } else {
-      processRef.childProcess.kill("SIGTERM");
-    }
-    await waitForProcessExit(processRef.childProcess);
-  }
 }
 
 function createInstalledBinInvocation(binDir, bin, args) {
@@ -287,11 +405,22 @@ async function smokeNpxEntrypoint(tarballPath) {
   // Keep one real invocation through the package's advertised npx path. Once
   // npx dispatches the bin, the installed-package smokes below cover the same
   // launcher without repeatedly charging npm startup to readiness budgets.
-  await runCommand({
-    args: ["--yes", "--package", tarballPath, "--", "bb-app", "--help"],
-    command: "npx",
-    label: "bb-app npx help",
-  });
+  await timed("npx install and help", () =>
+    runCommand({
+      args: [
+        "--yes",
+        "--no-audit",
+        "--no-fund",
+        "--package",
+        tarballPath,
+        "--",
+        "bb-app",
+        "--help",
+      ],
+      command: "npx",
+      label: "bb-app npx help",
+    }),
+  );
 }
 
 async function packTarball() {
@@ -656,83 +785,6 @@ async function smokePluginHostWorkerBundle(packageDir) {
   }
 }
 
-function collectJsonRpcMessages({ childProcess, onMessage }) {
-  const messages = [];
-  let buffer = "";
-  childProcess.stdout?.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-      const message = JSON.parse(trimmed);
-      messages.push(message);
-      onMessage?.(message);
-    }
-  });
-  return messages;
-}
-
-async function waitForBridgeMessage({
-  childProcess,
-  label,
-  messages,
-  output,
-  predicate,
-}) {
-  const deadline = Date.now() + BRIDGE_WAIT_TIMEOUT_MS;
-  while (Date.now() <= deadline) {
-    const message = messages.find(predicate);
-    if (message) {
-      return message;
-    }
-    if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
-      throw new Error(
-        `${label} exited before the expected message\n${formatProcessOutput(output)}`,
-      );
-    }
-    await delay(10);
-  }
-  throw new Error(
-    `${label} timed out waiting for the expected message\n${formatProcessOutput(output)}`,
-  );
-}
-
-function sendBridgeRequest(childProcess, id, method, params) {
-  childProcess.stdin.write(
-    `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
-  );
-}
-
-/**
- * The semantic deltas a `thread/delta` notification batches, or [] for
- * anything else. Bridge-protocol v2 carries no finished timeline events on
- * this wire — the runtime's assembler builds those — so the smoke asserts
- * against the delta grammar directly.
- */
-function threadDeltas(message) {
-  if (
-    !isRecord(message) ||
-    message.method !== "thread/delta" ||
-    !isRecord(message.params) ||
-    !Array.isArray(message.params.deltas)
-  ) {
-    return [];
-  }
-  return message.params.deltas.filter(isRecord);
-}
-
-/** The full permission policy a canonical request carries in `options`. */
-const SMOKE_EXECUTION_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
 async function smokeHelpCommands(binDir) {
   await runCommand({
     ...createInstalledBinInvocation(binDir, "bb-app", ["--help"]),
@@ -796,27 +848,48 @@ async function smokeSdkPackage(tarballPath) {
     join(sdkDir, "package.json"),
     JSON.stringify({ type: "module", private: true }, null, 2),
   );
-  await runCommand({
-    args: [
-      "install",
-      "--ignore-scripts=false",
-      "--no-audit",
-      "--no-fund",
-      tarballPath,
-    ],
-    command: "npm",
-    cwd: sdkDir,
-    label: "install bb-app SDK smoke package",
-  });
+  await timed("npm install tarball", () =>
+    runCommand({
+      args: [
+        "install",
+        "--ignore-scripts=false",
+        "--no-audit",
+        "--no-fund",
+        tarballPath,
+      ],
+      command: "npm",
+      cwd: sdkDir,
+      label: "install bb-app SDK smoke package",
+    }),
+  );
   await runCommand({
     args: [
       "--input-type=module",
       "-e",
-      'import { BBSdk } from "bb-app"; if (typeof BBSdk !== "function") process.exit(1);',
+      'import { BBSdk } from "bb-app"; if (typeof BBSdk !== "function" || typeof new BBSdk().experimental_desktopBrowsers?.listInstances !== "function") process.exit(1);',
     ],
     command: "node",
     cwd: sdkDir,
     label: "bb-app SDK JavaScript import",
+  });
+  await runCommand({
+    command: process.execPath,
+    args: [
+      "--input-type=module",
+      "-e",
+      [
+        'import { createRequire } from "node:module";',
+        'import { dirname, join } from "node:path";',
+        'import { execFileSync } from "node:child_process";',
+        "const require = createRequire(import.meta.url);",
+        'const bbRequire = createRequire(require.resolve("bb-app"));',
+        'const npmRoot = dirname(bbRequire.resolve("npm/package.json"));',
+        'const version = execFileSync(process.execPath, [join(npmRoot, "bin/npm-cli.js"), "--version"], { encoding: "utf8", env: { ...process.env, PATH: "" } }).trim();',
+        'if (version !== bbRequire("npm/package.json").version) process.exit(1);',
+      ].join("\n"),
+    ],
+    cwd: sdkDir,
+    label: "shipped npm without Node or npm on PATH",
   });
   await writeFile(
     join(sdkDir, "sdk-smoke.ts"),
@@ -826,30 +899,35 @@ async function smokeSdkPackage(tarballPath) {
       'const bb = new BBSdk({ baseUrl: "http://127.0.0.1:38886" });',
       "const error: typeof BbHttpError = BbHttpError;",
       "void bb.status.get();",
+      'void bb.experimental_desktopBrowsers.listInstances({ hostId: "smoke-host" });',
       "void error;",
       "",
     ].join("\n"),
   );
-  await runCommand({
-    args: [
-      "--yes",
-      "--package",
-      "typescript",
-      "--",
-      "tsc",
-      "--module",
-      "NodeNext",
-      "--moduleResolution",
-      "NodeNext",
-      "--target",
-      "ES2022",
-      "--noEmit",
-      "sdk-smoke.ts",
-    ],
-    command: "npx",
-    cwd: sdkDir,
-    label: "bb-app SDK TypeScript import",
-  });
+  await timed("npx typescript check", () =>
+    runCommand({
+      args: [
+        "--yes",
+        "--no-audit",
+        "--no-fund",
+        "--package",
+        "typescript",
+        "--",
+        "tsc",
+        "--module",
+        "NodeNext",
+        "--moduleResolution",
+        "NodeNext",
+        "--target",
+        "ES2022",
+        "--noEmit",
+        "sdk-smoke.ts",
+      ],
+      command: "npx",
+      cwd: sdkDir,
+      label: "bb-app SDK TypeScript import",
+    }),
+  );
   return sdkDir;
 }
 
@@ -929,35 +1007,60 @@ async function smokeBuiltinPluginsRunning({ binDir, cliEnv }) {
   );
 }
 
-async function smokeFullStack(binDir, sdkDir) {
-  const dataDir = join(tempRoot, "full-stack-data");
-  const [serverPort, daemonPort] = await getFreePorts(2);
+async function smokeFullStackAttempt(binDir, sdkDir, attempt) {
+  const dataDir = join(tempRoot, `full-stack-data-${attempt}`);
+  const reservations = await reserveFreePorts(2);
+  const [serverReservation, daemonReservation] = reservations;
+  const serverPort = serverReservation.port;
+  const daemonPort = daemonReservation.port;
   const serverUrl = `http://127.0.0.1:${serverPort}`;
-  const stack = spawnManagedProcess({
-    ...createInstalledBinInvocation(binDir, "bb-app", [
-      "--data-dir",
-      dataDir,
-      "--server-port",
-      String(serverPort),
-      "--host-daemon-port",
-      String(daemonPort),
-    ]),
-    env: {
-      BB_LOG_LEVEL: "info",
-    },
-    label: "bb-app full stack",
-  });
+  let stack = null;
 
   try {
+    await closePortReservations(reservations);
+    stack = spawnManagedProcess({
+      ...createInstalledBinInvocation(binDir, "bb-app", [
+        "--data-dir",
+        dataDir,
+        "--server-port",
+        String(serverPort),
+        "--host-daemon-port",
+        String(daemonPort),
+      ]),
+      env: {
+        BB_LOG_LEVEL: "info",
+      },
+      label: "bb-app full stack",
+    });
     await waitForHttp({
+      acceptResponse: (response) => acceptServerHealthResponse(response),
       label: stack.label,
+      portCollisionLogPaths: [
+        join(dataDir, "logs", "server-stdio.log"),
+        join(dataDir, "logs", "host-daemon-stdio.log"),
+      ],
       processRef: stack,
       url: `${serverUrl}/health`,
     });
     await waitForHttp({
       label: stack.label,
+      portCollisionLogPaths: [
+        join(dataDir, "logs", "server-stdio.log"),
+        join(dataDir, "logs", "host-daemon-stdio.log"),
+      ],
       processRef: stack,
       url: `http://${DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST}:${daemonPort}/health`,
+    });
+    await waitForHttp({
+      acceptResponse: (response) =>
+        acceptHostDaemonStatusResponse(response, serverUrl),
+      label: stack.label,
+      portCollisionLogPaths: [
+        join(dataDir, "logs", "server-stdio.log"),
+        join(dataDir, "logs", "host-daemon-stdio.log"),
+      ],
+      processRef: stack,
+      url: `http://${DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST}:${daemonPort}/status`,
     });
     const cliEnv = {
       BB_DATA_DIR: dataDir,
@@ -974,6 +1077,7 @@ async function smokeFullStack(binDir, sdkDir) {
     // log proves the packed daemon found its companion worker, downloaded the
     // plugin artifact, and started the worker for a host RPC call.
     await waitForHostPluginWorker({
+      dataDir,
       pluginId: "keep-awake",
       processRef: stack,
     });
@@ -995,51 +1099,74 @@ async function smokeFullStack(binDir, sdkDir) {
       label: "bb-app SDK status",
     });
   } finally {
-    await stopManagedProcess(stack);
+    await waitForAllCleanup([
+      stack === null ? undefined : stopManagedProcess(stack),
+      closePortReservations(reservations),
+    ]);
   }
 }
 
-async function smokeDaemonJoin(binDir) {
-  const serverDataDir = join(tempRoot, "join-server-data");
-  const [serverPort, firstDaemonPort, secondDaemonPort, staleEnvPort] =
-    await getFreePorts(4);
+async function smokeFullStack(binDir, sdkDir) {
+  await retryPortCollisions("full stack", (attempt) =>
+    smokeFullStackAttempt(binDir, sdkDir, attempt),
+  );
+}
+
+async function smokeDaemonJoinAttempt(binDir, attempt) {
+  const serverDataDir = join(tempRoot, `join-server-data-${attempt}`);
+  const reservations = await reserveFreePorts(4);
+  const [
+    serverReservation,
+    firstDaemonReservation,
+    secondDaemonReservation,
+    staleEnvReservation,
+  ] = reservations;
+  const serverPort = serverReservation.port;
+  const staleEnvPort = staleEnvReservation.port;
+  const serverLaunchId = randomUUID();
   const serverUrl = `http://127.0.0.1:${serverPort}`;
   const staleEnvServerUrl = `http://127.0.0.1:${staleEnvPort}`;
   const daemonSpecs = [
     {
-      dataDir: join(tempRoot, "join-daemon-data-1"),
+      dataDir: join(tempRoot, `join-daemon-data-${attempt}-1`),
       label: "bb-app host-daemon join 1",
-      port: firstDaemonPort,
+      reservation: firstDaemonReservation,
     },
     {
-      dataDir: join(tempRoot, "join-daemon-data-2"),
+      dataDir: join(tempRoot, `join-daemon-data-${attempt}-2`),
       label: "bb-app host-daemon join 2",
-      port: secondDaemonPort,
+      reservation: secondDaemonReservation,
     },
   ];
-  const server = spawnManagedProcess({
-    ...createInstalledBinInvocation(binDir, "bb-server", [
-      "--data-dir",
-      serverDataDir,
-      "--server-port",
-      String(serverPort),
-      "--host-daemon-port",
-      String(firstDaemonPort),
-    ]),
-    env: {
-      BB_LOG_LEVEL: "warn",
-    },
-    label: "bb-server",
-  });
-
+  let server = null;
   const daemons = [];
   try {
+    await closePortReservation(serverReservation);
+    server = spawnManagedProcess({
+      ...createInstalledBinInvocation(binDir, "bb-server", [
+        "--data-dir",
+        serverDataDir,
+        "--server-port",
+        String(serverPort),
+        "--host-daemon-port",
+        String(firstDaemonReservation.port),
+      ]),
+      env: {
+        BB_LOG_LEVEL: "warn",
+        BB_SERVER_LAUNCH_ID: serverLaunchId,
+      },
+      label: "bb-server",
+    });
     await waitForHttp({
+      acceptResponse: (response) =>
+        acceptServerHealthResponse(response, serverLaunchId),
       label: server.label,
+      portCollisionLogPaths: [join(serverDataDir, "logs", "server-stdio.log")],
       processRef: server,
       url: `${serverUrl}/health`,
     });
     for (const spec of daemonSpecs) {
+      await closePortReservation(spec.reservation);
       const daemon = spawnManagedProcess({
         ...createInstalledBinInvocation(binDir, "bb-app", [
           "host-daemon",
@@ -1049,7 +1176,7 @@ async function smokeDaemonJoin(binDir) {
           "--server-url",
           serverUrl,
           "--host-daemon-port",
-          String(spec.port),
+          String(spec.reservation.port),
         ]),
         env: {
           BB_LOG_LEVEL: "info",
@@ -1060,8 +1187,21 @@ async function smokeDaemonJoin(binDir) {
       daemons.push(daemon);
       await waitForHttp({
         label: daemon.label,
+        portCollisionLogPaths: [
+          join(spec.dataDir, "logs", "host-daemon-stdio.log"),
+        ],
         processRef: daemon,
-        url: `http://${DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST}:${spec.port}/health`,
+        url: `http://${DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST}:${spec.reservation.port}/health`,
+      });
+      await waitForHttp({
+        acceptResponse: (response) =>
+          acceptHostDaemonStatusResponse(response, serverUrl),
+        label: daemon.label,
+        portCollisionLogPaths: [
+          join(spec.dataDir, "logs", "host-daemon-stdio.log"),
+        ],
+        processRef: daemon,
+        url: `http://${DEFAULT_HOST_DAEMON_LOCAL_BIND_HOST}:${spec.reservation.port}/status`,
       });
       const configJson = JSON.parse(
         await readFile(join(spec.dataDir, "config.json"), "utf8"),
@@ -1074,7 +1214,7 @@ async function smokeDaemonJoin(binDir) {
     }
     const cliEnv = {
       BB_DATA_DIR: serverDataDir,
-      BB_HOST_DAEMON_PORT: String(firstDaemonPort),
+      BB_HOST_DAEMON_PORT: String(firstDaemonReservation.port),
       BB_SERVER_URL: serverUrl,
     };
     await smokeBuiltinPluginsRunning({ binDir, cliEnv });
@@ -1082,33 +1222,68 @@ async function smokeDaemonJoin(binDir) {
     // Ready workers on both prove host-plugin artifacts and calls fan out to
     // enrolled machines instead of assuming server-local paths.
     await Promise.all(
-      daemons.map((daemon) =>
+      daemons.map((daemon, index) =>
         waitForHostPluginWorker({
+          dataDir: daemonSpecs[index].dataDir,
           pluginId: "keep-awake",
           processRef: daemon,
         }),
       ),
     );
   } finally {
-    await Promise.all(daemons.map((daemon) => stopManagedProcess(daemon)));
-    await stopManagedProcess(server);
+    await waitForAllCleanup([
+      ...daemons.map((daemon) => stopManagedProcess(daemon)),
+      server === null ? undefined : stopManagedProcess(server),
+      closePortReservations(reservations),
+    ]);
   }
 }
 
+async function smokeDaemonJoin(binDir) {
+  await retryPortCollisions("daemon join", (attempt) =>
+    smokeDaemonJoinAttempt(binDir, attempt),
+  );
+}
+
 try {
-  const tarballPath = await packTarball();
-  await smokeNpxEntrypoint(tarballPath);
-  const sdkDir = await smokeSdkPackage(tarballPath);
+  const smokeStartedAt = performance.now();
+  const tarballPath = await timed("npm pack", () => packTarball());
+  let sdkDir;
+  if (process.platform === "win32") {
+    const [npxResult, sdkResult] = await Promise.allSettled([
+      timed("npx entrypoint", () => smokeNpxEntrypoint(tarballPath)),
+      timed("sdk package", () => smokeSdkPackage(tarballPath)),
+    ]);
+    if (npxResult.status === "rejected") throw npxResult.reason;
+    if (sdkResult.status === "rejected") throw sdkResult.reason;
+    sdkDir = sdkResult.value;
+  } else {
+    await timed("npx entrypoint", () => smokeNpxEntrypoint(tarballPath));
+    sdkDir = await timed("sdk package", () => smokeSdkPackage(tarballPath));
+  }
   const installedBinDir = join(sdkDir, "node_modules", ".bin");
   const installedPackageDir = join(sdkDir, "node_modules", "bb-app");
-  await smokeHelpCommands(installedBinDir);
-  await smokeConfigCommand(installedBinDir);
-  await smokeInstalledRepack(installedPackageDir);
-  await smokeProviderBridgeBundles(installedPackageDir);
-  await smokePluginHostWorkerBundle(installedPackageDir);
-  await smokeFullStack(installedBinDir, sdkDir);
-  await smokeDaemonJoin(installedBinDir);
-  process.stdout.write("bb-app tarball smoke passed\n");
+  await timed("help commands", () => smokeHelpCommands(installedBinDir));
+  await timed("config command", () => smokeConfigCommand(installedBinDir));
+  await timed("installed repack", () =>
+    smokeInstalledRepack(installedPackageDir),
+  );
+  await timed("provider bridge bundles", () =>
+    smokeProviderBridgeBundles(installedPackageDir),
+  );
+  await timed("plugin host worker bundle", () =>
+    smokePluginHostWorkerBundle(installedPackageDir),
+  );
+  await timed("full stack", () => smokeFullStack(installedBinDir, sdkDir));
+  await timed("daemon join", () => smokeDaemonJoin(installedBinDir));
+  process.stdout.write(
+    `bb-app tarball smoke passed in ${formatElapsed(smokeStartedAt)}\n`,
+  );
 } finally {
-  await rm(tempRoot, { force: true, recursive: true });
+  await rm(tempRoot, {
+    force: true,
+    maxRetries: 20,
+    recursive: true,
+    retryDelay: 250,
+  });
 }

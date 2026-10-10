@@ -2,7 +2,10 @@ import { useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 import type { Host } from "@bb/domain";
 import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
-import type { SystemVersionResponse } from "@bb/server-contract";
+import type {
+  SystemAppUpdateStatus,
+  SystemVersionResponse,
+} from "@bb/server-contract";
 import type { BbDesktopInfo } from "@bb/desktop-contract";
 import {
   buildProviderCliIssue,
@@ -11,6 +14,8 @@ import {
   providerCliEntries,
   type ProviderCliIssue,
 } from "@/components/provider-cli/provider-cli-install";
+import { hasActionableNpmAppUpdate } from "@/components/app-update/app-update-presentation";
+import { useAppUpdateStatus } from "@/hooks/queries/app-update-queries";
 import { useDesktopUpdateInfo } from "@/hooks/useDesktopUpdateInfo";
 import { usePluginList } from "@/hooks/queries/plugin-settings-queries";
 import { pluginsNeedingAttention } from "@/hooks/usePluginAttention";
@@ -60,11 +65,30 @@ export function buildUpdateInventoryProviderIssues(
     .filter(isProviderCliIssue);
 }
 
+export function resolveAppUpdateAvailable(args: {
+  appUpdate: SystemAppUpdateStatus | undefined;
+  isDesktop: boolean;
+  systemVersion: SystemVersionResponse | undefined;
+}): boolean {
+  if (hasActionableNpmAppUpdate(args.appUpdate)) return true;
+  return (
+    !args.isDesktop &&
+    args.systemVersion !== undefined &&
+    !args.systemVersion.isDevelopment &&
+    args.systemVersion.updateAvailable
+  );
+}
+
+export function updateInventoryHosts(hosts: readonly Host[]): Host[] {
+  return hosts.filter((host) => host.type !== "ephemeral");
+}
+
 export function useUpdateInventory(
   options?: UseUpdateInventoryOptions,
 ): UpdateInventory {
   const enabled = options?.enabled ?? true;
   const systemVersionQuery = useSystemVersion({ enabled });
+  const appUpdateStatusQuery = useAppUpdateStatus({ enabled });
   const systemConfigQuery = useSystemConfig({ enabled });
   const hostsQuery = useHosts({ enabled });
   const { desktopInfo, isDesktop } = useDesktopUpdateInfo();
@@ -73,9 +97,9 @@ export function useUpdateInventory(
   ).length;
 
   const hosts = useMemo(() => hostsQuery.data ?? [], [hostsQuery.data]);
-  const connectedHosts = useMemo(
-    () => hosts.filter((host) => host.status === "connected"),
-    [hosts],
+  const updateHosts = updateInventoryHosts(hosts);
+  const connectedHosts = updateHosts.filter(
+    (host) => host.status === "connected",
   );
   const primaryHostId =
     selectPrimaryHost(hosts, systemConfigQuery.data?.primaryHostId ?? null)
@@ -101,7 +125,7 @@ export function useUpdateInventory(
     }
   });
 
-  const machines: UpdateInventoryMachine[] = hosts.map((host) => {
+  const machines: UpdateInventoryMachine[] = updateHosts.map((host) => {
     const statusQuery = providerStatusByHostId.get(host.id);
     const providerStatus = statusQuery?.data ?? null;
     const issues =
@@ -121,11 +145,11 @@ export function useUpdateInventory(
   });
 
   const systemVersion = systemVersionQuery.data;
-  const appUpdateAvailable =
-    !isDesktop &&
-    systemVersion !== undefined &&
-    !systemVersion.isDevelopment &&
-    systemVersion.updateAvailable;
+  const appUpdateAvailable = resolveAppUpdateAvailable({
+    appUpdate: appUpdateStatusQuery.data,
+    isDesktop,
+    systemVersion,
+  });
   const desktopUpdateReady = desktopInfo?.updateDownloaded === true;
   const actionableCount =
     machines.reduce(

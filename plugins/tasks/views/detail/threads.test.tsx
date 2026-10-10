@@ -2,6 +2,7 @@
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import { makeTask, rpcInput } from "../../test-fixtures.js";
 
 if (!window.matchMedia) {
   window.matchMedia = (query: string) => ({
@@ -25,22 +26,14 @@ const TASK_ID = "01HZZZZZZZZZZZZZZZZZZZZZT5";
 const THREAD_ROW_ID = "01HZZZZZZZZZZZZZZZZZZZZZR1";
 const OFFLINE_ROW_ID = "01HZZZZZZZZZZZZZZZZZZZZZR2";
 
-const task = {
+const task = makeTask({
   id: TASK_ID,
   projectId: PROJECT_ID,
   number: 5,
   key: "TSK-5",
   title: "Ship the PR pill",
-  description: "",
-  status: "todo",
-  priority: "none",
-  dueDate: null,
-  parentTaskId: null,
   position: 1,
-  createdAt: "2026-07-15T00:00:00.000Z",
-  updatedAt: "2026-07-15T00:00:00.000Z",
-  labelIds: [],
-};
+});
 
 function taskThreadRow(id: string, threadId: string, title: string) {
   return {
@@ -75,8 +68,10 @@ function detailRpc(overrides: Record<string, unknown> = {}) {
     listPresets: () => ({ presets: [] }),
     sidebarSummary: () => ({ projects: [] }),
     getTaskByKey: () => ({ task }),
-    listTasks: (input: { parentTaskId?: string } | null) =>
-      input?.parentTaskId ? { tasks: [] } : { tasks: [task] },
+    listTasks: (input: unknown) =>
+      input !== null && rpcInput(input).parentTaskId
+        ? { tasks: [] }
+        : { tasks: [task] },
     listLabels: () => ({ labels: [] }),
     listAttachments: () => ({ attachments: [] }),
     listTaskThreads: () => ({
@@ -165,9 +160,9 @@ describe("task detail pull request pills", () => {
               ? []
               : [taskThreadRow(THREAD_ROW_ID, "thr_worker000", "Worker")],
           }),
-          taskThreadsDetach: (input: { threadId: string }) => {
+          taskThreadsDetach: (input: unknown) => {
             detached = true;
-            return { threadId: input.threadId };
+            return { threadId: rpcInput(input).threadId };
           },
         }),
       },

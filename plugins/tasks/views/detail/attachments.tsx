@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
+import { attachmentDownloadUrl } from "../../shared/attachments.js";
 import type { Attachment } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import { formatFileSize } from "../activity/time.js";
-import { ConfirmDialog } from "../../components/confirm-dialog.js";
-import { Icon } from "@bb/shared-ui/icon";
-
-export function attachmentDownloadUrl(attachmentId: string): string {
-  return `/api/v1/plugins/tasks/http/attachments/download?attachmentId=${encodeURIComponent(attachmentId)}`;
-}
+import {
+  ConfirmDeleteDialog,
+  ConfirmDeleteDialogContent,
+} from "@/components/ui/confirm-delete-dialog";
+import { Icon } from "@/components/ui/icon";
 
 let tokenPromise: Promise<string> | null = null;
 
@@ -116,11 +117,9 @@ export function Lightbox({
 
 function RemovalSpinner() {
   return (
-    <span
-      role="status"
-      aria-label="Removing"
-      className="size-3.5 animate-spin rounded-full border-2 border-current border-t-transparent"
-    />
+    <span role="status" aria-label="Removing" className="inline-flex">
+      <Icon name="Spinner" className="size-3.5 animate-spin" aria-hidden />
+    </span>
   );
 }
 
@@ -130,13 +129,12 @@ export function AttachmentsGrid({
   onError,
 }: {
   attachments: Attachment[];
-  onRemove?: (attachment: Attachment) => Promise<void>;
-  onError?: (message: string) => void;
+  onRemove: (attachment: Attachment) => Promise<void>;
+  onError: (message: string) => void;
 }) {
   const [lightbox, setLightbox] = useState<Attachment | null>(null);
   const [confirm, setConfirm] = useState<Attachment | null>(null);
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
-  const removable = onRemove !== undefined;
 
   const requestRemove = (attachment: Attachment) => setConfirm(attachment);
 
@@ -145,9 +143,9 @@ export function AttachmentsGrid({
     setLightbox((current) => (current?.id === attachment.id ? null : current));
     setPending((current) => new Set(current).add(attachment.id));
     try {
-      await onRemove?.(attachment);
+      await onRemove(attachment);
     } catch (error) {
-      onError?.(error instanceof Error ? error.message : String(error));
+      onError(errorMessage(error));
     } finally {
       setPending((current) => {
         const next = new Set(current);
@@ -163,7 +161,6 @@ export function AttachmentsGrid({
   const images = attachments.filter((attachment) => attachment.isImage);
 
   const removeButton = (attachment: Attachment, variant: "image" | "file") => {
-    if (!removable) return null;
     const busy = pending.has(attachment.id);
     const base =
       variant === "image"
@@ -255,22 +252,28 @@ export function AttachmentsGrid({
       {lightbox ? (
         <Lightbox attachment={lightbox} onClose={() => setLightbox(null)} />
       ) : null}
-      <ConfirmDialog
+      <ConfirmDeleteDialog
+        className="max-w-sm"
         open={confirm !== null}
         onOpenChange={(open) => {
           if (!open) setConfirm(null);
         }}
-        title="Remove attachment?"
-        description={
-          confirm
-            ? `"${confirm.fileName}" will be permanently removed. Any references in the task description will be removed too. This cannot be undone.`
-            : ""
-        }
-        confirmLabel="Remove"
-        onConfirm={() => {
-          if (confirm) void performRemove(confirm);
-        }}
-      />
+      >
+        {confirm ? (
+          <ConfirmDeleteDialogContent
+            title="Remove attachment?"
+            description={`"${confirm.fileName}" will be permanently removed. Any references in the task description will be removed too. This cannot be undone.`}
+            confirmLabel="Remove"
+            pending={false}
+            size="sm"
+            onCancel={() => setConfirm(null)}
+            onConfirm={() => {
+              setConfirm(null);
+              void performRemove(confirm);
+            }}
+          />
+        ) : null}
+      </ConfirmDeleteDialog>
     </div>
   );
 }

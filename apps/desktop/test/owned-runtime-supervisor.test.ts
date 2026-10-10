@@ -24,12 +24,14 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
+import type {
+  VerifiedProcessOps,
+  WaitForProcessExitArgs,
+} from "@bb/config/verified-process-stop";
 import {
   readOwnedRuntimePidFile,
   reapStaleOwnedRuntime,
   writeOwnedRuntimePidFile,
-  type OwnedRuntimeProcessOps,
-  type WaitForProcessExitArgs,
 } from "../src/owned-runtime-supervisor.js";
 
 interface TempDir {
@@ -38,7 +40,7 @@ interface TempDir {
 
 interface FakeProcessOps {
   killedSignals: NodeJS.Signals[];
-  ops: OwnedRuntimeProcessOps;
+  ops: VerifiedProcessOps;
 }
 
 interface CreateFakeProcessOpsArgs {
@@ -58,7 +60,7 @@ async function createTempDir(): Promise<TempDir> {
 function createFakeProcessOps(args: CreateFakeProcessOpsArgs): FakeProcessOps {
   let running = args.running;
   const killedSignals: NodeJS.Signals[] = [];
-  const ops: OwnedRuntimeProcessOps = {
+  const ops: VerifiedProcessOps = {
     isRunning() {
       return running;
     },
@@ -66,11 +68,8 @@ function createFakeProcessOps(args: CreateFakeProcessOpsArgs): FakeProcessOps {
       killedSignals.push(signal);
       running = false;
     },
-    async readCommand() {
-      return args.command;
-    },
-    async readElapsedSeconds() {
-      return 0;
+    async readIdentity() {
+      return { command: args.command, startedAt: Date.now() };
     },
     async waitForExit(_args: WaitForProcessExitArgs) {
       return !running;

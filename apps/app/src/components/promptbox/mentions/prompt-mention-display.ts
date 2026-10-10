@@ -12,9 +12,7 @@ export const PROMPT_MENTION_PILL_CLASS = cn(
   "align-baseline",
 );
 
-export function promptMentionIconLabel(
-  resource: PromptMentionResource,
-): string {
+function promptMentionIconLabel(resource: PromptMentionResource): string {
   if (resource.kind === "thread") {
     return "Thread";
   }
@@ -29,6 +27,9 @@ export function promptMentionIconLabel(
   }
   if (resource.kind === "plugin") {
     return "Plugin";
+  }
+  if (resource.kind === "attachment") {
+    return "Attachment";
   }
   if (resource.source === "thread-storage") {
     return "Storage";
@@ -54,6 +55,9 @@ export function promptMentionIconName(
   if (resource.kind === "plugin") {
     return "Zap";
   }
+  if (resource.kind === "attachment") {
+    return "Paperclip";
+  }
   return resource.entryKind === "directory" ? "Folder" : "File";
 }
 
@@ -70,7 +74,9 @@ export function promptCommandIconName(command: PromptCommandLike): IconName {
   return "Terminal";
 }
 
-function promptMentionDisplayLabel(resource: PromptMentionResource): string {
+export function promptMentionDisplayLabel(
+  resource: PromptMentionResource,
+): string {
   return `${promptMentionIconLabel(resource)}: ${resource.label}`;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RuntimePermissionPolicy } from "@bb/domain";
+import type { RuntimePermissionPolicy } from "@get-bb/plugin-sdk/provider-bridge";
 import {
   buildClaudeSessionParams,
   buildClaudeTurnParams,
@@ -11,7 +11,9 @@ const EXECUTION_CONTEXT = {
   reasoningLevel: "high",
   claudeCodePermissionMode: "plan",
   workflowsEnabled: true,
-  idleQueryReleaseEnabled: true,
+  chromeEnabled: true,
+  disable1MContext: false,
+  sandboxEnabled: false,
   memoryEnabled: false,
   providerSubagentsEnabled: false,
   instructions: "Session instructions",
@@ -26,7 +28,9 @@ function toCanonicalWireOptions(options: typeof EXECUTION_CONTEXT) {
   const {
     claudeCodePermissionMode,
     workflowsEnabled,
-    idleQueryReleaseEnabled,
+    chromeEnabled,
+    disable1MContext,
+    sandboxEnabled,
     memoryEnabled,
     providerSubagentsEnabled,
     ...core
@@ -36,7 +40,9 @@ function toCanonicalWireOptions(options: typeof EXECUTION_CONTEXT) {
     providerOptions: {
       claudeCodePermissionMode,
       workflowsEnabled,
-      idleQueryReleaseEnabled,
+      chromeEnabled,
+      disable1MContext,
+      sandboxEnabled,
       memoryEnabled,
       providerSubagentsEnabled,
     },
@@ -73,7 +79,6 @@ describe("buildClaudeSessionParams", () => {
       dynamicTools: [
         { name: "tool", description: "desc", inputSchema: { type: "object" } },
       ],
-      disallowedTools: ["WebSearch"],
       options: toCanonicalWireOptions(EXECUTION_CONTEXT),
     });
 
@@ -82,38 +87,16 @@ describe("buildClaudeSessionParams", () => {
       cwd: "/tmp/worktree",
       permissionMode: "plan",
       workflowsEnabled: true,
-      idleQueryReleaseEnabled: true,
+      chromeEnabled: true,
+      sandboxEnabled: false,
       memoryEnabled: false,
       providerSubagentsEnabled: false,
       model: "claude-sonnet-5",
       reasoningLevel: "high",
-      disallowedTools: ["WebSearch"],
+      serviceTier: "default",
       config: { envVars: { BB_TEST: "1" } },
     });
     expect(params.baseInstructions).toContain("Session instructions");
-  });
-
-  it("passes the daemon's extra workspace write roots from the providerOptions bag", () => {
-    const shared = {
-      threadId: "thread-1",
-      cwd: "/tmp/worktree",
-      instructionMode: "append" as const,
-    };
-    const additionalWorkspaceWriteRoots = ["/tmp/thread-storage"];
-    const canonical = buildClaudeSessionParams({
-      ...shared,
-      options: {
-        ...toCanonicalWireOptions(EXECUTION_CONTEXT),
-        providerOptions: {
-          ...toCanonicalWireOptions(EXECUTION_CONTEXT).providerOptions,
-          additionalWorkspaceWriteRoots,
-        },
-      },
-    });
-
-    expect(canonical.additionalWorkspaceWriteRoots).toEqual(
-      additionalWorkspaceWriteRoots,
-    );
   });
 
   it("falls back to provider defaults when the providerOptions bag is absent", () => {
@@ -125,9 +108,11 @@ describe("buildClaudeSessionParams", () => {
     });
     expect(params).toMatchObject({
       workflowsEnabled: false,
-      idleQueryReleaseEnabled: false,
+      chromeEnabled: false,
+      sandboxEnabled: true,
       permissionMode: "bypassPermissions",
       approvedPlanPermissionMode: "bypassPermissions",
+      permissionEscalation: null,
     });
 
     expect(
@@ -174,22 +159,6 @@ function toWireOptionsWithRoots(args: {
 }
 
 describe("claude session workspace-write roots", () => {
-  it("includes construction-level workspace-write roots", () => {
-    const params = buildClaudeSessionParams({
-      threadId: "bb-thread-1",
-      cwd: "/tmp/worktree",
-      instructionMode: "append",
-      options: toWireOptionsWithRoots({
-        policy: WORKSPACE_ACCEPT_EDITS_POLICY,
-        additionalWorkspaceWriteRoots: EXTRA_WORKSPACE_WRITE_ROOTS,
-      }),
-    });
-
-    expect(params).toMatchObject({
-      additionalWorkspaceWriteRoots: EXTRA_WORKSPACE_WRITE_ROOTS,
-    });
-  });
-
   it("omits empty workspace-write roots", () => {
     expect(
       buildClaudeSessionParams({
@@ -267,7 +236,6 @@ describe("claude session option passthrough", () => {
           },
         },
       ],
-      disallowedTools: ["ExitPlanMode", "NotebookEdit", "Task"],
     });
 
     expect(params).toMatchObject({
@@ -292,7 +260,6 @@ describe("claude session option passthrough", () => {
           },
         },
       ],
-      disallowedTools: ["ExitPlanMode", "NotebookEdit", "Task"],
     });
     expect(params).toMatchObject({
       config: {
@@ -303,45 +270,6 @@ describe("claude session option passthrough", () => {
       (params as { config: { envVars: Record<string, string> } }).config
         .envVars,
     ).not.toHaveProperty("BAD.KEY");
-  });
-
-  it("maps automatic review to Claude auto", () => {
-    const params = buildClaudeSessionParams({
-      threadId: "bb-thread-1",
-      cwd: "/tmp/worktree",
-      instructionMode: "append",
-      options: {
-        ...WORKSPACE_AUTO_POLICY,
-        permissionEscalation: "deny",
-        providerOptions: {
-          workflowsEnabled: false,
-        },
-      },
-    });
-
-    expect(params).toMatchObject({
-      permissionMode: "auto",
-      permissionEscalation: "deny",
-    });
-  });
-
-  it("ignores escalation in full permission mode", () => {
-    const params = buildClaudeSessionParams({
-      threadId: "bb-thread-1",
-      cwd: "/tmp/worktree",
-      instructionMode: "append",
-      options: {
-        ...FULL_POLICY,
-        providerOptions: {
-          workflowsEnabled: false,
-        },
-      },
-    });
-
-    expect(params).toMatchObject({
-      permissionMode: "bypassPermissions",
-      permissionEscalation: null,
-    });
   });
 });
 
@@ -359,10 +287,26 @@ describe("buildClaudeTurnParams", () => {
       },
     });
     expect(params.workflowsEnabled).toBeUndefined();
-    expect(params.idleQueryReleaseEnabled).toBeUndefined();
+    expect(params.chromeEnabled).toBeUndefined();
+    expect(params.sandboxEnabled).toBeUndefined();
     expect(params.memoryEnabled).toBeUndefined();
     expect(params.providerSubagentsEnabled).toBeUndefined();
     expect(params.permissionEscalation).toBeNull();
+    expect(params).not.toHaveProperty("serviceTier");
+  });
+
+  it("forwards fast service tier to Claude turns", () => {
+    const params = buildClaudeTurnParams({
+      threadId: "thread-1",
+      providerThreadId: "provider-1",
+      input: [{ type: "text", text: "hi", mentions: [] }],
+      options: {
+        ...FULL_POLICY,
+        model: "claude-opus-5",
+        serviceTier: "fast",
+      },
+    });
+    expect(params.serviceTier).toBe("fast");
   });
 
   it("strips the /plan command mention that opened plan mode", () => {

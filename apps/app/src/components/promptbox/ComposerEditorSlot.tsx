@@ -7,7 +7,10 @@ import {
   type PromptMentionLinkResolver,
 } from "./editor/prompt-mention-link";
 
-type ComposerEditorLayout = "thread" | "root-compose";
+export type ComposerEditorLayout = "thread" | "root-compose";
+
+export const COMPOSER_EDITOR_AVAILABLE_HEIGHT_PROPERTY =
+  "--composer-editor-available-height";
 
 const COMPOSER_EDITOR_MAX_HEIGHT_BY_LAYOUT: Record<
   ComposerEditorLayout,
@@ -17,8 +20,8 @@ const COMPOSER_EDITOR_MAX_HEIGHT_BY_LAYOUT: Record<
   "root-compose": "calc(70dvh - 3rem)",
 };
 
-function blurComposerEditor(editor: Editor): void {
-  editor.view.dom.blur();
+export function blurPromptEditor(editor: Editor | null | undefined): void {
+  editor?.view.dom.blur();
   window.getSelection()?.removeAllRanges();
 }
 
@@ -55,7 +58,7 @@ export function ComposerEditorSlot({
         height: isCompactLayout ? "48px" : undefined,
         maxHeight: isCompactLayout
           ? "48px"
-          : COMPOSER_EDITOR_MAX_HEIGHT_BY_LAYOUT[layout],
+          : `min(${COMPOSER_EDITOR_MAX_HEIGHT_BY_LAYOUT[layout]}, var(${COMPOSER_EDITOR_AVAILABLE_HEIGHT_PROPERTY}, 100dvh))`,
       }}
     >
       <PromptMentionLinkContext.Provider value={resolveMentionLink ?? null}>
@@ -65,7 +68,7 @@ export function ComposerEditorSlot({
             if (event.key !== "Escape") return;
             if (editor === null || editor.isEditable) return;
             event.preventDefault();
-            blurComposerEditor(editor);
+            blurPromptEditor(editor);
           }}
           data-promptbox-editor-content=""
           data-promptbox-compact-content={isCompactLayout ? "" : undefined}
@@ -75,14 +78,6 @@ export function ComposerEditorSlot({
             "[&_.ProseMirror]:min-h-full [&_.ProseMirror]:leading-[1.7] [&_.ProseMirror]:outline-none",
             "[&_.ProseMirror_p]:m-0",
             "[&_.ProseMirror_blockquote]:my-1 [&_.ProseMirror_blockquote]:border-l-2 [&_.ProseMirror_blockquote]:border-surface-selected-border [&_.ProseMirror_blockquote]:pl-3 [&_.ProseMirror_blockquote]:text-muted-foreground",
-            "[&_.ProseMirror_h1]:my-1 [&_.ProseMirror_h1]:text-lg [&_.ProseMirror_h1]:font-semibold",
-            "[&_.ProseMirror_h2]:my-1 [&_.ProseMirror_h2]:text-base [&_.ProseMirror_h2]:font-semibold",
-            "[&_.ProseMirror_h3]:my-1 [&_.ProseMirror_h3]:text-sm [&_.ProseMirror_h3]:font-semibold",
-            "[&_.ProseMirror_h4]:my-1 [&_.ProseMirror_h4]:text-sm [&_.ProseMirror_h4]:font-semibold [&_.ProseMirror_h5]:font-semibold [&_.ProseMirror_h6]:font-semibold",
-            "[&_.ProseMirror_ul]:my-1 [&_.ProseMirror_ul]:list-disc [&_.ProseMirror_ul]:pl-5",
-            "[&_.ProseMirror_ol]:my-1 [&_.ProseMirror_ol]:list-decimal [&_.ProseMirror_ol]:pl-5",
-            "[&_.ProseMirror_li]:my-0.5 [&_.ProseMirror_li>p]:m-0",
-            "[&_.ProseMirror_code]:rounded [&_.ProseMirror_code]:bg-surface-selected [&_.ProseMirror_code]:px-1 [&_.ProseMirror_code]:py-0.5 [&_.ProseMirror_code]:font-mono [&_.ProseMirror_code]:text-[0.9em]",
             "[&_.ProseMirror_p.is-editor-empty:first-child::before]:pointer-events-none",
             "[&_.ProseMirror_p.is-editor-empty:first-child::before]:float-left",
             "[&_.ProseMirror_p.is-editor-empty:first-child::before]:h-0",

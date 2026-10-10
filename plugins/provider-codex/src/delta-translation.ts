@@ -20,6 +20,7 @@ import {
   experimental_webSearchPresentation as webSearchPresentation,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import {
+  codexAsyncQuestionItemSchema,
   codexBridgeEnvelopeSchema,
   codexHandledEventSchema,
   codexHandledThreadItemSchema,
@@ -39,12 +40,15 @@ import {
   collabAgentPresentation,
   commandPresentation,
   fileChangePresentation,
+  imageGenerationPresentation,
   imageViewPresentation,
   mcpToolPresentation,
   planStepsPresentation,
 } from "./presentation.js";
 import {
+  CODEX_ASYNC_QUESTION_EXTENSION_KIND,
   CODEX_GOAL_EXTENSION_KIND,
+  type CodexAsyncQuestionState,
   type CodexGoalState,
 } from "./extension-kinds.js";
 import { codexVisibilityMetadata } from "./visibility.js";
@@ -65,6 +69,7 @@ interface CodexRetryErrorContext {
 
 interface CodexEventTranslationState {
   rateLimitsByLimitId: Map<string, CodexRateLimitSnapshot>;
+  latestRateLimitId: string;
   injectedToolsByName: Map<string, CodexInjectedTool>;
   retryErrorsByTurnKey: Map<string, CodexRetryErrorContext>;
 }
@@ -72,6 +77,7 @@ interface CodexEventTranslationState {
 export function createCodexEventTranslationState(): CodexEventTranslationState {
   return {
     rateLimitsByLimitId: new Map(),
+    latestRateLimitId: "codex",
     injectedToolsByName: new Map(),
     retryErrorsByTurnKey: new Map(),
   };
@@ -180,6 +186,7 @@ export function applyCodexRateLimitUpdate(
     limitId,
   );
   state.rateLimitsByLimitId.set(limitId, rateLimits);
+  state.latestRateLimitId = limitId;
   return rateLimits;
 }
 
@@ -268,7 +275,7 @@ type CodexRateLimitCandidate = {
   rateLimits: ProviderRateLimitState;
 };
 
-function normalizeCodexRateLimits(
+export function normalizeCodexRateLimits(
   state: CodexEventTranslationState,
   preferredLimitId: string,
 ): ProviderRateLimitState {
@@ -758,6 +765,24 @@ function summarizeCollabAgentsStates(
   return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
+function translateCodexAsyncQuestion(item: unknown): ThreadDelta[] {
+  const parsed = codexAsyncQuestionItemSchema.safeParse(item);
+  if (!parsed.success) {
+    return [];
+  }
+  const state: CodexAsyncQuestionState = {
+    itemId: parsed.data.id,
+    questions: parsed.data.questions,
+  };
+  return [
+    {
+      kind: "extension.state",
+      extensionKind: CODEX_ASYNC_QUESTION_EXTENSION_KIND,
+      payload: state,
+    },
+  ];
+}
+
 function translateCodexItemShape(
   item: unknown,
   state: CodexEventTranslationState,
@@ -937,6 +962,28 @@ function translateCodexItemShape(
         status: "completed",
         approvalDenied: false,
       };
+    case "imageGeneration": {
+      const path = parsedItem.savedPath ?? null;
+      const prompt = parsedItem.revisedPrompt;
+      return {
+        kind: "translated",
+        shape: {
+          type: "imageGeneration",
+          prompt,
+          path,
+          ...(parsedItem.result.length === 0
+            ? {}
+            : { result: parsedItem.result }),
+          error:
+            parsedItem.failure === null
+              ? null
+              : "Image generation usage limit exceeded",
+          transparentBackground: parsedItem.transparentBackground ?? false,
+        },
+        presentation: imageGenerationPresentation({ path, prompt }),
+        ...toolStatusFields(parsedItem.status),
+      };
+    }
     case "reasoning":
       return {
         kind: "translated",
@@ -1027,9 +1074,7 @@ export function translateCodexEventToDeltas(
           ...(handledEvent.params.turn.error?.message
             ? { error: { message: handledEvent.params.turn.error.message } }
             : {}),
-          ...(status === "completed" || status === "interrupted"
-            ? { providerCheckpointId: handledEvent.params.turn.id }
-            : {}),
+          providerCheckpointId: handledEvent.params.turn.id,
         },
       ];
     }
@@ -1125,6 +1170,7 @@ export function translateCodexEventToDeltas(
           presentation: translation.presentation,
           providerTurnId: handledEvent.params.turnId,
         },
+        ...translateCodexAsyncQuestion(handledEvent.params.item),
       ];
     }
     case "item/agentMessage/delta":
@@ -1207,6 +1253,12 @@ export function translateCodexEventToDeltas(
             totalTokens: tokenUsage.total.totalTokens,
             inputTokens: tokenUsage.total.inputTokens,
             cachedInputTokens: tokenUsage.total.cachedInputTokens,
+            cacheReadInputTokens: tokenUsage.total.cachedInputTokens,
+            ...(tokenUsage.total.cacheWriteInputTokens === undefined
+              ? {}
+              : {
+                  cacheWriteInputTokens: tokenUsage.total.cacheWriteInputTokens,
+                }),
             outputTokens: tokenUsage.total.outputTokens,
             reasoningOutputTokens: tokenUsage.total.reasoningOutputTokens,
           },
@@ -1214,6 +1266,12 @@ export function translateCodexEventToDeltas(
             totalTokens: tokenUsage.last.totalTokens,
             inputTokens: tokenUsage.last.inputTokens,
             cachedInputTokens: tokenUsage.last.cachedInputTokens,
+            cacheReadInputTokens: tokenUsage.last.cachedInputTokens,
+            ...(tokenUsage.last.cacheWriteInputTokens === undefined
+              ? {}
+              : {
+                  cacheWriteInputTokens: tokenUsage.last.cacheWriteInputTokens,
+                }),
             outputTokens: tokenUsage.last.outputTokens,
             reasoningOutputTokens: tokenUsage.last.reasoningOutputTokens,
           },
@@ -1293,6 +1351,14 @@ export function translateCodexEventToDeltas(
           ...(handledEvent.params.details
             ? { details: handledEvent.params.details }
             : {}),
+        },
+      ];
+    case "warning":
+      return [
+        {
+          kind: "provider.warning",
+          category: "general",
+          summary: handledEvent.params.message,
         },
       ];
     case "configWarning":

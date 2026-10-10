@@ -1,3 +1,4 @@
+import { prependOlderTimelineRows } from "@bb/client-core";
 import { Command } from "commander";
 import {
   formatThreadTimelineText,
@@ -13,10 +14,15 @@ import {
   type ThreadTimelinePendingTodos,
   type WorkspaceStatus,
 } from "@bb/domain";
-import type { BbSdk } from "@bb/sdk";
+import { BbHttpError, type BbSdk } from "@bb/sdk";
 import type {
   EnvironmentDiffQuery,
   ThreadTimelineResponse,
+  TimelineConversationRow,
+} from "@bb/server-contract";
+import {
+  THREAD_EVENT_LIST_PAGE_SIZE,
+  THREAD_MESSAGE_CONTEXT_LIMIT,
 } from "@bb/server-contract";
 import { action } from "../../action.js";
 import { createCliBbSdk } from "../../client.js";
@@ -49,10 +55,11 @@ interface ThreadLogCommandOptions {
   limit?: string;
   afterSeq?: string;
   all?: boolean;
+  message?: string;
+  context?: string;
 }
 
 const THREAD_LOG_DEFAULT_EVENT_LIMIT = 100;
-const THREAD_LOG_ALL_EVENTS_PAGE_SIZE = 1000;
 const THREAD_LOG_TIMELINE_SEGMENT_LIMIT_MAX = 100;
 
 interface ThreadOutputCommandOptions {
@@ -190,6 +197,7 @@ export function registerShowCommand(
 ): void {
   parent
     .command("show [id]")
+    .aliases(["get", "view", "status"])
     .description("Show thread details and pull request status")
     .option("--self", "Target the current thread (from BB_THREAD_ID)")
     .option("--json", "Print machine-readable JSON output")
@@ -398,6 +406,7 @@ export function registerShowCommand(
 
   parent
     .command("log [id]")
+    .aliases(["messages", "timeline"])
     .description("Show thread event log")
     .option("--self", "Target the current thread (from BB_THREAD_ID)")
     .option(
@@ -421,11 +430,27 @@ export function registerShowCommand(
       "--all",
       "Print the whole thread by paging through every entry (cannot be combined with --limit)",
     )
+    .option(
+      "--message <seq>",
+      "Print one message: the msg value of a message link or @thread:<id>#msg=<seq> mention",
+    )
+    .option(
+      "--context <count>",
+      `With --message, also print up to this many messages before and after it (0-${THREAD_MESSAGE_CONTEXT_LIMIT})`,
+    )
     .action(
       action(async (id: string | undefined, opts: ThreadLogCommandOptions) => {
         const threadId = requireThreadIdOrSelf(id, opts);
         const sdk = createCliBbSdk(getUrl());
         const format = resolveThreadTimelineTextFormat(opts);
+
+        if (opts.message !== undefined) {
+          await printThreadLogMessage(sdk, { threadId, format, opts });
+          return;
+        }
+        if (opts.context !== undefined) {
+          throw new Error("--context requires --message");
+        }
 
         if (opts.all && opts.limit !== undefined) {
           throw new Error("--all cannot be combined with --limit");
@@ -487,7 +512,10 @@ export function registerShowCommand(
             beforeAnchorSeq: String(page.olderCursor.anchorSeq),
             beforeAnchorId: page.olderCursor.anchorId,
           });
-          rows = [...older.rows, ...rows];
+          rows = prependOlderTimelineRows({
+            olderRows: older.rows,
+            loadedRows: rows,
+          });
           page = older.timelinePage;
         }
         const color = process.stdout.isTTY === true && !process.env.NO_COLOR;
@@ -596,6 +624,62 @@ function printEnvironmentPullRequest(
   console.log(`    Merge:        ${pr.mergeability.state}`);
 }
 
+async function printThreadLogMessage(
+  sdk: BbSdk,
+  args: {
+    threadId: string;
+    format: ThreadTimelineTextFormat;
+    opts: ThreadLogCommandOptions;
+  },
+): Promise<void> {
+  const { format, opts, threadId } = args;
+  if (opts.all || opts.limit !== undefined || opts.afterSeq !== undefined) {
+    throw new Error(
+      "--message cannot be combined with --limit, --all or --after-seq",
+    );
+  }
+  if (opts.message === undefined || !/^(0|[1-9]\d*)$/u.test(opts.message)) {
+    throw new Error("--message must be a non-negative integer.");
+  }
+  const context = opts.context === undefined ? 0 : Number(opts.context);
+  if (
+    opts.context !== undefined &&
+    (!/^\d+$/u.test(opts.context) || context > THREAD_MESSAGE_CONTEXT_LIMIT)
+  ) {
+    throw new Error(
+      `--context must be an integer from 0 to ${THREAD_MESSAGE_CONTEXT_LIMIT}.`,
+    );
+  }
+  const result = await sdk.threads.message({
+    threadId,
+    seq: Number(opts.message),
+    before: context,
+    after: context,
+  });
+  if (format === "json") {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  const color = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const formatRows = (rows: readonly TimelineConversationRow[]) =>
+    formatThreadTimelineText([...rows], {
+      verbose: format === "verbose",
+      color,
+    });
+  if (context === 0) {
+    console.log(formatRows([result.message]));
+    return;
+  }
+  const sections = [
+    ...(result.before.length > 0
+      ? [`Before:\n${formatRows(result.before)}`]
+      : []),
+    `Message ${opts.message}:\n${formatRows([result.message])}`,
+    ...(result.after.length > 0 ? [`After:\n${formatRows(result.after)}`] : []),
+  ];
+  console.log(sections.join("\n\n"));
+}
+
 function parseThreadLogLimit<TDefault extends number | null>(
   value: string | undefined,
   defaultLimit: TDefault,
@@ -612,15 +696,69 @@ interface ThreadLogEventsPage {
   hasMore: boolean;
 }
 
+interface ThreadLogEventBatch {
+  pageSize: number;
+  rows: ThreadEventRow[];
+}
+
+async function listThreadLogEventBatch(
+  sdk: BbSdk,
+  args: {
+    threadId: string;
+    limit: number;
+    afterSeq: string | undefined;
+  },
+): Promise<ThreadLogEventBatch> {
+  let pageSize = args.limit;
+  for (;;) {
+    try {
+      const rows = await sdk.threads.events.list({
+        threadId: args.threadId,
+        limit: String(pageSize),
+        ...(args.afterSeq === undefined ? {} : { afterSeq: args.afterSeq }),
+      });
+      return { pageSize, rows };
+    } catch (error) {
+      if (
+        !(error instanceof BbHttpError) ||
+        error.status !== 413 ||
+        error.code !== "event_data_too_large" ||
+        pageSize === 1
+      ) {
+        throw error;
+      }
+      pageSize = Math.max(1, Math.ceil(pageSize / 2));
+    }
+  }
+}
+
+function growThreadLogEventPageSize(pageSize: number): number {
+  return Math.min(THREAD_EVENT_LIST_PAGE_SIZE, pageSize * 2);
+}
+
 async function listThreadLogEventsPage(
   sdk: BbSdk,
   args: { threadId: string; limit: number; afterSeq: string | undefined },
 ): Promise<ThreadLogEventsPage> {
-  const rows = await sdk.threads.events.list({
-    threadId: args.threadId,
-    limit: String(args.limit + 1),
-    ...(args.afterSeq === undefined ? {} : { afterSeq: args.afterSeq }),
-  });
+  const requestedRows = args.limit + 1;
+  const rows: ThreadEventRow[] = [];
+  let cursor = args.afterSeq;
+  let pageSize = THREAD_EVENT_LIST_PAGE_SIZE;
+  while (rows.length < requestedRows) {
+    const requestedPageSize = Math.min(pageSize, requestedRows - rows.length);
+    const page = await listThreadLogEventBatch(sdk, {
+      threadId: args.threadId,
+      limit: requestedPageSize,
+      afterSeq: cursor,
+    });
+    rows.push(...page.rows);
+    const last = page.rows.at(-1);
+    if (!last || page.rows.length < page.pageSize) {
+      break;
+    }
+    cursor = String(last.seq);
+    pageSize = growThreadLogEventPageSize(page.pageSize);
+  }
   const hasMore = rows.length > args.limit;
   return { rows: hasMore ? rows.slice(0, args.limit) : rows, hasMore };
 }
@@ -632,18 +770,20 @@ async function listAllThreadLogEvents(
 ): Promise<ThreadLogEventsPage> {
   const rows: ThreadEventRow[] = [];
   let cursor = afterSeq;
+  let pageSize = THREAD_EVENT_LIST_PAGE_SIZE;
   for (;;) {
-    const page = await sdk.threads.events.list({
+    const page = await listThreadLogEventBatch(sdk, {
       threadId,
-      limit: String(THREAD_LOG_ALL_EVENTS_PAGE_SIZE),
-      ...(cursor === undefined ? {} : { afterSeq: cursor }),
+      limit: pageSize,
+      afterSeq: cursor,
     });
-    rows.push(...page);
-    const last = page[page.length - 1];
-    if (last === undefined || page.length < THREAD_LOG_ALL_EVENTS_PAGE_SIZE) {
+    rows.push(...page.rows);
+    const last = page.rows.at(-1);
+    if (last === undefined || page.rows.length < page.pageSize) {
       return { rows, hasMore: false };
     }
     cursor = String(last.seq);
+    pageSize = growThreadLogEventPageSize(page.pageSize);
   }
 }
 

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import {
   access,
   chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -173,7 +174,10 @@ type RunConfigScript = (
 type ReadResolvedConfig = (
   overrides: EnvironmentOverrides,
 ) => Promise<ReadResolvedConfigResult>;
-type RunNativePrepScript = (appOutDir: string) => Promise<ScriptRunResult>;
+type RunNativePrepScript = (
+  appOutDir: string,
+  args?: string[],
+) => Promise<ScriptRunResult>;
 
 const createScriptEnvironment: CreateScriptEnvironment = (overrides) => {
   const env = { ...process.env };
@@ -223,10 +227,13 @@ const runConfigScript: RunConfigScript = async (overrides) => {
   };
 };
 
-const runNativePrepScript: RunNativePrepScript = async (appOutDir) => {
+const runNativePrepScript: RunNativePrepScript = async (
+  appOutDir,
+  args = [],
+) => {
   const child = spawn(
     process.execPath,
-    ["scripts/prepare-native-modules.cjs", appOutDir],
+    ["scripts/prepare-native-modules.cjs", appOutDir, ...args],
     {
       cwd: desktopPackageRoot,
     },
@@ -251,6 +258,14 @@ const runNativePrepScript: RunNativePrepScript = async (appOutDir) => {
     stdout: stdoutChunks.join(""),
   };
 };
+
+async function readStaticConfig(): Promise<ElectronBuilderConfig> {
+  const configText = await readFile(
+    resolve(desktopPackageRoot, "electron-builder.config.json"),
+    "utf8",
+  );
+  return electronBuilderConfigSchema.parse(JSON.parse(configText));
+}
 
 const readResolvedConfig: ReadResolvedConfig = async (overrides) => {
   const result = await runConfigScript(overrides);
@@ -290,22 +305,14 @@ describe("electron-builder signing config", () => {
   });
 
   it("unpacks the ESM bb-app bridge with an explicit module extension", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.asarUnpack).toContain("dist/bb-app-bridge.mjs");
     expect(config.asarUnpack).not.toContain("dist/bb-app-bridge.js");
   });
 
   it("runs a native module preparation hook after packaging", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
     const hookPath = "scripts/prepare-native-modules.cjs";
 
     expect(config.afterPack).toBe(hookPath);
@@ -317,7 +324,7 @@ describe("electron-builder signing config", () => {
   it("passes the standalone platform through to better-sqlite3 prebuild-install", () => {
     const { options } = nativeModulesScript.parseStandaloneArguments([
       "/tmp/linux-unpacked",
-      "--electron-version=41.7.0",
+      "--electron-version=44.3.0",
       "--arch=x64",
       "--platform=linux",
     ]);
@@ -334,7 +341,7 @@ describe("electron-builder signing config", () => {
       }),
     ).toEqual([
       "--runtime=electron",
-      "--target=41.7.0",
+      "--target=44.3.0",
       "--arch=x64",
       "--platform=linux",
     ]);
@@ -344,12 +351,12 @@ describe("electron-builder signing config", () => {
     expect(
       nativeModulesScript.resolveBetterSqlite3PrebuildArguments({
         arch: "arm64",
-        electronVersion: "41.7.0",
+        electronVersion: "44.3.0",
         platform: "darwin",
       }),
     ).toEqual([
       "--runtime=electron",
-      "--target=41.7.0",
+      "--target=44.3.0",
       "--arch=arm64",
       "--platform=darwin",
     ]);
@@ -371,31 +378,19 @@ describe("electron-builder signing config", () => {
   });
 
   it("disables in-place native rebuilds so the shared pnpm store is not mutated", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.npmRebuild).toBe(false);
   });
 
   it("excludes source maps from packaged app files", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.files).toContain("!**/*.map");
   });
 
   it("copies the app scaffold template as a dedicated file set", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.files).toContainEqual({
       filter: ["**/*"],
@@ -453,19 +448,58 @@ describe("electron-builder signing config", () => {
       await expect(readFile(unixTerminalPath, "utf8")).resolves.toContain(
         "helperPath.replace(/app\\.asar(?!\\.unpacked)/g, 'app.asar.unpacked')",
       );
-      expect((await stat(helperPath)).mode & 0o777).toBe(0o755);
-      expect((await stat(rebuiltHelperPath)).mode & 0o777).toBe(0o755);
+      if (process.platform !== "win32") {
+        expect((await stat(helperPath)).mode & 0o777).toBe(0o755);
+        expect((await stat(rebuiltHelperPath)).mode & 0o777).toBe(0o755);
+      }
     } finally {
       await rm(appOutDir, { force: true, recursive: true });
     }
   });
 
-  it("points mac signing entitlements at checked-in plist files", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
+  it("validates bundled N-API SQLite without using the legacy prebuild installer", async () => {
+    const appOutDir = await mkdtemp(resolve(tmpdir(), "bb-desktop-napi-"));
+    const nodeModules = resolve(appOutDir, "node_modules");
+    const requireFromRuntime = createRequire(
+      resolve(desktopPackageRoot, "../../packages/bb-app/package.json"),
     );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    try {
+      const ptyLib = resolve(nodeModules, "node-pty/lib");
+      await mkdir(ptyLib, { recursive: true });
+      await writeFile(
+        resolve(ptyLib, "unixTerminal.js"),
+        "helperPath = helperPath.replace('app.asar', 'app.asar.unpacked');",
+      );
+      await cp(
+        dirname(requireFromRuntime.resolve("better-sqlite3/package.json")),
+        resolve(nodeModules, "better-sqlite3"),
+        { recursive: true },
+      );
+      await mkdir(resolve(nodeModules, "@parcel/watcher"), { recursive: true });
+      const result = await runNativePrepScript(appOutDir, [
+        "--electron-version=44.3.0",
+      ]);
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+      const binaryPath = resolve(
+        nodeModules,
+        "better-sqlite3/prebuilds",
+        `${process.platform}-${process.arch}.node`,
+      );
+      await writeFile(binaryPath, "invalid native binary");
+      const invalidResult = await runNativePrepScript(appOutDir, [
+        "--electron-version=44.3.0",
+      ]);
+      expect(invalidResult.exitCode).not.toBe(0);
+      expect(invalidResult.stderr).toContain(binaryPath);
+      expect(invalidResult.stderr).not.toContain("prebuild-install");
+    } finally {
+      await rm(appOutDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("points mac signing entitlements at checked-in plist files", async () => {
+    const config = await readStaticConfig();
 
     expect(config.mac.entitlements).toBe("build/entitlements.mac.plist");
     expect(config.mac.entitlementsInherit).toBe(
@@ -481,11 +515,7 @@ describe("electron-builder signing config", () => {
   });
 
   it("packages macOS artifacts for arm64 only", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.mac.target).toEqual([
       { arch: ["arm64"], target: "dmg" },
@@ -494,11 +524,7 @@ describe("electron-builder signing config", () => {
   });
 
   it("packages a Linux AppImage for x64", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.linux).toMatchObject({
       category: "Development",
@@ -512,11 +538,7 @@ describe("electron-builder signing config", () => {
   });
 
   it("grants audio input to the signed app and helper processes", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
     const entitlementPaths = [
       config.mac.entitlements,
       config.mac.entitlementsInherit,
@@ -533,11 +555,7 @@ describe("electron-builder signing config", () => {
   });
 
   it("keeps the updater provider pointed at desktop-latest release assets", async () => {
-    const configText = await readFile(
-      resolve(desktopPackageRoot, "electron-builder.config.json"),
-      "utf8",
-    );
-    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const config = await readStaticConfig();
 
     expect(config.publish[0]).toMatchObject(DESKTOP_AUTO_UPDATE_FEED_CONFIG);
     expect(DESKTOP_AUTO_UPDATE_FEED_CONFIG.url).toBe(

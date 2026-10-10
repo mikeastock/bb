@@ -1,24 +1,23 @@
-import type {
-  ExperimentalAiInferenceCompleteInput,
-  ExperimentalAiInferenceCompleteOutput,
-  ExperimentalAiServiceErrorCode,
-  ExperimentalAiVoiceTranscribeInput,
-  ExperimentalAiVoiceTranscribeOutput,
-} from "@get-bb/plugin-sdk/ai-services";
 import type { JsonValue } from "@get-bb/plugin-sdk";
+import type { JsonObject } from "@get-bb/plugin-sdk/provider-bridge";
 import { fetchChatGpt, isCloudflareChallenge } from "./chatgpt-fetch.js";
+import type {
+  CodexAiCompleteInput,
+  CodexAiFailureCode,
+  CodexAiTranscribeInput,
+} from "./host-contract.js";
 import {
   parseJsonValue,
   readCodexAuthCredentials,
+  toJsonObject,
   type CodexAuthCredentials,
   type CodexChatGptAuthCredentials,
   type CodexOpenAiApiKeyCredentials,
-  type JsonObject,
 } from "./codex-auth.js";
 import { AiServiceFailure } from "./failure.js";
 
-type InferenceCompleteCommand = ExperimentalAiInferenceCompleteInput;
-type VoiceTranscribeCommand = ExperimentalAiVoiceTranscribeInput;
+type InferenceCompleteCommand = CodexAiCompleteInput;
+type VoiceTranscribeCommand = CodexAiTranscribeInput;
 
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_TRANSCRIBE_URL = "https://chatgpt.com/backend-api/transcribe";
@@ -40,6 +39,7 @@ interface TimeoutFetchArgs {
 interface CodexRequestDeadline {
   expiresAt: number;
   timeoutMs: number;
+  signal: AbortSignal;
 }
 
 interface ReadChunkWithTimeoutArgs {
@@ -104,25 +104,15 @@ interface CodexHttpErrorArgs {
   response: Response;
 }
 
-interface CodexResponseFormat {
-  type: "json_schema";
-  name: string;
-  strict: boolean;
-  schema: JsonValue;
-}
-
 interface CodexResponsesRequest {
   model: string;
   instructions: string;
   reasoning: {
-    effort: InferenceCompleteCommand["reasoningEffort"];
+    effort: "none";
   };
   store: boolean;
   stream: boolean;
   input: CodexInputMessage[];
-  text: {
-    format: CodexResponseFormat;
-  };
 }
 
 interface CodexInputMessage {
@@ -143,13 +133,6 @@ interface ResponseTextResult {
 interface CodexStreamFailure {
   code: string | null;
   message: string;
-}
-
-function jsonObject(value: JsonValue): JsonObject | null {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  return value;
 }
 
 function optionalString(value: JsonValue | undefined): string | null {
@@ -188,16 +171,23 @@ function createOpenAiResponsesHeaders(
   return headers;
 }
 
-function createCodexRequestDeadline(timeoutMs: number): CodexRequestDeadline {
+function createCodexRequestDeadline(
+  timeoutMs: number,
+  signal: AbortSignal,
+): CodexRequestDeadline {
   return {
     expiresAt: performance.now() + timeoutMs,
     timeoutMs,
+    signal,
   };
 }
 
 function remainingCodexRequestTimeoutMs(
   deadline: CodexRequestDeadline,
 ): number {
+  if (deadline.signal.aborted) {
+    throw codexRequestCancelledError();
+  }
   const remainingMs = Math.ceil(deadline.expiresAt - performance.now());
   if (remainingMs <= 0) {
     throw codexRequestTimeoutError(deadline.timeoutMs);
@@ -212,16 +202,30 @@ async function runWithTimeout(args: TimeoutFetchArgs): Promise<Response> {
     abortController.abort();
   }, timeoutMs);
   timeout.unref();
+  const cancel = (): void => abortController.abort();
+  args.deadline.signal.addEventListener("abort", cancel, { once: true });
   try {
     return await args.work(abortController.signal);
   } catch (error) {
+    if (args.deadline.signal.aborted) {
+      throw codexRequestCancelledError();
+    }
     if (abortController.signal.aborted) {
       throw codexRequestTimeoutError(args.deadline.timeoutMs);
     }
     throw error;
   } finally {
     clearTimeout(timeout);
+    args.deadline.signal.removeEventListener("abort", cancel);
   }
+}
+
+function codexRequestCancelledError(): AiServiceFailure {
+  return new AiServiceFailure(
+    "request_failed",
+    "codex_request_cancelled",
+    "Codex request was cancelled",
+  );
 }
 
 function codexRequestTimeoutError(timeoutMs: number): AiServiceFailure {
@@ -247,6 +251,7 @@ async function readChunkWithTimeout({
   ReadableStreamDefaultReader<Uint8Array>["read"]
 > {
   let timeout: ReturnType<typeof setTimeout> | null = null;
+  let cancel: (() => void) | null = null;
   const timeoutMs = remainingCodexRequestTimeoutMs(deadline);
   try {
     return await Promise.race([
@@ -256,11 +261,16 @@ async function readChunkWithTimeout({
           reject(codexRequestTimeoutError(deadline.timeoutMs));
         }, timeoutMs);
         timeout.unref();
+        cancel = () => reject(codexRequestCancelledError());
+        deadline.signal.addEventListener("abort", cancel, { once: true });
       }),
     ]);
   } finally {
     if (timeout) {
       clearTimeout(timeout);
+    }
+    if (cancel) {
+      deadline.signal.removeEventListener("abort", cancel);
     }
   }
 }
@@ -339,7 +349,7 @@ async function readErrorText(
   return text.length > 400 ? `${text.slice(0, 400)}...` : text;
 }
 
-type FailureCodes = [generic: ExperimentalAiServiceErrorCode, detail: string];
+type FailureCodes = [generic: CodexAiFailureCode, detail: string];
 
 function codexRequestErrorCode(status: number): FailureCodes {
   if (status === 401) {
@@ -387,7 +397,7 @@ function extractJsonErrorMessage(value: JsonValue): string | null {
     return null;
   }
 
-  const object = jsonObject(value);
+  const object = toJsonObject(value);
   if (!object) {
     return null;
   }
@@ -427,11 +437,6 @@ function isHtmlResponse(response: Response): boolean {
   );
 }
 
-const CODEX_API_KEY_ROUTE_HINT: Record<CodexRequestOperation, string> = {
-  inference: "BB_INFERENCE",
-  transcription: "BB_TRANSCRIPTION",
-};
-
 async function createCodexHttpError({
   deadline,
   operation,
@@ -442,7 +447,7 @@ async function createCodexHttpError({
     return new AiServiceFailure(
       "service_unavailable",
       "codex_service_unavailable",
-      `${prefix}: chatgpt.com answered with a Cloudflare challenge that bb cannot solve. Retry, or set ${CODEX_API_KEY_ROUTE_HINT[operation]} to an openai/ model with OPENAI_API_KEY.`,
+      `${prefix}: chatgpt.com answered with a Cloudflare challenge that bb cannot solve. Retry, or choose another service in Settings → AI services.`,
     );
   }
   const providerMessage = isHtmlResponse(response)
@@ -461,13 +466,13 @@ function getCodexResponseText(response: JsonObject): string | null {
     return null;
   }
   for (const outputItem of output) {
-    const item = jsonObject(outputItem);
+    const item = toJsonObject(outputItem);
     const content = item ? optionalJsonArray(item.content) : null;
     if (!content) {
       continue;
     }
     for (const contentItem of content) {
-      const contentObject = jsonObject(contentItem);
+      const contentObject = toJsonObject(contentItem);
       if (!contentObject) {
         continue;
       }
@@ -484,7 +489,7 @@ function getCodexResponseText(response: JsonObject): string | null {
 }
 
 function getCodexFailure(response: JsonObject): CodexStreamFailure | null {
-  const error = response.error ? jsonObject(response.error) : null;
+  const error = response.error ? toJsonObject(response.error) : null;
   if (!error) {
     return null;
   }
@@ -510,7 +515,7 @@ function extractTextFromSseEvent(event: JsonObject): ResponseTextResult {
   }
 
   if (type === "response.failed") {
-    const response = event.response ? jsonObject(event.response) : null;
+    const response = event.response ? toJsonObject(event.response) : null;
     return {
       failure: response
         ? (getCodexFailure(response) ?? {
@@ -530,7 +535,7 @@ function extractTextFromSseEvent(event: JsonObject): ResponseTextResult {
   }
 
   if (type === "response.completed" || type === "response.done") {
-    const response = event.response ? jsonObject(event.response) : null;
+    const response = event.response ? toJsonObject(event.response) : null;
     const text = response ? getCodexResponseText(response) : null;
     const failure = response ? getCodexFailure(response) : null;
     return {
@@ -575,9 +580,10 @@ async function readResponseTextFromSse(
   let deltaText = "";
   let finalText: string | null = null;
   let totalBytes = 0;
+  let completed = false;
 
   try {
-    while (true) {
+    while (!completed) {
       const chunk = await readChunkWithTimeout({
         deadline: args.deadline,
         reader,
@@ -609,9 +615,13 @@ async function readResponseTextFromSse(
           .map((line) => line.slice(5).trim())
           .join("\n")
           .trim();
-        if (eventData && eventData !== "[DONE]") {
+        if (eventData === "[DONE]") {
+          completed = true;
+          break;
+        }
+        if (eventData) {
           const eventValue = parseSseEventValue(eventData);
-          const event = jsonObject(eventValue);
+          const event = toJsonObject(eventValue);
           if (event) {
             const result = extractTextFromSseEvent(event);
             if (result.failure) {
@@ -620,15 +630,16 @@ async function readResponseTextFromSse(
                 result.failure.message,
               );
             }
+            if (
+              optionalString(event.type) === "response.completed" ||
+              optionalString(event.type) === "response.done"
+            ) {
+              finalText = result.text || null;
+              completed = true;
+              break;
+            }
             if (result.text) {
-              if (
-                optionalString(event.type) === "response.completed" ||
-                optionalString(event.type) === "response.done"
-              ) {
-                finalText = result.text;
-              } else {
-                deltaText += result.text;
-              }
+              deltaText += result.text;
             }
           }
         }
@@ -636,6 +647,9 @@ async function readResponseTextFromSse(
       }
     }
     buffer += decoder.decode();
+    if (completed) {
+      await cancelReaderBestEffort(reader);
+    }
   } catch (error) {
     await cancelReaderBestEffort(reader);
     throw error;
@@ -646,58 +660,10 @@ async function readResponseTextFromSse(
     throw new AiServiceFailure(
       "invalid_response",
       "codex_response_invalid",
-      "Codex response did not include structured output text.",
+      "Codex response did not include output text.",
     );
   }
   return text;
-}
-
-function parseStructuredResult(rawText: string): JsonObject {
-  let parsed: JsonValue;
-  try {
-    parsed = parseJsonValue(rawText);
-  } catch {
-    throw new AiServiceFailure(
-      "invalid_response",
-      "codex_response_invalid",
-      "Codex structured output was not valid JSON.",
-    );
-  }
-  const object = jsonObject(parsed);
-  if (!object) {
-    throw new AiServiceFailure(
-      "invalid_response",
-      "codex_response_invalid",
-      "Codex structured output was not a JSON object.",
-    );
-  }
-  return object;
-}
-
-function withStrictObjectSchemas(value: JsonValue): JsonValue {
-  if (Array.isArray(value)) {
-    return value.map((item) => withStrictObjectSchemas(item));
-  }
-
-  const object = jsonObject(value);
-  if (!object) {
-    return value;
-  }
-
-  const normalized: JsonObject = {};
-  for (const [key, childValue] of Object.entries(object)) {
-    normalized[key] = withStrictObjectSchemas(childValue);
-  }
-  if (
-    normalized.type === "object" &&
-    normalized.additionalProperties === undefined
-  ) {
-    normalized.additionalProperties = false;
-  }
-  if (normalized.type === "object") {
-    normalized.required = Object.keys(jsonObject(normalized.properties) ?? {});
-  }
-  return normalized;
 }
 
 function buildCodexResponsesRequest(
@@ -706,8 +672,8 @@ function buildCodexResponsesRequest(
   return {
     model: command.model,
     instructions:
-      "Follow the user prompt and respond with structured JSON that matches the requested schema.",
-    reasoning: { effort: command.reasoningEffort },
+      "Follow the user prompt. Reply with only the requested text, without quotes or commentary.",
+    reasoning: { effort: "none" },
     store: false,
     stream: true,
     input: [
@@ -721,14 +687,6 @@ function buildCodexResponsesRequest(
         ],
       },
     ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "result",
-        strict: true,
-        schema: withStrictObjectSchemas(command.outputSchema),
-      },
-    },
   };
 }
 
@@ -808,8 +766,9 @@ async function fetchResponses(args: ResponsesFetchArgs): Promise<Response> {
 
 export async function completeCodexInference(
   command: InferenceCompleteCommand,
-): Promise<Extract<ExperimentalAiInferenceCompleteOutput, { ok: true }>> {
-  const deadline = createCodexRequestDeadline(command.timeoutMs);
+  signal: AbortSignal,
+): Promise<string> {
+  const deadline = createCodexRequestDeadline(command.timeoutMs, signal);
   const auth = await readCodexAuthCredentials();
   const request = buildCodexResponsesRequest(command);
   const response = await fetchResponses({ auth, command, deadline, request });
@@ -822,16 +781,11 @@ export async function completeCodexInference(
     });
   }
 
-  const rawText = await readResponseTextFromSse(response, {
+  return readResponseTextFromSse(response, {
     deadline,
     maxBytes: CODEX_SSE_RESPONSE_MAX_BYTES,
     maxEventChars: CODEX_SSE_EVENT_MAX_CHARS,
   });
-  return {
-    ok: true,
-    model: command.model,
-    value: parseStructuredResult(rawText),
-  };
 }
 
 function buildAudioBlob(command: VoiceTranscribeCommand): Blob {
@@ -845,14 +799,14 @@ function buildTranscriptionFormData(command: VoiceTranscribeCommand): FormData {
   const formData = new FormData();
   formData.set("file", buildAudioBlob(command), command.filename);
   formData.set("model", command.model);
-  if (command.prompt !== null) {
-    formData.set("prompt", command.prompt);
+  if (command.hint !== null) {
+    formData.set("prompt", command.hint);
   }
   return formData;
 }
 
 function parseTranscriptionText(value: JsonValue): string {
-  const object = jsonObject(value);
+  const object = toJsonObject(value);
   const text = object ? optionalString(object.text) : null;
   if (text === null) {
     throw new AiServiceFailure(
@@ -927,8 +881,9 @@ async function fetchTranscription(
 
 export async function transcribeCodexVoice(
   command: VoiceTranscribeCommand,
-): Promise<Extract<ExperimentalAiVoiceTranscribeOutput, { ok: true }>> {
-  const deadline = createCodexRequestDeadline(command.timeoutMs);
+  signal: AbortSignal,
+): Promise<string> {
+  const deadline = createCodexRequestDeadline(command.timeoutMs, signal);
   const auth = await readCodexAuthCredentials();
   const response = await fetchTranscription({ auth, command, deadline });
 
@@ -946,9 +901,5 @@ export async function transcribeCodexVoice(
     overflowBehavior: "throw",
   });
 
-  return {
-    ok: true,
-    model: command.model,
-    text: parseTranscriptionText(parseTranscriptionResponse(responseText)),
-  };
+  return parseTranscriptionText(parseTranscriptionResponse(responseText));
 }

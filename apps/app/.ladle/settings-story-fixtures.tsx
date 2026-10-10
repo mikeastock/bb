@@ -1,8 +1,6 @@
-import { useState, type ReactNode } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useState, type ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
-import { PERSONAL_PROJECT_ID, type ProviderInfo } from "@bb/domain";
-import { UPDATE_ACTION_ICON } from "@bb/domain/update-state";
+import { PERSONAL_PROJECT_ID, type Host, type ProviderInfo } from "@bb/domain";
 import type {
   SidebarBootstrapResponse,
   SystemVersionResponse,
@@ -11,8 +9,10 @@ import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
 import {
   hostProviderCliStatusQueryKey,
   hostsQueryKey,
+  machineEnvironmentQueryKey,
   pluginListQueryKey,
   pluginMarketplacesQueryKey,
+  serverMoveStatusQueryKey,
   sidebarNavigationQueryKey,
   systemConfigQueryKey,
   systemProvidersQueryKey,
@@ -24,26 +24,47 @@ import {
 } from "../src/hooks/useUpdateInventory";
 import { createAppQueryClient } from "../src/lib/query-client";
 import { makeSystemConfig } from "../src/test/fixtures/system-config";
-import { makeProviderInfo } from "../src/test/provider-info-fixture";
-import { getSettingsRoutePath } from "../src/lib/route-paths";
+import { systemMachineProvidersQueryKey } from "../src/hooks/queries/query-keys";
+import {
+  MANUAL_MACHINE_PROVIDER,
+  MODAL_MACHINE_PROVIDER,
+} from "./machine-story-fixtures";
+import { makeProviderInfo } from "@bb/test-helpers/domain-fixtures";
 import {
   BbAppUpdateRows,
-  MachineUpdatesRows,
-  MachineUpdatesSection,
-  UpdateActionButton,
+  BbUpdatesCard,
+  ProviderCliUpdatesSection,
 } from "../src/components/settings/UpdatesSettingsSection";
 import {
   HOST_IDS,
   HOST_NAMES,
   PROJECT_IDS,
+  PROJECT_NAMES,
   STORY_PROJECT_SOURCES,
   makeHost,
   makeProject,
+  makeThreadListEntry,
   makeProviderCliStatus,
 } from "./story-fixtures";
 import codexLogoUrl from "../../../plugins/provider-codex/icons/codex.svg";
 import claudeCodeLogoUrl from "../../../plugins/provider-claude-code/icons/claude-code.svg";
 import cursorLogoUrl from "../../../plugins/provider-acp/icons/cursor.svg";
+
+const STORY_GIT_HEALTH = {
+  status: "logged in" as const,
+  statusMessage: "gh is authenticated",
+};
+
+const STORY_GLOBAL_VARIABLES = [
+  { name: "ANTHROPIC_API_KEY", value: null, secret: true as const, note: null },
+  {
+    name: "DATABASE_URL",
+    value: null,
+    secret: true as const,
+    note: "Points at the staging replica, not production.",
+  },
+  { name: "SENTRY_DSN", value: null, secret: true as const, note: null },
+];
 
 const SETTINGS_STORY_NOW = Date.parse("2026-08-19T08:00:00.000Z");
 
@@ -110,7 +131,31 @@ const remoteProviderStatus = {
 
 const project = makeProject({
   id: PROJECT_IDS.bb,
+  gitRemoteUrl: "git@github.com:get-bb/bb.git",
   sources: [...STORY_PROJECT_SOURCES],
+});
+const pierreProject = makeProject({
+  id: PROJECT_IDS.pierre,
+  name: PROJECT_NAMES.pierre,
+  gitRemoteUrl: "https://github.com/get-bb/pierre.git",
+  sources: [
+    {
+      id: "src_pierre_remote",
+      projectId: PROJECT_IDS.pierre,
+      type: "local_path",
+      hostId: HOST_IDS.remote,
+      path: "/home/michael/pierre",
+      isDefault: true,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  ],
+});
+const ingestProject = makeProject({
+  id: PROJECT_IDS.ingest,
+  name: PROJECT_NAMES.ingest,
+  gitRemoteUrl: null,
+  sources: [],
 });
 const personalProject = makeProject({
   id: PERSONAL_PROJECT_ID,
@@ -121,7 +166,28 @@ const personalProject = makeProject({
 
 const sidebarNavigation = {
   sections: [],
-  projects: [{ ...project, defaultExecutionOptions: null, threads: [] }],
+  projects: [
+    {
+      ...project,
+      defaultExecutionOptions: null,
+      threads: [
+        makeThreadListEntry({ id: "thr_bb_1", projectId: PROJECT_IDS.bb }),
+        makeThreadListEntry({ id: "thr_bb_2", projectId: PROJECT_IDS.bb }),
+        makeThreadListEntry({ id: "thr_bb_3", projectId: PROJECT_IDS.bb }),
+      ],
+    },
+    {
+      ...pierreProject,
+      defaultExecutionOptions: null,
+      threads: [
+        makeThreadListEntry({
+          id: "thr_pierre_1",
+          projectId: PROJECT_IDS.pierre,
+        }),
+      ],
+    },
+    { ...ingestProject, defaultExecutionOptions: null, threads: [] },
+  ],
   personalProject: {
     ...personalProject,
     defaultExecutionOptions: null,
@@ -139,6 +205,8 @@ const systemConfig = makeSystemConfig({
 const systemVersion = {
   currentVersion: "0.39.0",
   latestVersion: "0.39.0",
+  currentCommit: null,
+  installKind: "npm",
   source: "npm",
   updateAvailable: false,
   isDevelopment: false,
@@ -175,28 +243,13 @@ const settingsUpdateMachine = {
 } satisfies UpdateInventoryMachine;
 
 const noJobs: ReadonlySet<string> = new Set();
+const noFailures = new Map<string, never>();
 const noop = () => {};
 
 export function SettingsUpdatesStory() {
-  const navigate = useNavigate();
   return (
     <div className="space-y-6">
-      <MachineUpdatesSection
-        machine={settingsUpdateMachine}
-        isThisMachine={false}
-        action={
-          <div role="toolbar" aria-label="Bulk update actions">
-            <UpdateActionButton
-              label="Update all 1 CLI tool"
-              tooltipLabel="Update all"
-              icon={UPDATE_ACTION_ICON}
-              visibleLabel="Update all"
-              variant="default"
-              onClick={noop}
-            />
-          </div>
-        }
-      >
+      <BbUpdatesCard>
         <BbAppUpdateRows
           systemVersion={systemVersion}
           desktopInfo={null}
@@ -204,19 +257,26 @@ export function SettingsUpdatesStory() {
           onRelaunchDesktop={null}
           onRetryDesktop={null}
         />
-        <MachineUpdatesRows
-          machine={settingsUpdateMachine}
-          runningJobKey={null}
-          queuedJobKeys={noJobs}
-          onStartInstall={noop}
-          onOpenProvider={() => navigate(getSettingsRoutePath("providers"))}
-        />
-      </MachineUpdatesSection>
+      </BbUpdatesCard>
+      <ProviderCliUpdatesSection
+        machines={[settingsUpdateMachine]}
+        now={0}
+        localDaemonHostId={null}
+        serverHostId={null}
+        retryPendingHostId={null}
+        runningJobKey={null}
+        queuedJobKeys={noJobs}
+        failuresByJobKey={noFailures}
+        onStartInstall={noop}
+        onRetryDaemonUpdate={noop}
+        onRetryAllDaemonUpdates={noop}
+        onRecheckClis={noop}
+      />
     </div>
   );
 }
 
-function createSettingsStoryQueryClient() {
+function createSettingsStoryQueryClient(hosts: Host[] = SETTINGS_STORY_HOSTS) {
   const queryClient = createAppQueryClient({
     showMutationErrorToasts: false,
     defaultOptions: {
@@ -228,12 +288,30 @@ function createSettingsStoryQueryClient() {
       },
     },
   });
-  queryClient.setQueryData(hostsQueryKey(), SETTINGS_STORY_HOSTS);
+  queryClient.setQueryData(hostsQueryKey(), hosts);
+  queryClient.setQueryData(hostsQueryKey(true), hosts);
   queryClient.setQueryData(systemConfigQueryKey(), systemConfig);
   queryClient.setQueryData(systemProvidersQueryKey(), systemProviders);
   queryClient.setQueryData(systemVersionQueryKey(), systemVersion);
   queryClient.setQueryData(sidebarNavigationQueryKey(), sidebarNavigation);
   queryClient.setQueryData(pluginMarketplacesQueryKey(), []);
+  queryClient.setQueryData(machineEnvironmentQueryKey(null), {
+    builtInGit: STORY_GIT_HEALTH,
+    variables: STORY_GLOBAL_VARIABLES,
+    inheritedVariables: [],
+  });
+  queryClient.setQueryData(machineEnvironmentQueryKey(PROJECT_IDS.bb), {
+    builtInGit: STORY_GIT_HEALTH,
+    variables: [
+      {
+        name: "DATABASE_URL",
+        value: null,
+        secret: true,
+        note: "Points at the bb sandbox.",
+      },
+    ],
+    inheritedVariables: STORY_GLOBAL_VARIABLES,
+  });
   queryClient.setQueryData(
     hostProviderCliStatusQueryKey(HOST_IDS.local),
     localProviderStatus,
@@ -243,11 +321,29 @@ function createSettingsStoryQueryClient() {
     remoteProviderStatus,
   );
   queryClient.setQueryData(pluginListQueryKey(true), []);
+  queryClient.setQueryData(serverMoveStatusQueryKey(), {
+    move: null,
+    lastMove: null,
+  });
+  queryClient.setQueryData(systemMachineProvidersQueryKey(), [
+    MANUAL_MACHINE_PROVIDER,
+    MODAL_MACHINE_PROVIDER,
+  ]);
   return queryClient;
 }
 
-export function SettingsStoryFixtures({ children }: { children: ReactNode }) {
-  const [queryClient] = useState(createSettingsStoryQueryClient);
+export function SettingsStoryFixtures({
+  children,
+  hosts = SETTINGS_STORY_HOSTS,
+}: {
+  children: ReactNode;
+  hosts?: Host[];
+}) {
+  const [queryClient] = useState(() => createSettingsStoryQueryClient(hosts));
+  useEffect(() => {
+    queryClient.setQueryData(hostsQueryKey(), hosts);
+    queryClient.setQueryData(hostsQueryKey(true), hosts);
+  }, [hosts, queryClient]);
   return (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );

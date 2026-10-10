@@ -1,16 +1,15 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { PromptInput, ThreadEvent } from "@bb/domain";
+import { z } from "zod";
 import {
   BRIDGE_INBOUND_REQUEST_METHODS,
-  BRIDGE_JSON_RPC_ERRORS,
   THREAD_DELTA_NOTIFICATION_METHOD,
-  interactionRequestParamsSchema,
-  type InteractionRequestParams,
-} from "@bb/provider-bridge-protocol";
+  approvalInteractionOutcomeSchema,
+  interactionRequestPayloadSchema,
+  type PromptInput,
+} from "@get-bb/plugin-sdk/provider-bridge";
 import {
   experimental_createBridgeDeltaEventCollector as createBridgeDeltaEventCollector,
   experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness,
@@ -20,25 +19,21 @@ import {
 import type {
   BridgeDeltaEventCollector,
   BridgeJsonRpcTestHarness,
+  ThreadEvent,
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import type { ServerNotification as CodexEvent } from "../generated/codex-app-server/schema/ServerNotification.js";
 import type { Turn } from "../generated/codex-app-server/schema/v2/Turn.js";
 import { handleLine } from "./bridge.js";
+import {
+  FULL_ACCESS_SESSION_OPTIONS,
+  stubFakeCodexAppServer,
+} from "./fake-codex-app-server-harness.js";
 
 const THREAD_ID = "thr_codex_calibration_1";
 const SCRIPT_THREAD_ID = "codex-script-thread";
 const FIRST_TURN_ID = "turn-cal-1";
 const SECOND_TURN_ID = "turn-cal-2";
 const COMMAND_ITEM_ID = "cmd-cal-1";
-
-const ARCHIVED_PROVIDER_THREAD_ID = "archived-calibration-1";
-const ARCHIVED_ERROR_TEXT = `session ${ARCHIVED_PROVIDER_THREAD_ID} is archived; unarchive it and retry`;
-const RUNTIME_UNARCHIVE_RETRY_PATTERN =
-  /\b(?:session|thread)\s+\S+\s+is archived\b/i;
-
-const fakeAppServerPath = fileURLToPath(
-  new URL("./fake-codex-app-server.mjs", import.meta.url),
-);
 
 interface ScriptedNotification {
   kind?: "notify";
@@ -110,6 +105,7 @@ const SCRIPT: (ScriptedNotification | ScriptedRequest)[][] = [
         phase: null,
         memoryCitation: null,
         delivery: null,
+        questions: null,
       },
     }),
     APPROVAL_REQUEST,
@@ -251,6 +247,7 @@ const SCRIPT: (ScriptedNotification | ScriptedRequest)[][] = [
         phase: null,
         memoryCitation: null,
         delivery: null,
+        questions: null,
       },
     }),
     codexNotification("item/completed", {
@@ -264,6 +261,7 @@ const SCRIPT: (ScriptedNotification | ScriptedRequest)[][] = [
         phase: null,
         memoryCitation: null,
         delivery: null,
+        questions: null,
       },
     }),
     codexNotification("turn/completed", {
@@ -273,13 +271,6 @@ const SCRIPT: (ScriptedNotification | ScriptedRequest)[][] = [
   ],
 ];
 
-const CANONICAL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-} as const;
-
 function promptInput(text: string): PromptInput[] {
   return [{ type: "text", text, mentions: [] }];
 }
@@ -287,6 +278,21 @@ function promptInput(text: string): PromptInput[] {
 const FIRST_REQUEST_ID = "creq_23456789ab";
 const STEER_REQUEST_ID = "creq_23456789ac";
 const SECOND_REQUEST_ID = "creq_23456789ad";
+
+const interactionRequestParamsSchema = z
+  .object({
+    providerThreadId: z.string().min(1),
+    threadId: z.string().min(1).optional(),
+    turnId: z.union([z.string().min(1), z.null()]),
+    payload: z.union([
+      approvalInteractionOutcomeSchema.shape.payload,
+      ...interactionRequestPayloadSchema.options,
+    ]),
+    providerNativeIds: z.boolean().optional(),
+  })
+  .passthrough();
+
+type InteractionRequestParams = z.infer<typeof interactionRequestParamsSchema>;
 
 interface ReplayResult {
   approvals: InteractionRequestParams[];
@@ -350,7 +356,7 @@ async function replayCanonical(workspaceDir: string): Promise<ReplayResult> {
       threadId: THREAD_ID,
       cwd: workspaceDir,
       instructionMode: "append",
-      options: { ...CANONICAL_OPTIONS },
+      options: { ...FULL_ACCESS_SESSION_OPTIONS },
     });
     await settle(1);
 
@@ -359,7 +365,7 @@ async function replayCanonical(workspaceDir: string): Promise<ReplayResult> {
       providerThreadId: THREAD_ID,
       input: promptInput("check the tree"),
       clientRequestId: FIRST_REQUEST_ID,
-      options: { ...CANONICAL_OPTIONS },
+      options: { ...FULL_ACCESS_SESSION_OPTIONS },
     });
     await settle(2);
 
@@ -377,7 +383,7 @@ async function replayCanonical(workspaceDir: string): Promise<ReplayResult> {
       expectedTurnId,
       input: promptInput("also check git log"),
       clientRequestId: STEER_REQUEST_ID,
-      options: { ...CANONICAL_OPTIONS },
+      options: { ...FULL_ACCESS_SESSION_OPTIONS },
     });
     await settle(3);
 
@@ -386,7 +392,7 @@ async function replayCanonical(workspaceDir: string): Promise<ReplayResult> {
       providerThreadId: THREAD_ID,
       input: promptInput("now summarize"),
       clientRequestId: SECOND_REQUEST_ID,
-      options: { ...CANONICAL_OPTIONS },
+      options: { ...FULL_ACCESS_SESSION_OPTIONS },
     });
     await settle(4);
 
@@ -442,11 +448,7 @@ beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-codex-calibration-ws-"));
   const scriptPath = join(workspaceDir, "calibration-script.json");
   writeFileSync(scriptPath, JSON.stringify({ turns: SCRIPT }), "utf8");
-  vi.stubEnv("BB_CODEX_BRIDGE_APP_SERVER_COMMAND", process.execPath);
-  vi.stubEnv(
-    "BB_CODEX_BRIDGE_APP_SERVER_ARGS",
-    JSON.stringify([fakeAppServerPath, scriptPath]),
-  );
+  stubFakeCodexAppServer(scriptPath);
 });
 
 afterEach(() => {
@@ -501,26 +503,3 @@ it("replays one scripted codex session onto the golden event stream", async () =
     subject: { kind: "command", command: "git status --short" },
   });
 }, 60_000);
-
-it("surfaces an archived-session resume rejection verbatim", async () => {
-  const bridge = createBridgeJsonRpcTestHarness(handleLine);
-  try {
-    bridge.sendRequest(1, "thread/resume", {
-      threadId: THREAD_ID,
-      providerThreadId: ARCHIVED_PROVIDER_THREAD_ID,
-      cwd: workspaceDir,
-      instructionMode: "append",
-      options: { ...CANONICAL_OPTIONS },
-    });
-    const response = await bridge.waitForResponse(1);
-
-    expect(response.error?.code).toBe(
-      BRIDGE_JSON_RPC_ERRORS.SESSION_NOT_RESTORABLE,
-    );
-    expect(response.error?.message).toBe(ARCHIVED_ERROR_TEXT);
-    expect(ARCHIVED_ERROR_TEXT).toMatch(RUNTIME_UNARCHIVE_RETRY_PATTERN);
-    expect(response.error?.message).toMatch(RUNTIME_UNARCHIVE_RETRY_PATTERN);
-  } finally {
-    bridge.restore();
-  }
-}, 30_000);

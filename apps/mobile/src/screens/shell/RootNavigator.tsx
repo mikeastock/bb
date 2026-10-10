@@ -65,15 +65,22 @@ export function RootNavigator() {
           ...headerSurface,
           headerShadowVisible: false,
           headerLargeTitleShadowVisible: false,
-          headerTintColor: tokens.primary,
-          headerTitleStyle: { fontWeight: "600", color: tokens.foreground },
+          headerTintColor: IS_IOS ? tokens.primary : tokens.foreground,
+          headerTitleStyle: {
+            fontWeight: "600",
+            color: tokens.foreground,
+            ...(IS_IOS ? {} : { fontSize: 17 }),
+          },
           headerLargeTitleStyle: { color: tokens.foreground },
           headerBackButtonDisplayMode: "minimal",
           contentStyle: { backgroundColor: tokens.background },
         }}
       >
         <Stack.Screen name="index" options={hiddenHeader} />
-        <Stack.Screen name="webview" options={hiddenHeader} />
+        <Stack.Screen
+          name="webview"
+          options={{ ...hiddenHeader, gestureEnabled: false }}
+        />
         <Stack.Screen
           name="settings/device"
           options={{ title: "This device", ...listScreen }}

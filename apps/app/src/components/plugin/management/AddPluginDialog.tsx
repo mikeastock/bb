@@ -2,9 +2,9 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   CURATED_PLUGIN_MARKETPLACE_NAME,
-  type InstalledPlugin,
   type PluginCatalogInstallPlan,
   type PluginCatalogResolvedSource,
+  type PluginInstallJob,
 } from "@bb/server-contract";
 import { Button } from "@bb/shared-ui/button";
 import {
@@ -17,23 +17,19 @@ import {
 } from "@bb/shared-ui/dialog";
 import { Icon } from "@bb/shared-ui/icon";
 import { Input } from "@bb/shared-ui/input";
-import { appToast } from "@/components/ui/app-toast.js";
 import { pluginAdminErrorMessage } from "@/lib/plugin-admin-error";
+import { applyPluginInstallJob } from "@/hooks/cache-owners/plugin-cache-owner";
+import { useCatalogInstallPlan } from "@/hooks/queries/plugin-catalog-queries";
 import {
-  applyInstalledPlugin,
-  invalidatePluginCatalogSearch,
-  invalidatePluginList,
-} from "@/hooks/cache-owners/plugin-cache-owner";
-import {
-  installCatalogPlugin,
-  installPlugin,
-  useCatalogInstallPlan,
-} from "@/hooks/queries/plugin-catalog-queries";
+  startCatalogPluginInstall,
+  startPluginInstall,
+} from "@/hooks/queries/plugin-install-job-queries";
 import { CatalogEntryIcon, FullTrustWarning } from "./plugin-ui";
 
 export type AddPluginInitial = {
   entryId: string;
   marketplace: string;
+  pluginId: string;
   publisherLabel: string;
   displayName: string;
   icon: string | null;
@@ -58,14 +54,14 @@ function catalogInstallDescription(
 interface AddPluginDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onInstalled?: (plugin: InstalledPlugin) => void;
+  onInstallStarted?: (job: PluginInstallJob) => void;
   initial?: AddPluginInitial | null;
 }
 
 export function AddPluginDialog({
   open,
   onOpenChange,
-  onInstalled,
+  onInstallStarted,
   initial,
 }: AddPluginDialogProps) {
   return (
@@ -75,7 +71,7 @@ export function AddPluginDialog({
           <AddPluginDialogContent
             initial={initial ?? null}
             onOpenChange={onOpenChange}
-            onInstalled={onInstalled}
+            onInstallStarted={onInstallStarted}
           />
         ) : null}
       </DialogContent>
@@ -148,10 +144,12 @@ function ThirdPartySourceDisclosure({
   plan,
   pending,
   error,
+  onRetry,
 }: {
   plan: PluginCatalogInstallPlan | undefined;
   pending: boolean;
   error: unknown;
+  onRetry: () => void;
 }) {
   if (pending) {
     return (
@@ -161,11 +159,47 @@ function ThirdPartySourceDisclosure({
     );
   }
   if (error !== null && error !== undefined) {
+    const status =
+      error instanceof Error &&
+      "status" in error &&
+      typeof error.status === "number"
+        ? error.status
+        : null;
+    const retryable =
+      status === null || status === 408 || status === 429 || status >= 500;
+    const message =
+      status === 401 || status === 403
+        ? "Source access denied. Check repository permissions."
+        : status === 404
+          ? "Source not found. Check the marketplace listing."
+          : retryable
+            ? "Source unavailable. Try again."
+            : "Invalid source. Check the marketplace listing.";
     return (
-      <p className="text-2xs text-warning-text" role="status">
-        Could not resolve this listing&rsquo;s source:{" "}
-        {pluginAdminErrorMessage(error)}
-      </p>
+      <div
+        className="flex items-center gap-3 rounded-md border border-warning/20 bg-warning/5 p-3"
+        role="alert"
+      >
+        <Icon
+          name="AlertTriangle"
+          className="size-4 shrink-0 text-warning-text"
+          aria-hidden
+        />
+        <p className="min-w-0 flex-1 text-xs leading-normal text-foreground">
+          {message}
+        </p>
+        {retryable ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 shrink-0 px-2 text-xs"
+            onClick={onRetry}
+          >
+            Retry
+          </Button>
+        ) : null}
+      </div>
     );
   }
   if (plan === undefined || plan.kind !== "marketplace" || plan.official) {
@@ -227,11 +261,11 @@ function ThirdPartySourceDisclosure({
 function AddPluginDialogContent({
   initial,
   onOpenChange,
-  onInstalled,
+  onInstallStarted,
 }: {
   initial: AddPluginInitial | null;
   onOpenChange: (open: boolean) => void;
-  onInstalled?: (plugin: InstalledPlugin) => void;
+  onInstallStarted?: (job: PluginInstallJob) => void;
 }) {
   const queryClient = useQueryClient();
   const [sourceText, setSourceText] = useState("");
@@ -248,28 +282,21 @@ function AddPluginDialogContent({
   const plan = planQuery.data;
 
   const install = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: (body: NonNullable<typeof request>) =>
       body.kind === "catalog"
-        ? installCatalogPlugin(fetch, {
+        ? startCatalogPluginInstall(fetch, {
             entryId: body.entryId,
             marketplace: body.marketplace,
             ...(thirdParty && plan?.kind === "marketplace"
               ? { confirmedSource: plan.resolvedSource }
               : {}),
           })
-        : installPlugin(fetch, body.source),
-    onSuccess: (plugin) => {
-      applyInstalledPlugin({ queryClient, plugin });
-      invalidatePluginList({ queryClient });
-      invalidatePluginCatalogSearch({ queryClient });
-      appToast.success(`${initial?.displayName ?? "Plugin"} installed`);
+        : startPluginInstall(fetch, body.source),
+    onSuccess: (job) => {
+      applyPluginInstallJob({ queryClient, job });
       onOpenChange(false);
-      onInstalled?.(plugin);
-    },
-    onError: (error) => {
-      appToast.error("Installing the plugin failed", {
-        description: pluginAdminErrorMessage(error),
-      });
+      onInstallStarted?.(job);
     },
   });
 
@@ -302,7 +329,6 @@ function AddPluginDialogContent({
                 {initial.entryId}
               </span>
             </div>
-            {}
             <p className="overflow-x-auto whitespace-nowrap font-mono text-2xs text-subtle-foreground">
               {initial.source}
             </p>
@@ -328,22 +354,22 @@ function AddPluginDialogContent({
             plan={plan}
             pending={planQuery.isPending}
             error={planQuery.error}
+            onRetry={() => void planQuery.refetch()}
           />
         ) : null}
 
-        {install.isPending ? (
-          <div
-            className="h-0.5 overflow-hidden rounded-full bg-border"
-            role="progressbar"
-            aria-label="Installing plugin"
+        {install.isError ? (
+          <p
+            role="alert"
+            className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-xs text-warning-text"
           >
-            <div className="h-full w-1/3 animate-indeterminate-progress rounded-full bg-muted-foreground" />
-          </div>
-        ) : (
-          <FullTrustWarning />
-        )}
+            {pluginAdminErrorMessage(install.error)}
+          </p>
+        ) : null}
+
+        <FullTrustWarning />
       </div>
-      <DialogFooter>
+      <DialogFooter className="gap-2">
         <Button
           type="button"
           variant="outline"
@@ -367,9 +393,7 @@ function AddPluginDialogContent({
           {install.isPending ? (
             <Icon name="Spinner" className="animate-spin" />
           ) : null}
-          {install.isPending
-            ? `Installing ${initial?.displayName ?? "plugin"}…`
-            : `Install ${initial?.displayName ?? "plugin"}`}
+          {`Install ${initial?.displayName ?? "plugin"}`}
         </Button>
       </DialogFooter>
     </>

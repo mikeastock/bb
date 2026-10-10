@@ -3,13 +3,16 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPluginHost } from "./build-plugin-host.js";
 import { resolvePluginBuildToolchain } from "./toolchain.js";
@@ -239,6 +242,7 @@ describe("plugin host build", () => {
       JSON.stringify({
         name: "bb-plugin-host-bridge-fixture",
         version: "1.0.0",
+        type: "module",
         engines: { bb: ">=0.0" },
         bb: {
           name: "Bridge surface fixture",
@@ -256,7 +260,8 @@ describe("plugin host build", () => {
     await writeFile(
       join(dir, "host.ts"),
       [
-        'import { experimental_defineProviderBridge, threadDeltaSchema, threadStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";',
+        'import { experimental_compareVersions, experimental_defineProviderBridge, threadDeltaSchema, threadStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";',
+        "export const compareVersions = experimental_compareVersions;",
         "export const experimental_providerBridge = experimental_defineProviderBridge({",
         "  handleLine(line) {",
         "    threadStartParamsSchema.safeParse(JSON.parse(line));",
@@ -274,6 +279,17 @@ describe("plugin host build", () => {
     const bundle = await readFile(result.jsPath, "utf8");
     expect(bundle).not.toMatch(/from\s*"@bb\//u);
     expect(bundle).toContain("experimental_apiVersion");
+    expect(bundle).not.toMatch(/(?:from\s*|require\()["']semver/u);
+    const builtEntry = await import(
+      `${pathToFileURL(result.jsPath).href}?test=${Date.now()}`
+    );
+    expect(
+      builtEntry.compareVersions("1.0.0-beta.9", "1.0.0-beta.10"),
+    ).toBeLessThan(0);
+    expect(
+      builtEntry.compareVersions("1.0.0-rc.10", "1.0.0-rc.2"),
+    ).toBeGreaterThan(0);
+    expect(() => builtEntry.compareVersions("invalid", "0.0.0")).toThrow();
   });
 
   describe("host contract imports without a usable SDK", () => {
@@ -348,53 +364,137 @@ describe("plugin host build", () => {
       await expect(
         buildPluginHost(dir, "0.9.0-test", await testToolchain()),
       ).rejects.toThrow(
-        `"@get-bb/plugin-sdk/host" is installed for this plugin but its dist is not built: run the SDK build (${join(sdkDir, "dist", "host.js")} is missing); a host entry that imports experimental_nativeRootsHostContract needs the built SDK`,
+        `"@get-bb/plugin-sdk/host" is installed for this plugin but its dist is not built: run the SDK build (${join(await realpath(sdkDir), "dist", "host.js")} is missing); a host entry that imports experimental_nativeRootsHostContract needs the built SDK`,
       );
     });
   });
 
-  it("rejects relative type imports into private BB workspace packages", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "bb-host-relative-private-"));
+  it.each([
+    [
+      "dead dynamic import",
+      'if (false) import("../private-package/index.js"); export default 1;',
+    ],
+    [
+      "dead require",
+      'if (false) require("../private-package/index.js"); export default 1;',
+    ],
+    [
+      "relative value",
+      'import { value } from "../private-package/index.js"; export default value;',
+    ],
+    [
+      "erased value",
+      'import { value } from "../private-package/index.js"; export default 1;',
+    ],
+    [
+      "relative re-export",
+      'export { value as default } from "../private-package/index.js";',
+    ],
+    [
+      "dynamic import",
+      'export default () => import("../private-package/index.js");',
+    ],
+    ["require", 'export default require("../private-package/index.js");'],
+    [
+      "JSON",
+      'import value from "../private-package/value.json"; export default value;',
+    ],
+    [
+      "symlink",
+      'import { value } from "./linked/index.js"; export default value;',
+    ],
+    [
+      "erased symlink",
+      'import type { Value } from "./linked/index.js"; export default 1;',
+    ],
+    ["alias", 'import { value } from "private-alias"; export default value;'],
+    ["transitive", 'export { default } from "./helper.js";'],
+  ])("rejects private packages reached by %s", async (_name, source) => {
+    const parent = await mkdtemp(join(tmpdir(), "bb-host-private-graph-"));
     tempDirs.push(parent);
     const dir = join(parent, "plugin");
     const privatePackage = join(parent, "private-package");
-    await mkdir(dir, { recursive: true });
-    await mkdir(privatePackage, { recursive: true });
+    await mkdir(dir);
+    await mkdir(privatePackage);
     await writeFile(
       join(privatePackage, "package.json"),
       JSON.stringify({ name: "@bb/private-fixture", type: "module" }),
     );
     await writeFile(
       join(privatePackage, "index.ts"),
-      "export type PrivateValue = string;\n",
+      "export const value = 1; export type Value = number;",
+    );
+    await writeFile(join(privatePackage, "value.json"), '{"value":1}');
+    await symlink(privatePackage, join(dir, "linked"), "dir");
+    await writeFile(
+      join(dir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          paths: { "private-alias": ["../private-package/index.ts"] },
+        },
+      }),
     );
     await writeFile(
       join(dir, "package.json"),
       JSON.stringify({
-        name: "bb-plugin-relative-private-fixture",
+        name: "bb-plugin-private-graph",
         version: "1.0.0",
         engines: { bb: ">=0.0" },
         bb: {
-          name: "Relative private import fixture",
-          description: "Invalid relative host dependency.",
+          name: "Private graph",
+          description: "Private graph fixture",
           branding: { icon: "Cpu" },
           server: "./server.ts",
           host: "./host.ts",
         },
       }),
     );
+    await writeFile(join(dir, "server.ts"), "export default () => {};");
+    await writeFile(join(dir, "host.ts"), source);
+    await mkdir(join(dir, "dist"));
     await writeFile(
-      join(dir, "server.ts"),
-      "export default function plugin() {}\n",
+      join(dir, "dist", "host.js"),
+      "previous validated artifact",
     );
     await writeFile(
-      join(dir, "host.ts"),
-      'import type { PrivateValue } from "../private-package/index.js";\nconst value: PrivateValue = "nope";\nexport default value;\n',
+      join(dir, "helper.ts"),
+      'import { value } from "../private-package/index.js"; export default value;',
     );
-
     await expect(
       buildPluginHost(dir, "0.9.0-test", await testToolchain()),
     ).rejects.toThrow(/@bb\/private-fixture/u);
+    expect(await readFile(join(dir, "dist", "host.js"), "utf8")).toBe(
+      "previous validated artifact",
+    );
+    expect(await readdir(join(dir, "dist"))).toEqual(["host.js"]);
+  });
+
+  it("allows unresolved relative type imports without replacing runtime validation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bb-host-erased-missing-"));
+    tempDirs.push(dir);
+    await writeFile(
+      join(dir, "package.json"),
+      JSON.stringify({
+        name: "bb-plugin-erased-missing",
+        version: "1.0.0",
+        engines: { bb: ">=0.0" },
+        bb: {
+          name: "Erased missing",
+          description: "Erased missing fixture",
+          branding: { icon: "Cpu" },
+          server: "./server.ts",
+          host: "./host.ts",
+        },
+      }),
+    );
+    await writeFile(join(dir, "server.ts"), "export default () => {};");
+    await writeFile(
+      join(dir, "host.ts"),
+      'import type { Missing } from "./missing.js"; export default 1;',
+    );
+    await expect(
+      buildPluginHost(dir, "0.9.0-test", await testToolchain()),
+    ).resolves.toMatchObject({ artifactDigest: expect.any(String) });
   });
 
   it("allows private package names in comments and diagnostic strings", async () => {

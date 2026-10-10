@@ -2,18 +2,25 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  rename,
+  realpath,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, extname, join, relative, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { init as initModuleLexer, parse as parseModule } from "es-module-lexer";
+import { renameIntoPlace } from "./rename-into-place.js";
 import { createPluginArtifactMeta } from "./plugin-artifact-meta.js";
-import { isRecord, validatePluginBuildManifest } from "./plugin-manifest.js";
+import { zodLocaleStubPlugin } from "./zod-locale-stub.mjs";
+import { zodResolutionPlugin } from "./zod-resolution.js";
 import {
-  installedPluginSdkDirectory,
-  installedPluginSdkExportTarget,
-  pathExists,
+  isRecord,
+  readPluginPackageJsonFile,
+  resolveManifestEntryFile,
+  validatePluginBuildManifest,
+} from "./plugin-manifest.js";
+import {
+  describeUnresolvedSdkImport,
   PLUGIN_SDK_PACKAGE_NAME,
 } from "./plugin-sdk-install.js";
 import {
@@ -21,12 +28,10 @@ import {
   type PluginBuildToolchain,
 } from "./toolchain.js";
 
-const PLUGIN_SDK_SPECIFIER = "@get-bb/plugin-sdk";
-
 const LEGACY_PLUGIN_SDK_SPECIFIER = "@bb/plugin-sdk";
 
 export const PLUGIN_SERVER_EXTERNALS: readonly string[] = [
-  PLUGIN_SDK_SPECIFIER,
+  PLUGIN_SDK_PACKAGE_NAME,
   LEGACY_PLUGIN_SDK_SPECIFIER,
   "better-sqlite3",
 ];
@@ -34,28 +39,11 @@ export const PLUGIN_SERVER_EXTERNALS: readonly string[] = [
 const PLUGIN_SDK_ROOT_FILTER = /^@get-bb\/plugin-sdk$|^@bb\/plugin-sdk$/;
 const PLUGIN_SDK_SUBPATH_FILTER = /^@get-bb\/plugin-sdk\//;
 const PLUGIN_SDK_SUBPATH_RESOLVE_MARK = "bb-server-sdk-subpath";
-
-async function unresolvedSdkSubpathError(args: {
-  specifier: string;
-  resolveDir: string;
-  esbuildErrors: readonly { text: string }[];
-}): Promise<string> {
-  const need = `a server entry's "${args.specifier}" import is bundled from the plugin's own SDK install (bb serves only the bare "${PLUGIN_SDK_SPECIFIER}" at load time), so the plugin needs`;
-  const packageDir = await installedPluginSdkDirectory(args.resolveDir);
-  if (packageDir === null) {
-    return `"${args.specifier}" is not installed for this plugin (no node_modules/${PLUGIN_SDK_PACKAGE_NAME}); ${need} the SDK as a dependency`;
-  }
-  const subpath = `.${args.specifier.slice(PLUGIN_SDK_PACKAGE_NAME.length)}`;
-  const target = await installedPluginSdkExportTarget(packageDir, subpath);
-  if (target === null) {
-    return `"${args.specifier}" is not exported by the ${PLUGIN_SDK_PACKAGE_NAME} installed at ${packageDir}; ${need} an SDK version that ships it`;
-  }
-  const targetPath = resolve(packageDir, target);
-  if (!(await pathExists(targetPath))) {
-    return `"${args.specifier}" is installed for this plugin but its dist is not built: run the SDK build (${targetPath} is missing); ${need} the built SDK`;
-  }
-  return `"${args.specifier}" could not be resolved from ${packageDir}: ${args.esbuildErrors.map((error) => error.text).join("; ")}`;
-}
+const PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK = "bb-server-runtime-fallback";
+const PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK = "bb-server-source-boundary";
+const PLUGIN_BUNDLED_DEPENDENCY_MARK = "bb-server-bundled-dependency";
+const BARE_PACKAGE_FILTER = /^[^./]|^@[^/]+\/[^/]+/;
+const FILE_IMPORT_FILTER = /^(?:\.{1,2}\/|\/)/;
 
 interface PluginServerConfig {
   serverEntry: string;
@@ -67,18 +55,7 @@ async function readPluginServerConfig(
   rootDir: string,
 ): Promise<PluginServerConfig> {
   const packageJsonPath = join(rootDir, "package.json");
-  let raw: string;
-  try {
-    raw = await readFile(packageJsonPath, "utf8");
-  } catch {
-    throw new Error(`no readable package.json at ${packageJsonPath}`);
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`package.json is not valid JSON at ${packageJsonPath}`);
-  }
+  const json = await readPluginPackageJsonFile(packageJsonPath);
   if (!isRecord(json) || !isRecord(json.bb) || json.bb.server === undefined) {
     throw new Error(
       `no server entry: ${packageJsonPath} has no "bb": { "server": "./server.ts" } field`,
@@ -89,21 +66,11 @@ async function readPluginServerConfig(
     rootDir,
     packageJsonPath,
   );
-  const server = manifest.bb.server;
-  if (isAbsolute(server)) {
-    throw new Error(`manifest bb.server must be relative, got "${server}"`);
-  }
-  const serverEntry = resolve(rootDir, server);
-  if (serverEntry !== rootDir && !serverEntry.startsWith(rootDir + "/")) {
-    throw new Error(
-      `manifest bb.server escapes the plugin directory: "${server}"`,
-    );
-  }
-  try {
-    await stat(serverEntry);
-  } catch {
-    throw new Error(`manifest bb.server points at a missing file: ${server}`);
-  }
+  const serverEntry = await resolveManifestEntryFile(
+    rootDir,
+    manifest.bb.server,
+    "bb.server",
+  );
   return {
     serverEntry,
     packageName: manifest.name,
@@ -117,43 +84,141 @@ interface PluginServerBuildResult {
   metaPath: string;
 }
 
+export interface PluginServerBuildOptions {
+  hostProvidedZod?: boolean;
+  outDir?: string;
+  format?: "esm" | "cjs";
+  validatedConfig?: PluginServerConfig;
+  runtimeImports?: Record<string, { path: string; external?: boolean }>;
+  fallbackResolve?: (specifier: string) => string | undefined;
+  preserveSourceModuleLocation?: boolean;
+  externalizeSourceOutsideRoot?: boolean;
+  externalizeBareImports?: boolean;
+}
+
+async function transformSourceModuleLocation(
+  esbuild: typeof import("esbuild"),
+  path: string,
+): Promise<string> {
+  const sourceUrl = pathToFileURL(path).href;
+  const transformed = await esbuild.transform(await readFile(path, "utf8"), {
+    loader: loaderForSourcePath(path),
+    target: "node22",
+    sourcefile: path,
+    define: {
+      "import.meta.url": JSON.stringify(sourceUrl),
+      "import.meta.dirname": JSON.stringify(dirname(path)),
+      "import.meta.filename": JSON.stringify(path),
+      __dirname: JSON.stringify(dirname(path)),
+      __filename: JSON.stringify(path),
+    },
+  });
+  await initModuleLexer;
+  const [imports] = parseModule(transformed.code);
+  let code = transformed.code;
+  for (const entry of [...imports].reverse()) {
+    if (entry.d < 0 || entry.n !== undefined) continue;
+    const expression = code.slice(entry.s, entry.e);
+    const resolved = `((specifier) => typeof specifier === "string" && (specifier.startsWith("./") || specifier.startsWith("../")) ? new URL(specifier, ${JSON.stringify(sourceUrl)}).href : specifier)(${expression})`;
+    code = `${code.slice(0, entry.s)}${resolved}${code.slice(entry.e)}`;
+  }
+  return code;
+}
+
+function loaderForSourcePath(path: string): "js" | "jsx" | "ts" | "tsx" {
+  const extension = extname(path);
+  if (extension === ".ts" || extension === ".mts" || extension === ".cts") {
+    return "ts";
+  }
+  if (extension === ".tsx") return "tsx";
+  if (extension === ".jsx") return "jsx";
+  return "js";
+}
+
 export async function buildPluginServer(
   rootDir: string,
   bbVersion: string,
   toolchain: PluginBuildToolchain,
+  options: PluginServerBuildOptions = {},
 ): Promise<PluginServerBuildResult> {
   const { serverEntry, packageName, pluginVersion } =
-    await readPluginServerConfig(rootDir);
-  const distDir = join(rootDir, "dist");
+    options.validatedConfig ?? (await readPluginServerConfig(rootDir));
+  const format = options.format ?? "esm";
+  const sourceRoot = await realpath(rootDir);
+  const distDir = options.outDir ?? join(rootDir, "dist");
   await mkdir(distDir, { recursive: true });
-  const jsPath = join(distDir, "server.js");
-  const mapPath = join(distDir, "server.js.map");
+  const fileName = format === "esm" ? "server.js" : "server.cjs";
+  const jsPath = join(distDir, fileName);
+  const mapPath = join(distDir, `${fileName}.map`);
   const metaPath = join(distDir, "server.meta.json");
 
   const stageDir = await mkdtemp(join(distDir, ".stage-"));
   try {
-    const stagedJsPath = join(stageDir, "server.js");
+    const stagedJsPath = join(stageDir, fileName);
     const stagedMetaPath = join(stageDir, "server.meta.json");
 
     const esbuild = (await import(
       toolchain.esbuild
     )) as typeof import("esbuild");
+    const runtimeImports = options.runtimeImports ?? {};
     await esbuild.build({
       entryPoints: [serverEntry],
       outfile: stagedJsPath,
       bundle: true,
-      format: "esm",
+      format,
       platform: "node",
       target: "node22",
       sourcemap: true,
-      banner: { js: NODE_ESM_REQUIRE_BANNER },
+      sourcesContent: false,
+      ...(format === "esm" ? { banner: { js: NODE_ESM_REQUIRE_BANNER } } : {}),
       external: PLUGIN_SERVER_EXTERNALS.filter(
-        (specifier) => !PLUGIN_SDK_ROOT_FILTER.test(specifier),
+        (specifier) =>
+          !PLUGIN_SDK_ROOT_FILTER.test(specifier) &&
+          runtimeImports[specifier] === undefined,
+      ).concat(
+        Object.values(runtimeImports)
+          .filter((entry) => entry.external === true)
+          .map((entry) => entry.path),
       ),
+      minify: true,
+      keepNames: true,
       plugins: [
+        zodResolutionPlugin("server", {
+          hostProvidedBareZod: options.hostProvidedZod,
+          fallbackResolve: options.fallbackResolve,
+        }),
+        zodLocaleStubPlugin(),
+        ...(options.preserveSourceModuleLocation === true
+          ? [
+              {
+                name: "bb-plugin-source-url",
+                setup(build: import("esbuild").PluginBuild) {
+                  build.onLoad(
+                    { filter: /\.(?:[cm]?[jt]s|[jt]sx)$/ },
+                    async (args: import("esbuild").OnLoadArgs) => ({
+                      contents: await transformSourceModuleLocation(
+                        esbuild,
+                        args.path,
+                      ),
+                      loader: "js",
+                      pluginData: args.pluginData,
+                    }),
+                  );
+                },
+              },
+            ]
+          : []),
         {
           name: "bb-plugin-sdk-resolution",
           setup(build) {
+            for (const [specifier, entry] of Object.entries(runtimeImports)) {
+              const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              build.onResolve({ filter: new RegExp(`^${escaped}$`) }, () => ({
+                path: entry.path,
+                external: entry.external === true,
+                pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+              }));
+            }
             build.onResolve({ filter: PLUGIN_SDK_ROOT_FILTER }, (args) => ({
               path: args.path,
               external: true,
@@ -171,14 +236,18 @@ export async function buildPluginServer(
                   pluginData: PLUGIN_SDK_SUBPATH_RESOLVE_MARK,
                 });
                 if (installed.errors.length === 0 && installed.path !== "") {
-                  return { path: installed.path };
+                  return {
+                    path: installed.path,
+                    pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                  };
                 }
                 return {
                   errors: [
                     {
-                      text: await unresolvedSdkSubpathError({
+                      text: await describeUnresolvedSdkImport({
                         specifier: args.path,
                         resolveDir: args.resolveDir,
+                        need: `a server entry's "${args.path}" import is bundled from the plugin's own SDK install (bb serves only the bare "${PLUGIN_SDK_PACKAGE_NAME}" at load time), so the plugin needs`,
                         esbuildErrors: installed.errors,
                       }),
                     },
@@ -186,6 +255,90 @@ export async function buildPluginServer(
                 };
               },
             );
+            build.onResolve({ filter: BARE_PACKAGE_FILTER }, async (args) => {
+              if (
+                args.kind === "entry-point" ||
+                args.pluginData === PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK ||
+                PLUGIN_SDK_SUBPATH_FILTER.test(args.path) ||
+                /^zod($|\/)/.test(args.path) ||
+                options.fallbackResolve === undefined
+              ) {
+                return undefined;
+              }
+              const installed = await build.resolve(args.path, {
+                resolveDir: args.resolveDir,
+                kind: args.kind,
+                importer: args.importer,
+                pluginData: PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK,
+              });
+              if (installed.errors.length === 0 && installed.path !== "") {
+                return {
+                  path: installed.path,
+                  external:
+                    options.externalizeBareImports === true ||
+                    installed.external ||
+                    installed.path.startsWith("node:"),
+                  pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                };
+              }
+              const fallback = options.fallbackResolve(args.path);
+              return fallback === undefined || fallback.startsWith("node:")
+                ? undefined
+                : {
+                    path: fallback,
+                    external: options.externalizeBareImports === true,
+                    pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                  };
+            });
+            if (options.externalizeSourceOutsideRoot === true) {
+              build.onResolve({ filter: FILE_IMPORT_FILTER }, async (args) => {
+                if (
+                  args.importer === "" ||
+                  args.kind === "entry-point" ||
+                  args.pluginData === PLUGIN_BUNDLED_DEPENDENCY_MARK ||
+                  args.pluginData === PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK
+                ) {
+                  return undefined;
+                }
+                const importerFromRoot = relative(sourceRoot, args.importer);
+                if (
+                  importerFromRoot === ".." ||
+                  importerFromRoot.startsWith(`..${sep}`) ||
+                  importerFromRoot.split(sep).includes("node_modules")
+                ) {
+                  return undefined;
+                }
+                const resolved = await build.resolve(args.path, {
+                  resolveDir: args.resolveDir,
+                  kind: args.kind,
+                  importer: args.importer,
+                  pluginData: PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK,
+                });
+                if (resolved.errors.length > 0 || resolved.path === "") {
+                  return undefined;
+                }
+                const fromRoot = relative(sourceRoot, resolved.path);
+                if (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`)) {
+                  return { path: resolved.path };
+                }
+                if (args.kind === "dynamic-import") {
+                  return {
+                    path:
+                      process.platform === "win32"
+                        ? pathToFileURL(resolved.path).href
+                        : resolved.path,
+                    external: true,
+                  };
+                }
+                return {
+                  errors: [
+                    {
+                      text: `server source import escapes the plugin directory: ${args.path}`,
+                    },
+                  ],
+                };
+              });
+            }
           },
         },
       ],
@@ -200,9 +353,19 @@ export async function buildPluginServer(
       ) + "\n",
     );
 
-    await rename(stagedJsPath, jsPath);
-    await rename(join(stageDir, "server.js.map"), mapPath);
-    await rename(stagedMetaPath, metaPath);
+    if (format === "esm") {
+      await writeFile(join(stageDir, "package.json"), '{"type":"module"}\n');
+    }
+
+    await renameIntoPlace(stagedJsPath, jsPath);
+    await renameIntoPlace(join(stageDir, `${fileName}.map`), mapPath);
+    await renameIntoPlace(stagedMetaPath, metaPath);
+    if (format === "esm") {
+      await renameIntoPlace(
+        join(stageDir, "package.json"),
+        join(distDir, "package.json"),
+      );
+    }
   } finally {
     await rm(stageDir, { recursive: true, force: true });
   }

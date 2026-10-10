@@ -16,6 +16,7 @@ import { clientTurnRequestIdSchema } from "./protocol-ids.js";
 import {
   systemMessageKindSchema,
   systemMessageSubjectSchema,
+  systemThreadInterruptedReasonSchema,
 } from "./system-message.js";
 
 export const systemEventTypeValues = [
@@ -113,7 +114,10 @@ export function refineTurnRequestRetryMarker(
   data: Pick<TurnRequestEventData, "retryOfRequestId" | "retryAttempt">,
   ctx: z.RefinementCtx,
 ): void {
-  if ((data.retryOfRequestId === undefined) !== (data.retryAttempt === undefined)) {
+  if (
+    (data.retryOfRequestId === undefined) !==
+    (data.retryAttempt === undefined)
+  ) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message:
@@ -128,38 +132,11 @@ export const turnRequestRejectedEventDataSchema = z.object({
   message: z.string().min(1),
 });
 
-export const systemErrorEventDataSchema = z
-  .object({
-    code: z.string().optional(),
-    message: z.string(),
-    detail: z.string().optional(),
-    reconnectAttempt: z.number().int().positive().optional(),
-    reconnectTotal: z.number().int().positive().optional(),
-  })
-  .superRefine((value, ctx) => {
-    const hasReconnectAttempt = value.reconnectAttempt !== undefined;
-    const hasReconnectTotal = value.reconnectTotal !== undefined;
-    if (hasReconnectAttempt !== hasReconnectTotal) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "system/error reconnectAttempt and reconnectTotal must be provided together",
-      });
-      return;
-    }
-
-    if (
-      value.reconnectAttempt !== undefined &&
-      value.reconnectTotal !== undefined &&
-      value.reconnectAttempt > value.reconnectTotal
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "system/error reconnectAttempt cannot be greater than reconnectTotal",
-      });
-    }
-  });
+export const systemErrorEventDataSchema = z.object({
+  code: z.string().optional(),
+  message: z.string(),
+  detail: z.string().optional(),
+});
 export type SystemErrorEventData = z.infer<typeof systemErrorEventDataSchema>;
 
 const ownershipChangeOperationActionValues = [
@@ -184,6 +161,10 @@ export const ownershipChangeOperationMetadataSchema = z.object({
 export type OwnershipChangeOperationMetadata = z.infer<
   typeof ownershipChangeOperationMetadataSchema
 >;
+
+export const THREAD_CONTEXT_CLEAR_OPERATION = "context_clear";
+export const THREAD_CONTEXT_CLEARED_DETAIL =
+  "New prompts won’t include messages above. Thread history and workspace are unchanged.";
 
 export const systemOperationEventDataSchema = z.object({
   operation: z.string(),
@@ -221,22 +202,15 @@ export const systemUserQuestionLifecycleEventDataSchema = z.object({
   payload: userQuestionPendingInteractionPayloadSchema,
 });
 
-const systemThreadInterruptedReasonValues = [
-  "manual-stop",
-  "host-daemon-restarted",
-  "provider-turn-idle",
-] as const;
-export const systemThreadInterruptedReasonSchema = z.enum(
-  systemThreadInterruptedReasonValues,
-);
-export type SystemThreadInterruptedReason = z.infer<
-  typeof systemThreadInterruptedReasonSchema
->;
-
 export const systemThreadInterruptedEventDataSchema = z.object({
   reason: systemThreadInterruptedReasonSchema,
   cause: z.literal("host-connection-lost").optional(),
 });
+
+export const WORKSPACE_PROVISIONING_STEP_KEYS = {
+  workspacePath: "workspace-path",
+  workspaceBranch: "workspace-branch",
+} as const;
 
 export const provisioningTranscriptEntrySchema = z.object({
   type: z.enum(["step", "output"]),
@@ -266,7 +240,7 @@ export type SystemThreadProvisioningStatus = z.infer<
 export const systemThreadProvisioningEventDataSchema = z.object({
   provisioningId: z.string(),
   status: systemThreadProvisioningStatusSchema,
-  environmentId: z.string(),
+  environmentId: z.string().nullable(),
   entries: z.array(provisioningTranscriptEntrySchema),
 });
 

@@ -4,11 +4,10 @@ import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { createTasksStore } from "../db";
 import {
-  buildAttachmentUrl,
-  deleteAttachmentById,
+  attachmentDownloadUrl,
   MAX_ATTACHMENT_SIZE_BYTES,
-  registerAttachments,
-} from ".";
+} from "../shared/attachments";
+import { registerAttachments } from ".";
 
 function setup(options?: Parameters<typeof registerAttachments>[2]) {
   const { bb, harness } = createFakePluginHost({ pluginId: "tasks" });
@@ -29,7 +28,7 @@ function setup(options?: Parameters<typeof registerAttachments>[2]) {
     .all()
     .find((entry) => entry.name === "main");
   if (!database) throw new Error("test database path is missing");
-  return { bb, harness, store, task, root: dirname(database.file) };
+  return { harness, store, task, root: dirname(database.file) };
 }
 
 async function upload(
@@ -63,7 +62,7 @@ describe("task attachments", () => {
       };
       const attachment = store.getAttachment(result.attachmentId);
 
-      expect(result.url).toBe(buildAttachmentUrl(result.attachmentId));
+      expect(result.url).toBe(attachmentDownloadUrl(result.attachmentId));
       expect(attachment).toMatchObject({
         taskId: task.id,
         commentId: null,
@@ -333,34 +332,6 @@ describe("task attachments", () => {
     }
   });
 
-  it("deleteAttachmentById removes the row and blob and returns the attachment", async () => {
-    const { bb, harness, root, store, task } = setup();
-    try {
-      const uploaded = await upload(
-        harness,
-        task.id,
-        "document",
-        "note.txt",
-        "text/plain",
-      );
-      const { attachmentId } = (await uploaded.json()) as {
-        attachmentId: string;
-      };
-      const attachment = store.getAttachment(attachmentId);
-      if (!attachment) throw new Error("attachment row was not created");
-      const blobDirectory = dirname(join(root, attachment.blobPath));
-
-      const deleted = await deleteAttachmentById(bb, store, attachmentId);
-      expect(deleted).toMatchObject({ id: attachmentId });
-      expect(store.getAttachment(attachmentId)).toBeUndefined();
-      await expect(stat(blobDirectory)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-    } finally {
-      await harness.dispose();
-    }
-  });
-
   it("keeps the row and blob reachable and publishes nothing when cleanup fails", async () => {
     const { harness, root, store, task } = setup({
       removeBlobs: async () => {
@@ -374,7 +345,7 @@ describe("task attachments", () => {
       };
       const attachment = store.getAttachment(attachmentId);
       if (!attachment) throw new Error("attachment row was not created");
-      const description = `![diagram](${buildAttachmentUrl(attachmentId)})`;
+      const description = `![diagram](${attachmentDownloadUrl(attachmentId)})`;
       store.updateTask(task.id, { description });
       const signalsBeforeDelete = harness.realtimeSignals.length;
 
@@ -409,7 +380,7 @@ describe("task attachments", () => {
       const attachment = store.getAttachment(attachmentId);
       if (!attachment) throw new Error("attachment row was not created");
       store.updateTask(task.id, {
-        description: `![diagram](${buildAttachmentUrl(attachmentId)})`,
+        description: `![diagram](${attachmentDownloadUrl(attachmentId)})`,
       });
       const signalsBeforeDelete = harness.realtimeSignals.length;
 
@@ -442,17 +413,6 @@ describe("task attachments", () => {
         stat(dirname(join(root, attachment.blobPath))),
       ).rejects.toMatchObject({ code: "ENOENT" });
       expect(harness.realtimeSignals).toHaveLength(signalsBeforeDelete + 1);
-    } finally {
-      await harness.dispose();
-    }
-  });
-
-  it("deleteAttachmentById is a safe no-op for an unknown id", async () => {
-    const { bb, harness, store } = setup();
-    try {
-      await expect(
-        deleteAttachmentById(bb, store, "01JZZZZZZZZZZZZZZZZZZZZZZZ"),
-      ).resolves.toBeNull();
     } finally {
       await harness.dispose();
     }

@@ -4,7 +4,7 @@ export type ConnectStateName =
   | "connected"
   | "reconnecting";
 
-interface ConnectShareStatus {
+export interface ShareListing {
   hostId: string;
   hostName: string;
   port: number;
@@ -16,6 +16,7 @@ interface ConnectShareStatus {
 export interface ConnectStatus {
   state: ConnectStateName;
   paired: boolean;
+  enabled: boolean;
   handle: string | null;
   url: string | null;
   dashboardUrl: string;
@@ -24,7 +25,7 @@ export interface ConnectStatus {
   since: number;
   remoteClients: number;
   lastRemoteActivityAt: number | null;
-  shares: ConnectShareStatus[];
+  shares: ShareListing[];
 }
 
 export const CONNECT_REALTIME_CHANNEL = "connect";

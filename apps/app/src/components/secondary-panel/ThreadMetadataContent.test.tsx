@@ -9,72 +9,161 @@ import {
 } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import type { Environment, Thread } from "@bb/domain";
+import type { Environment, Host, Thread } from "@bb/domain";
+import type { EnvironmentDisplayHostContext } from "@bb/core-ui";
+import type {
+  SystemEnvironmentProvider,
+  SystemMachineProvider,
+} from "@bb/server-contract";
+import { systemEnvironmentProvidersQueryKey } from "@/hooks/queries/environment-provider-queries";
+import {
+  hostsQueryKey,
+  systemMachineProvidersQueryKey,
+} from "@/hooks/queries/query-keys";
 import { TooltipProvider } from "@bb/shared-ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EnvironmentRow, ThreadMetadataCard } from "./ThreadMetadataContent";
+import { focusWithKeyboard } from "@/test/keyboard-focus";
+import {
+  makeEnvironment,
+  makeHost,
+  makeThread as makeThreadFixture,
+} from "@bb/test-helpers/domain-fixtures";
+import { makeWorkspaceMergeBase, makeWorkspaceStatus } from "@bb/test-helpers";
+import {
+  EnvironmentProvisioningFailureRow,
+  EnvironmentRow,
+  formatBranchComparison,
+  GitStatusRow,
+  ThreadMetadataCard,
+} from "./ThreadMetadataContent";
 
 const localHost = { locality: "local", identity: null } as const;
+const connectedLocalHost: EnvironmentDisplayHostContext = {
+  locality: "local",
+  identity: { name: "Michael-M4", connected: true },
+};
+
+function withQueryClient(
+  children: ReactNode,
+  registeredProviders?: readonly SystemEnvironmentProvider[],
+  machines?: {
+    hosts: readonly Host[];
+    providers: readonly SystemMachineProvider[];
+  },
+): ReactNode {
+  const queryClient = new QueryClient();
+  queryClient.setQueryData(hostsQueryKey(), machines?.hosts ?? []);
+  queryClient.setQueryData(
+    systemMachineProvidersQueryKey(),
+    machines?.providers ?? [],
+  );
+  if (registeredProviders !== undefined) {
+    queryClient.setQueryData(
+      systemEnvironmentProvidersQueryKey({}),
+      registeredProviders,
+    );
+  }
+  return (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+const worktreeProvider: SystemEnvironmentProvider = {
+  machineProviderId: null,
+  id: "git-worktree",
+  displayName: "Worktree",
+  description: "Prepare a workspace for this thread.",
+  icon: "GitBranch",
+  logoUrl: null,
+  pluginId: "environment-git-worktree",
+  acceptsEmptyInputs: true,
+  machineAvailability: {},
+  availability: null,
+  requires: {
+    projectCheckout: true,
+    gitCheckout: true,
+    gitRemote: false,
+    projectless: false,
+  },
+  inputs: null,
+};
+
+const modalProvider: SystemEnvironmentProvider = {
+  machineProviderId: null,
+  id: "modal-sandbox",
+  displayName: "Modal sandbox",
+  description: "Prepare a workspace for this thread.",
+  icon: "Cloud",
+  logoUrl: null,
+  pluginId: "environment-modal-sandbox",
+  acceptsEmptyInputs: true,
+  machineAvailability: {},
+  availability: null,
+  requires: {
+    projectCheckout: false,
+    gitCheckout: false,
+    gitRemote: true,
+    projectless: false,
+  },
+  inputs: null,
+};
+
+const personalProvider: SystemEnvironmentProvider = {
+  machineProviderId: null,
+  id: "personal-workspace",
+  displayName: "Personal workspace",
+  description: "Prepare a workspace for this thread.",
+  icon: "Folder",
+  logoUrl: null,
+  pluginId: "environment-personal-workspace",
+  acceptsEmptyInputs: true,
+  machineAvailability: {},
+  availability: null,
+  requires: {
+    projectCheckout: false,
+    gitCheckout: false,
+    gitRemote: false,
+    projectless: true,
+  },
+  inputs: null,
+};
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
-  return {
-    id: "thr_test",
-    projectId: "proj_test",
-    environmentId: "env_test",
-    providerId: "codex",
+  return makeThreadFixture({
     title: null,
     titleFallback: null,
-    sectionId: null,
-    status: "idle",
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    archivedAt: null,
-    pinnedAt: null,
-    deletedAt: null,
     lastReadAt: null,
     latestAttentionAt: 0,
-    createdAt: 0,
     updatedAt: 0,
     ...overrides,
-  };
+  });
 }
 
-function makeEnvironment(overrides: Partial<Environment> = {}): Environment {
-  return {
-    id: "env_test",
-    name: null,
-    projectId: "proj_test",
-    hostId: "host_test",
-    path: "/workspace",
-    managed: true,
-    isGitRepo: true,
-    isWorktree: true,
-    workspaceProvisionType: "managed-worktree",
-    branchName: "feature",
-    baseBranch: "main",
-    defaultBranch: "main",
-    mergeBaseBranch: null,
-    status: "ready",
-    createdAt: 0,
-    updatedAt: 0,
-    ...overrides,
-  };
-}
-
-function renderEnvironmentRow(environment: Environment): string {
+function renderEnvironmentRow(
+  environment: Environment,
+  registeredProviders?: readonly SystemEnvironmentProvider[],
+  environmentDisplayHost: EnvironmentDisplayHostContext = localHost,
+  machines?: {
+    hosts: readonly Host[];
+    providers: readonly SystemMachineProvider[];
+  },
+): string {
   return renderToStaticMarkup(
-    <TooltipProvider>
-      <MemoryRouter>
-        <EnvironmentRow
-          thread={makeThread({ environmentId: environment.id })}
-          environment={environment}
-          environmentDisplayHost={localHost}
-        />
-      </MemoryRouter>
-    </TooltipProvider>,
+    withQueryClient(
+      <TooltipProvider>
+        <MemoryRouter>
+          <EnvironmentRow
+            thread={makeThread({ environmentId: environment.id })}
+            environment={environment}
+            environmentDisplayHost={environmentDisplayHost}
+          />
+        </MemoryRouter>
+      </TooltipProvider>,
+      registeredProviders,
+      machines,
+    ),
   );
 }
 
@@ -111,56 +200,228 @@ describe("ThreadMetadataCard", () => {
 });
 
 describe("EnvironmentRow", () => {
-  it("shows the create-thread action for a provisioned worktree", () => {
-    expect(renderEnvironmentRow(makeEnvironment())).toContain(
-      'aria-label="Create thread in worktree"',
+  it("shows an unregistered provider id as not installed", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ environmentProviderId: "retired-cloud" }),
+      [],
+      connectedLocalHost,
     );
+
+    expect(markup).toContain("retired-cloud (not installed)");
+  });
+
+  it("shows the provider icon and host name without provider kind text", () => {
+    const environment = makeEnvironment({ hostId: "host_modal" });
+    const markup = renderEnvironmentRow(
+      environment,
+      [],
+      {
+        locality: "remote",
+        identity: { name: "Modal sandbox abc123", connected: true },
+      },
+      {
+        hosts: [
+          makeHost({
+            id: "host_modal",
+            name: "Modal sandbox abc123",
+            type: "ephemeral",
+            machineProviderId: "modal-sandbox",
+          }),
+        ],
+        providers: [
+          {
+            id: "modal-sandbox",
+            displayName: "Modal machine",
+            description: "Run a machine for development.",
+            icon: "Cloud",
+            logoUrl: null,
+            pluginId: "environment-modal-sandbox",
+            inputs: null,
+            acceptsEmptyInputs: true,
+            supportsSuspend: true,
+          },
+        ],
+      },
+    );
+
+    expect(markup).toContain("Modal sandbox abc123");
+    expect(markup).toContain('data-icon="Cloud"');
+    expect(markup).not.toContain("Modal machine");
+  });
+
+  it("marks a removed machine and hides execution on a retained environment", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ status: "ready", hostLifecycle: "removed" }),
+      [],
+      {
+        locality: "remote",
+        identity: { name: "Old laptop", connected: false },
+      },
+    );
+    expect(markup).toContain("Unavailable — machine removed");
+    expect(markup).toContain("Old laptop");
+    expect(markup).not.toContain("(offline)");
+    expect(markup).not.toContain('aria-label="New thread in environment"');
   });
 
   it("explains the create-thread action in a tooltip", async () => {
     render(
-      <TooltipProvider delayDuration={0}>
-        <MemoryRouter>
-          <EnvironmentRow
-            thread={makeThread()}
-            environment={makeEnvironment()}
-            environmentDisplayHost={localHost}
-          />
-        </MemoryRouter>
-      </TooltipProvider>,
+      withQueryClient(
+        <TooltipProvider delayDuration={0}>
+          <MemoryRouter>
+            <EnvironmentRow
+              thread={makeThread()}
+              environment={makeEnvironment()}
+              environmentDisplayHost={localHost}
+            />
+          </MemoryRouter>
+        </TooltipProvider>,
+      ),
     );
 
-    fireEvent.focus(
+    focusWithKeyboard(
       screen.getByRole("button", {
-        name: "Create thread in worktree",
+        name: "New thread in environment",
       }),
     );
 
     expect((await screen.findByRole("tooltip")).textContent).toBe(
-      "Create thread in worktree",
+      "New thread in environment",
     );
   });
 
-  it("hides the create-thread action while a managed worktree is provisioning", () => {
+  it("hides the create-thread action while an environment is provisioning", () => {
     const markup = renderEnvironmentRow(
       makeEnvironment({
         status: "provisioning",
         path: null,
-        isWorktree: false,
       }),
     );
 
-    expect(markup).not.toContain('aria-label="Create thread in worktree"');
+    expect(markup).not.toContain('aria-label="New thread in environment"');
   });
 
-  it("hides the create-thread action before a prepared worktree has a path", () => {
+  it("hides the create-thread action before an environment has a path", () => {
     const markup = renderEnvironmentRow(
       makeEnvironment({
         path: null,
-        isWorktree: false,
       }),
     );
 
-    expect(markup).not.toContain('aria-label="Create thread in worktree"');
+    expect(markup).not.toContain('aria-label="New thread in environment"');
+  });
+
+  it("offers the create-thread action on a project's own checkout", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ environmentProviderId: null }),
+    );
+
+    expect(markup).toContain('aria-label="New thread in environment"');
+  });
+
+  it("shows a custom provider label with its machine", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ environmentProviderId: "modal-sandbox" }),
+      [modalProvider],
+      connectedLocalHost,
+    );
+
+    expect(markup).toContain("Modal sandbox");
+    expect(markup).toContain("Michael-M4");
+  });
+
+  it("shows a personal environment with the project folder icon and machine", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({
+        environmentProviderId: "personal-workspace",
+      }),
+      [personalProvider],
+      connectedLocalHost,
+    );
+
+    expect(markup).toContain(">Personal workspace<");
+    expect(markup).toContain("Michael-M4");
+    expect(markup).toContain('data-icon="Folder"');
+  });
+
+  it("shows the provider and machine without the custom environment name", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ name: "Design system polish" }),
+      [worktreeProvider],
+      connectedLocalHost,
+    );
+
+    expect(markup).not.toContain("Design system polish");
+    expect(markup).toContain("Michael-M4");
+    expect(markup).toContain("Worktree");
+  });
+
+  it("shows no provider id while the registered provider list is still loading", () => {
+    const markup = renderEnvironmentRow(
+      makeEnvironment({ environmentProviderId: "modal-sandbox" }),
+    );
+
+    expect(markup).not.toContain("modal-sandbox");
+  });
+});
+
+describe("EnvironmentProvisioningFailureRow", () => {
+  it("shows a short provisioning status without the failure detail", () => {
+    const markup = renderToStaticMarkup(
+      <EnvironmentProvisioningFailureRow failed />,
+    );
+
+    expect(markup).toContain("Environment");
+    expect(markup).toContain("Not created");
+    expect(markup).toContain("provisioning failed");
+  });
+});
+
+describe("GitStatusRow", () => {
+  it("shows no live git status for an archived attached checkout", () => {
+    const markup = renderToStaticMarkup(
+      <GitStatusRow
+        thread={makeThread({ archivedAt: 10, environmentId: "env_checkout" })}
+        environment={makeEnvironment({
+          id: "env_checkout",
+          environmentProviderId: "project-checkout",
+          managed: false,
+        })}
+        workspaceStatus={undefined}
+        workspaceStatusError={new Error("should not have queried")}
+      />,
+    );
+
+    expect(markup).toBe("");
+  });
+
+  it("compares the branch with the merge base the daemon reported", () => {
+    const render = (
+      mergeBase: ReturnType<typeof makeWorkspaceMergeBase> | null,
+    ) =>
+      renderToStaticMarkup(
+        <GitStatusRow
+          thread={makeThread()}
+          environment={null}
+          workspaceStatus={makeWorkspaceStatus({ mergeBase })}
+          workspaceStatusError={null}
+        />,
+      );
+
+    expect(
+      render(
+        makeWorkspaceMergeBase({ mergeBaseBranch: "release", aheadCount: 2 }),
+      ),
+    ).toContain("2 ahead of release");
+    expect(render(null)).toBe("");
+  });
+
+  it("phrases the branch comparison against its merge base", () => {
+    const compare = (aheadCount: number, behindCount: number) =>
+      formatBranchComparison({ aheadCount, behindCount, baseBranch: "main" });
+    expect(compare(0, 0)).toBe("Even with main");
+    expect(compare(6, 0)).toBe("6 ahead of main");
+    expect(compare(0, 3)).toBe("3 behind main");
+    expect(compare(4, 2)).toBe("4 ahead, 2 behind main");
   });
 });

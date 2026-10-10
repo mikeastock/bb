@@ -1,37 +1,32 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { BRIDGE_JSON_RPC_ERRORS } from "@bb/provider-bridge-protocol";
+import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import { experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { handleLine } from "./bridge.js";
+import {
+  FULL_ACCESS_SESSION_OPTIONS,
+  stubFakeCodexAppServer,
+} from "./fake-codex-app-server-harness.js";
 
 const THREAD_ID = "thr_archived_resume_1";
 const ARCHIVED_PROVIDER_THREAD_ID = "archived-prov-1";
 const ARCHIVED_ERROR_TEXT = `session ${ARCHIVED_PROVIDER_THREAD_ID} is archived; unarchive it and retry`;
 
-const fakeAppServerPath = fileURLToPath(
-  new URL("./fake-codex-app-server.mjs", import.meta.url),
-);
-
-const sessionOptions = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-} as const;
-
 let harness: ReturnType<typeof createBridgeJsonRpcTestHarness>;
 let workspaceDir: string;
+let processLogPath: string;
 
 beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-codex-archived-ws-"));
-  vi.stubEnv("BB_CODEX_BRIDGE_APP_SERVER_COMMAND", process.execPath);
-  vi.stubEnv(
-    "BB_CODEX_BRIDGE_APP_SERVER_ARGS",
-    JSON.stringify([fakeAppServerPath]),
+  processLogPath = join(workspaceDir, "app-server-processes.log");
+  const scriptPath = join(workspaceDir, "fake-codex-script.json");
+  writeFileSync(
+    scriptPath,
+    JSON.stringify({ processLogPath, sigtermDelayMs: 250 }),
   );
+  stubFakeCodexAppServer(scriptPath);
   harness = createBridgeJsonRpcTestHarness(handleLine);
 });
 
@@ -55,7 +50,7 @@ it("preserves the archived-session error text verbatim on a rejected resume", as
     providerThreadId: ARCHIVED_PROVIDER_THREAD_ID,
     cwd: workspaceDir,
     instructionMode: "append",
-    options: { ...sessionOptions },
+    options: { ...FULL_ACCESS_SESSION_OPTIONS },
   });
   const response = await harness.waitForResponse(1);
 
@@ -71,6 +66,7 @@ it("preserves the archived-session error text verbatim on a rejected resume", as
       retryable: true,
     },
   });
+  expect(readFileSync(processLogPath, "utf8")).toContain("exit:");
 }, 30_000);
 
 it("attaches the sessionArchived hint to a fork whose source is archived", async () => {
@@ -79,7 +75,7 @@ it("attaches the sessionArchived hint to a fork whose source is archived", async
     sourceProviderThreadId: ARCHIVED_PROVIDER_THREAD_ID,
     cwd: workspaceDir,
     instructionMode: "append",
-    options: { ...sessionOptions },
+    options: { ...FULL_ACCESS_SESSION_OPTIONS },
   });
   const response = await harness.waitForResponse(2);
 

@@ -20,9 +20,35 @@ interface ResolveBuiltinPluginRootPathArgs {
 
 export const BUILTIN_PLUGINS_DIRECTORY_NAME = "builtin-plugins";
 
+export const BUILTIN_PLUGIN_ID_PREFIX = "bb--";
+
+const ACCOUNT_POOL_PARENT_URL_ENV = "BB_ACCOUNT_POOL_PARENT_URL";
+
+export function accountPoolDefaultEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const value = env[ACCOUNT_POOL_PARENT_URL_ENV];
+  return typeof value === "string" && value.length > 0;
+}
+
 const REPO_PLUGINS_DIRECTORY_NAME = "plugins";
 
 export const BUILTIN_PLUGINS = [
+  {
+    name: "storage-retention",
+    pluginId: "bb--storage-retention",
+    defaultEnabled: false,
+  },
+  {
+    name: "bb-guide",
+    pluginId: "bb-guide",
+    defaultEnabled: true,
+  },
+  {
+    name: "account-pool",
+    pluginId: "account-pool",
+    defaultEnabled: accountPoolDefaultEnabled(),
+  },
   {
     name: "ask-user-question",
     pluginId: "ask-user-question",
@@ -34,8 +60,33 @@ export const BUILTIN_PLUGINS = [
     defaultEnabled: true,
   },
   {
+    name: "bb-account",
+    pluginId: "bb-account",
+    defaultEnabled: true,
+  },
+  {
+    name: "bb-ai",
+    pluginId: "bb-ai",
+    defaultEnabled: true,
+  },
+  {
     name: "connect",
     pluginId: "connect",
+    defaultEnabled: true,
+  },
+  {
+    name: "environment-project-checkout",
+    pluginId: "environment-project-checkout",
+    defaultEnabled: true,
+  },
+  {
+    name: "environment-git-worktree",
+    pluginId: "environment-git-worktree",
+    defaultEnabled: true,
+  },
+  {
+    name: "environment-personal-workspace",
+    pluginId: "environment-personal-workspace",
     defaultEnabled: true,
   },
   {
@@ -79,9 +130,19 @@ export const BUILTIN_PLUGINS = [
     defaultEnabled: true,
   },
   {
+    name: "provider-usage",
+    pluginId: "bb--provider-usage",
+    defaultEnabled: true,
+  },
+  {
     name: "provider-acp",
     pluginId: "provider-acp",
     defaultEnabled: true,
+  },
+  {
+    name: "provider-acp-next",
+    pluginId: "bb--provider-acp-next",
+    defaultEnabled: false,
   },
   {
     name: "keep-awake",
@@ -109,9 +170,29 @@ export const BUILTIN_PLUGINS = [
     defaultEnabled: true,
   },
   {
+    name: "drafts",
+    pluginId: "drafts",
+    defaultEnabled: true,
+  },
+  {
+    name: "thread-list",
+    pluginId: "thread-list",
+    defaultEnabled: true,
+  },
+  {
+    name: "prompt-library",
+    pluginId: "bb--prompt-library",
+    defaultEnabled: false,
+  },
+  {
     name: "scheduled-send",
     pluginId: "scheduled-send",
     defaultEnabled: true,
+  },
+  {
+    name: "agent-annotations",
+    pluginId: "agent-annotations",
+    defaultEnabled: false,
   },
   {
     name: "concurrency-limit",
@@ -128,14 +209,22 @@ export const BUILTIN_PLUGINS = [
     pluginId: "workflows",
     defaultEnabled: false,
   },
-].map(
-  (plugin): BundledPluginDefinition => ({
-    ...plugin,
-    autoInstall: true,
-  }),
-);
+].map((plugin): BundledPluginDefinition => ({
+  ...plugin,
+  autoInstall: true,
+}));
 
 export const OFFICIAL_PLUGINS = [
+  {
+    name: "environment-modal-sandbox",
+    pluginId: "environment-modal-sandbox",
+    defaultEnabled: true,
+  },
+  {
+    name: "browser-automation",
+    pluginId: "browser-automation",
+    defaultEnabled: false,
+  },
   {
     name: "github",
     pluginId: "github",
@@ -161,21 +250,30 @@ export const OFFICIAL_PLUGINS = [
     pluginId: "theme-preview",
     defaultEnabled: true,
   },
-].map(
-  (plugin): BundledPluginDefinition => ({
-    ...plugin,
-    autoInstall: false,
-  }),
-);
+].map((plugin): BundledPluginDefinition => ({
+  ...plugin,
+  autoInstall: false,
+}));
 
 export const BUNDLED_PLUGINS: readonly BundledPluginDefinition[] = [
   ...BUILTIN_PLUGINS,
   ...OFFICIAL_PLUGINS,
 ];
 
-export const BUILTIN_PLUGIN_NAMES = BUILTIN_PLUGINS.map(
-  (plugin) => plugin.name,
-);
+export interface BundledPluginReplacement {
+  pluginId: string;
+  replaces: string;
+  carriedSettings: readonly string[];
+}
+
+export const BUNDLED_PLUGIN_REPLACEMENTS: readonly BundledPluginReplacement[] =
+  [
+    {
+      pluginId: "bb--provider-acp-next",
+      replaces: "provider-acp",
+      carriedSettings: ["customAgents"],
+    },
+  ];
 
 const builtinPluginsModuleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -186,6 +284,13 @@ export function builtinPluginSource(name: string): string {
 export function resolveBuiltinPluginRootPathForModuleDir(
   args: ResolveBuiltinPluginRootPathArgs,
 ): string {
+  const preparedCandidate = path.resolve(
+    args.moduleDir,
+    "../../../packages/bundled-plugins/dist",
+    args.name,
+  );
+  if (existsSync(preparedCandidate)) return preparedCandidate;
+
   const packagedCandidate = path.resolve(
     args.moduleDir,
     BUILTIN_PLUGINS_DIRECTORY_NAME,

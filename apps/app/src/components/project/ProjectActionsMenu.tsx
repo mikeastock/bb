@@ -1,43 +1,34 @@
+import { Icon } from "@bb/shared-ui/icon";
+import {
+  ActionMenuItem,
+  ActionMenuSeparator,
+} from "@bb/shared-ui/action-menu-items";
 import { findLocalPathProjectSourceForHost } from "@bb/domain";
 import type { ProjectResponse } from "@bb/server-contract";
 import type { MouseEvent, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@bb/shared-ui/button";
-import { Icon, type IconName } from "@bb/shared-ui/icon";
+
 import { COARSE_POINTER_ICON_SIZE_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
-import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuSeparator,
-  ContextMenuTrigger,
-} from "@bb/shared-ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@bb/shared-ui/dropdown-menu";
-import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
-import { CompactLongPressMenu } from "@/components/ui/compact-long-press-menu";
 import { usePathPickerHost } from "@/hooks/useLocalPathPicker";
-import { getProjectSettingsRoutePath } from "@/lib/route-paths";
+import { getSettingsProjectRoutePath } from "@/lib/route-paths";
 import { cn } from "@bb/shared-ui/lib/utils";
 import { useProjectActions } from "./ProjectActionsProvider";
 
 interface ProjectActionsMenuBaseProps {
   project: ProjectResponse;
+  onRename?: () => void;
+  onCloseAutoFocus?: (event: Event) => void;
+  extraActions?: (surface: ProjectActionsMenuSurface) => ReactNode;
 }
 
 interface ProjectActionsMenuProps extends ProjectActionsMenuBaseProps {
   triggerClassName?: string;
-  onOpenChange?: (open: boolean) => void;
-}
-
-interface ProjectActionsContextMenuProps extends ProjectActionsMenuBaseProps {
-  children: ReactNode;
-  onOpenChange?: (open: boolean) => void;
 }
 
 type ProjectActionsMenuSurface = "context" | "dropdown";
@@ -46,77 +37,15 @@ interface ProjectActionsMenuItemsProps extends ProjectActionsMenuBaseProps {
   surface: ProjectActionsMenuSurface;
 }
 
-interface ProjectActionMenuItemProps {
-  children: ReactNode;
-  className?: string;
-  variant?: "default" | "destructive";
-  icon: IconName;
-  onSelect?: (event: Event) => void;
-  surface: ProjectActionsMenuSurface;
-}
-
-interface ProjectActionMenuSeparatorProps {
-  surface: ProjectActionsMenuSurface;
-}
-
 function stopProjectActionsMenuClickPropagation(event: MouseEvent) {
   event.stopPropagation();
 }
 
-function ProjectActionMenuItem({
-  children,
-  className,
-  variant,
-  icon,
-  onSelect,
-  surface,
-}: ProjectActionMenuItemProps) {
-  const content = (
-    <>
-      <Icon name={icon} aria-hidden="true" />
-      {children}
-    </>
-  );
-
-  if (surface === "context") {
-    return (
-      <ContextMenuItem
-        className={cn(
-          className,
-          variant === "destructive" &&
-            "text-destructive focus:bg-destructive/15 focus:text-destructive data-[last-hovered]:bg-destructive/15 data-[last-hovered]:text-destructive",
-        )}
-        onSelect={onSelect}
-      >
-        {content}
-      </ContextMenuItem>
-    );
-  }
-
-  return (
-    <DropdownMenuItem
-      className={className}
-      variant={variant}
-      onSelect={onSelect}
-    >
-      {content}
-    </DropdownMenuItem>
-  );
-}
-
-function ProjectActionMenuSeparator({
-  surface,
-}: ProjectActionMenuSeparatorProps) {
-  return surface === "context" ? (
-    <ContextMenuSeparator />
-  ) : (
-    <DropdownMenuSeparator />
-  );
-}
-
-function ProjectActionsMenuItems({
+export function ProjectActionsMenuItems({
   project,
   surface,
+  onRename,
+  extraActions,
 }: ProjectActionsMenuItemsProps) {
   const navigate = useNavigate();
   const { hostId: pickerHostId } = usePathPickerHost();
@@ -128,27 +57,27 @@ function ProjectActionsMenuItems({
 
   return (
     <>
-      <ProjectActionMenuItem
+      <ActionMenuItem
         surface={surface}
         icon="Settings"
         onSelect={() => {
-          navigate(getProjectSettingsRoutePath(project.id));
+          navigate(getSettingsProjectRoutePath(project.id));
         }}
       >
         Project settings
-      </ProjectActionMenuItem>
-      <ProjectActionMenuSeparator surface={surface} />
-      <ProjectActionMenuItem
+      </ActionMenuItem>
+      <ActionMenuItem
         surface={surface}
         icon="Edit"
         onSelect={() => {
-          requestRename(project);
+          if (onRename) onRename();
+          else requestRename(project);
         }}
       >
         Rename
-      </ProjectActionMenuItem>
+      </ActionMenuItem>
       {showAddLocalPath ? (
-        <ProjectActionMenuItem
+        <ActionMenuItem
           surface={surface}
           icon="FolderPlus"
           onSelect={() => {
@@ -156,9 +85,11 @@ function ProjectActionsMenuItems({
           }}
         >
           Add local path
-        </ProjectActionMenuItem>
+        </ActionMenuItem>
       ) : null}
-      <ProjectActionMenuItem
+      {extraActions?.(surface)}
+      <ActionMenuSeparator surface={surface} />
+      <ActionMenuItem
         surface={surface}
         icon="Trash2"
         variant="destructive"
@@ -167,7 +98,7 @@ function ProjectActionsMenuItems({
         }}
       >
         Remove
-      </ProjectActionMenuItem>
+      </ActionMenuItem>
     </>
   );
 }
@@ -175,10 +106,12 @@ function ProjectActionsMenuItems({
 export function ProjectActionsMenu({
   project,
   triggerClassName,
-  onOpenChange,
+  onRename,
+  onCloseAutoFocus,
+  extraActions,
 }: ProjectActionsMenuProps) {
   return (
-    <DropdownMenu onOpenChange={onOpenChange}>
+    <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
@@ -202,54 +135,16 @@ export function ProjectActionsMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
+        onCloseAutoFocus={onCloseAutoFocus}
         onClick={stopProjectActionsMenuClickPropagation}
       >
-        <ProjectActionsMenuItems project={project} surface="dropdown" />
+        <ProjectActionsMenuItems
+          project={project}
+          surface="dropdown"
+          onRename={onRename}
+          extraActions={extraActions}
+        />
       </DropdownMenuContent>
     </DropdownMenu>
-  );
-}
-
-export function ProjectActionsContextMenu(
-  props: ProjectActionsContextMenuProps,
-) {
-  const isCompactViewport = useIsCompactViewport();
-  if (isCompactViewport) {
-    return <ProjectActionsCompactLongPressMenu {...props} />;
-  }
-  return <ProjectActionsDesktopContextMenu {...props} />;
-}
-
-function ProjectActionsCompactLongPressMenu({
-  children,
-  project,
-  onOpenChange,
-}: ProjectActionsContextMenuProps) {
-  return (
-    <CompactLongPressMenu
-      label={`${project.name} actions`}
-      onOpenChange={onOpenChange}
-      items={<ProjectActionsMenuItems project={project} surface="dropdown" />}
-    >
-      {children}
-    </CompactLongPressMenu>
-  );
-}
-
-function ProjectActionsDesktopContextMenu({
-  children,
-  project,
-  onOpenChange,
-}: ProjectActionsContextMenuProps) {
-  return (
-    <ContextMenu onOpenChange={onOpenChange}>
-      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-      <ContextMenuContent
-        aria-label={`${project.name} actions`}
-        onClick={stopProjectActionsMenuClickPropagation}
-      >
-        <ProjectActionsMenuItems project={project} surface="context" />
-      </ContextMenuContent>
-    </ContextMenu>
   );
 }

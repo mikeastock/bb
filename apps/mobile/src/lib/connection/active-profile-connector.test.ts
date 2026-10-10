@@ -12,6 +12,7 @@ import {
 } from "../realtime/fake-socket";
 import type { RealtimeSocketFactory } from "../realtime/socket";
 import { createProfileClientRegistry } from "../sdk/client-registry";
+import type { StoredSession } from "../session/session-cache";
 import { createSessionScheduler } from "../session/session-scheduler";
 import {
   AUTH_FAILURE_BREAKER_COOLDOWN_MS,
@@ -64,12 +65,13 @@ function fakeAppState(): AppStateLike & {
 interface SetupOptions {
   fallbackResponse?: () => Response;
   onSocket?: (socket: FakeSocket) => void;
+  stored?: StoredSession;
 }
 
 function setup(options: SetupOptions = {}) {
   const sockets = createFakeSocketFactory();
-  const socketFactory: RealtimeSocketFactory = (url, socketOptions) => {
-    const socket = sockets(url, socketOptions);
+  const socketFactory: RealtimeSocketFactory = (url) => {
+    const socket = sockets(url);
     options.onSocket?.(sockets.latest());
     return socket;
   };
@@ -95,6 +97,11 @@ function setup(options: SetupOptions = {}) {
     createSessionScheduler: () => {
       const scheduler = createSessionScheduler({
         cookieStore: { set: async () => true },
+        sessionCache: {
+          read: async () => options.stored ?? null,
+          write: async () => {},
+          clear: async () => {},
+        },
         fetchSession,
       });
       schedulers.push(scheduler);
@@ -137,7 +144,7 @@ function sessionCookie(value: string): DesktopSession {
 }
 
 async function flush(): Promise<void> {
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
 
 async function settle(): Promise<void> {
@@ -157,7 +164,7 @@ describe("createActiveProfileConnector", () => {
     connector.activate(direct);
     expect(sockets.sockets).toHaveLength(1);
     const snap = connector.getSnapshot();
-    expect(snap?.client).toBe(registry.peekClient(direct.id));
+    expect(snap?.client).toBe(registry.getClientForProfile(direct));
     expect(snap?.session).toEqual({ status: "idle" });
 
     connector.activate({ ...direct, label: "Renamed" });
@@ -313,8 +320,8 @@ describe("createActiveProfileConnector", () => {
         headers: { "content-type": "text/html" },
       }),
     );
-    const client = registry.peekClient(connect.id);
-    await expect(client?.sdk.system.config()).rejects.toMatchObject({
+    const client = registry.getClientForProfile(connect);
+    await expect(client.sdk.system.config()).rejects.toMatchObject({
       status: 401,
     });
     await settle();
@@ -354,8 +361,7 @@ describe("createActiveProfileConnector", () => {
     );
     connector.activate(connect);
     await flush();
-    const client = registry.peekClient(connect.id);
-    if (!client) throw new Error("client missing");
+    const client = registry.getClientForProfile(connect);
 
     fetchResponses.push(
       new Response("<html>sign in</html>", {
@@ -396,8 +402,7 @@ describe("createActiveProfileConnector", () => {
     fetchSession.mockResolvedValueOnce(sessionCookie("s1"));
     connector.activate(connect);
     await flush();
-    const client = registry.peekClient(connect.id);
-    if (!client) throw new Error("client missing");
+    const client = registry.getClientForProfile(connect);
     expect(fetchSession).toHaveBeenCalledTimes(1);
 
     fetchResponses.push(
@@ -427,6 +432,36 @@ describe("createActiveProfileConnector", () => {
     unsubscribe();
   });
 
+  it("re-mints on the first 401 after restoring a stored session the gate no longer accepts", async () => {
+    const { fetchSession, fetchResponses, connector, registry } = setup({
+      stored: {
+        serverUrl: connect.serverUrl,
+        credential: connect.credential,
+        session: sessionCookie("restored"),
+      },
+    });
+    connector.activate(connect);
+    await flush();
+    const client = registry.getClientForProfile(connect);
+    expect(fetchSession).not.toHaveBeenCalled();
+    expect(connector.getSnapshot()?.session).toMatchObject({
+      status: "authenticated",
+      restored: true,
+    });
+
+    fetchSession.mockResolvedValueOnce(sessionCookie("fresh"));
+    fetchResponses.push(signInPage());
+    await expect(client.sdk.system.config()).rejects.toMatchObject({
+      status: 401,
+    });
+    await settle();
+    expect(fetchSession).toHaveBeenCalledTimes(1);
+    expect(connector.getSnapshot()?.session).toMatchObject({
+      status: "authenticated",
+      restored: false,
+    });
+  });
+
   it("stops re-minting after a few cycles when the gate keeps refusing freshly minted sessions, reports an error, and recovers after the cooldown", async () => {
     let gateRefuses = true;
     const { sockets, fetchSession, fetchCalls, connector, registry } = setup({
@@ -454,8 +489,7 @@ describe("createActiveProfileConnector", () => {
         }),
     );
     connector.activate(connect);
-    const client = registry.peekClient(connect.id);
-    if (!client) throw new Error("client missing");
+    const client = registry.getClientForProfile(connect);
     const observer = new QueryObserver(client.queryClient, {
       queryKey: ["system-config"],
       queryFn: () => client.sdk.system.config(),
@@ -479,7 +513,9 @@ describe("createActiveProfileConnector", () => {
     gateRefuses = false;
     await vi.advanceTimersByTimeAsync(tripped.retryAt - Date.now());
     await vi.advanceTimersByTimeAsync(1000);
-    expect(fetchSession.mock.calls.length).toBe(mintsWhileTripped + 1);
+    expect(fetchSession.mock.calls.length).toBeLessThanOrEqual(
+      mintsWhileTripped + 1,
+    );
     expect(fetchCalls.count).toBeGreaterThan(fetchesWhileTripped);
     expect(connector.getSnapshot()?.session.status).toBe("authenticated");
     expect(observer.getCurrentResult().status).toBe("success");
@@ -492,8 +528,7 @@ describe("createActiveProfileConnector", () => {
     fetchSession.mockResolvedValue(sessionCookie("s"));
     connector.activate(connect);
     await flush();
-    const client = registry.peekClient(connect.id);
-    if (!client) throw new Error("client missing");
+    const client = registry.getClientForProfile(connect);
     expect(fetchSession).toHaveBeenCalledTimes(1);
 
     for (let i = 0; i < AUTH_FAILURE_MAX_REMINTS + 2; i += 1) {

@@ -1,3 +1,5 @@
+import * as questionFormHost from "@bb/shared-ui/question-form-host";
+import * as voiceInputTextarea from "@bb/shared-ui/voice-input-textarea";
 import * as react from "react";
 import * as reactDom from "react-dom";
 import * as reactDomClient from "react-dom/client";
@@ -14,6 +16,7 @@ import * as radixPopover from "@radix-ui/react-popover";
 import * as radixSelect from "@radix-ui/react-select";
 import * as radixTooltip from "@radix-ui/react-tooltip";
 import * as sonner from "sonner";
+import { whenToasterSettled } from "@/components/ui/app-toast-runtime";
 import * as vaul from "vaul";
 import * as pierreDiffs from "@pierre/diffs";
 import * as clsx from "clsx";
@@ -27,6 +30,10 @@ import { markEnabledPluginListStale } from "@/hooks/cache-owners/plugin-cache-ow
 import { pluginListQueryOptions } from "@/hooks/queries/plugin-settings-queries";
 import { createRecordingToast } from "@/lib/notifications/plugin-toast-recording";
 import { appQueryClient } from "./app-query-client";
+import {
+  setServerPluginsStarting,
+  setPluginFrontendReconcilePending,
+} from "./plugin-frontend-boot-state";
 import type {
   PluginContentScriptDisposer,
   PluginContentScriptRegistration,
@@ -40,6 +47,7 @@ import {
   collectPluginAppRegistrations,
   isPluginAppDefinition,
 } from "./plugin-app-definition";
+import { setPluginAssetIcons } from "@bb/shared-ui/icon-registry";
 import { setPluginLogoUrls, type PluginLogoUrls } from "./plugin-logos";
 import { createGatedPierreDiffsReact } from "./plugin-pierre-diffs-react";
 import { getPluginPanelRoutePluginId } from "./route-paths";
@@ -121,7 +129,6 @@ export type PluginFrontendDiagnostic =
 
 interface PluginFrontendLoaderDeps {
   importModule: (url: string) => Promise<unknown>;
-  injectCss: (pluginId: string, url: string) => void;
   warn: (message: string) => void;
 }
 
@@ -154,7 +161,6 @@ async function loadOneBundle(
     };
   }
   try {
-    if (bundle.cssUrl !== null) deps.injectCss(pluginId, bundle.cssUrl);
     const mod = await deps.importModule(bundle.jsUrl);
     if (typeof mod !== "object" || mod === null) {
       throw new Error("bundle did not evaluate to a module namespace");
@@ -198,6 +204,8 @@ interface BbPluginRuntime {
   tailwindMerge: unknown;
   classVarianceAuthority: unknown;
   sharedUiIcon: unknown;
+  questionFormHost: typeof questionFormHost;
+  voiceInputTextarea: typeof voiceInputTextarea;
 }
 
 type RuntimeHost = typeof globalThis & { __bbPluginRuntime?: BbPluginRuntime };
@@ -230,6 +238,8 @@ export function installPluginRuntime(): void {
     tailwindMerge,
     classVarianceAuthority,
     sharedUiIcon,
+    questionFormHost,
+    voiceInputTextarea,
   };
 }
 
@@ -242,18 +252,27 @@ export async function fetchFrontendCandidates(
       pluginListQueryOptions({ enabled: true }),
     );
   } catch (error) {
+    setServerPluginsStarting(false);
     if (
       error instanceof BbHttpError &&
       (error.status === 401 || error.status === 403)
     ) {
       setPluginLogoUrls(new Map());
+      setPluginAssetIcons(new Map());
       return [];
     }
     throw error;
   }
+  setServerPluginsStarting(
+    plugins.some((plugin) => plugin.enabled && plugin.status === "starting"),
+  );
   const candidates: PluginFrontendCandidate[] = [];
   const logoUrls = new Map<string, PluginLogoUrls>();
+  const assetIcons = new Map<string, string>();
   for (const plugin of plugins) {
+    for (const [name, url] of Object.entries(plugin.icons)) {
+      assetIcons.set(`${plugin.id}/${name}`, url);
+    }
     logoUrls.set(plugin.id, {
       displayName: plugin.name,
       icon: plugin.icon,
@@ -262,7 +281,11 @@ export async function fetchFrontendCandidates(
       logoDarkUrl: plugin.logoDarkUrl,
       icons: new Map(Object.entries(plugin.icons)),
     });
-    if (plugin.status !== "running") {
+    if (
+      plugin.status !== "running" &&
+      plugin.status !== "needs-configuration" &&
+      plugin.status !== "degraded"
+    ) {
       continue;
     }
     const bundle = plugin.app.bundle;
@@ -270,12 +293,13 @@ export async function fetchFrontendCandidates(
     candidates.push({ pluginId: plugin.id, bundle });
   }
   setPluginLogoUrls(logoUrls);
+  setPluginAssetIcons(assetIcons);
   return candidates;
 }
 
 export { applyPluginCss } from "./plugin-css";
 
-export const PLUGIN_FRONTEND_LOAD_CONCURRENCY = 3;
+const PLUGIN_FRONTEND_LOAD_CONCURRENCY = 3;
 
 export function orderPluginFrontendCandidates(
   candidates: readonly PluginFrontendCandidate[],
@@ -307,9 +331,14 @@ async function runWithConcurrencyLimit<T>(
   await Promise.all(lanes);
 }
 
+function appendPluginImportRetry(url: string, retryCount: number): string {
+  return `${url}${url.includes("?") ? "&" : "?"}bb_retry=${retryCount}`;
+}
+
 interface PluginFrontendReconcileState {
   records: Map<string, PluginFrontendRecord>;
   appliedHashes: Map<string, string>;
+  failedImportAttempts: Map<string, { hash: string; count: number }>;
   activeGenerations: Map<string, ActivePluginFrontendGeneration>;
   generationByPluginId: Map<string, number>;
   pendingControllers: Map<string, AbortController>;
@@ -322,6 +351,7 @@ export function createPluginFrontendReconcileState(): PluginFrontendReconcileSta
   return {
     records: new Map(),
     appliedHashes: new Map(),
+    failedImportAttempts: new Map(),
     activeGenerations: new Map(),
     generationByPluginId: new Map(),
     pendingControllers: new Map(),
@@ -642,14 +672,35 @@ async function reconcileCandidates(
         return;
       }
       deps.resetCrashedSlots(pluginId);
-      const loaded = await loadPluginFrontends([candidate], {
-        importModule: deps.importModule,
-        injectCss: () => {},
-        warn: deps.warn,
-      });
+      const previousAttempt = state.failedImportAttempts.get(pluginId);
+      const retryCount =
+        previous?.status === "failed" &&
+        previousAttempt?.hash === candidate.bundle.hash
+          ? previousAttempt.count + 1
+          : 0;
+      const importUrl =
+        retryCount === 0
+          ? candidate.bundle.jsUrl
+          : appendPluginImportRetry(candidate.bundle.jsUrl, retryCount);
+      const loaded = await loadPluginFrontends(
+        [
+          {
+            ...candidate,
+            bundle: { ...candidate.bundle, jsUrl: importUrl },
+          },
+        ],
+        {
+          importModule: deps.importModule,
+          warn: deps.warn,
+        },
+      );
       const record = loaded.get(pluginId);
       if (record === undefined) return;
       if (record.status === "failed") {
+        state.failedImportAttempts.set(pluginId, {
+          hash: candidate.bundle.hash,
+          count: retryCount,
+        });
         await deactivateCommittedGeneration(pluginId, state, deps);
         state.records.set(pluginId, record);
         publishDiagnostic(state, deps, {
@@ -664,6 +715,7 @@ async function reconcileCandidates(
         });
         return;
       }
+      state.failedImportAttempts.delete(pluginId);
       if (record.status === "needs-update") {
         await deactivateCommittedGeneration(pluginId, state, deps);
         state.records.set(pluginId, record);
@@ -818,6 +870,7 @@ export async function disposePluginFrontends(
   }
   state.records.clear();
   state.appliedHashes.clear();
+  state.failedImportAttempts.clear();
   state.activeGenerations.clear();
   state.diagnostics.clear();
   deps.diagnosticsChanged?.();
@@ -898,10 +951,6 @@ export function subscribePluginFrontendDiagnostics(
   };
 }
 
-function teardownPluginFrontends(): Promise<void> {
-  return disposePluginFrontends(state, browserReconcileDeps);
-}
-
 interface PluginFrontendPageLifecycleDeps {
   restore: () => void;
   teardown: () => void;
@@ -933,7 +982,8 @@ function installPluginFrontendPageLifecycle(): void {
   const lifecycle = createPluginFrontendPageLifecycle({
     restore: () => schedulePluginFrontendReconcile(),
     teardown: () => {
-      void teardownPluginFrontends();
+      setPluginFrontendReconcilePending(true);
+      void disposePluginFrontends(state, browserReconcileDeps);
     },
   });
   window.addEventListener("pagehide", (event) => lifecycle.onPageHide(event));
@@ -944,6 +994,7 @@ export function bootPluginFrontends(): Promise<void> {
   bootPromise ??= (async () => {
     installPluginRuntime();
     installPluginFrontendPageLifecycle();
+    await whenToasterSettled();
     await reconcilePluginFrontends(state, browserReconcileDeps);
   })().catch((error: unknown) => {
     console.warn(
@@ -954,6 +1005,7 @@ export function bootPluginFrontends(): Promise<void> {
 }
 
 async function runLiveReconcile(): Promise<void> {
+  setPluginFrontendReconcilePending(true);
   try {
     await bootPromise;
     await markEnabledPluginListStale({ queryClient: appQueryClient });
@@ -968,6 +1020,8 @@ async function runLiveReconcile(): Promise<void> {
     console.warn(
       `plugin frontend reconcile failed: ${error instanceof Error ? error.message : String(error)}`,
     );
+  } finally {
+    setPluginFrontendReconcilePending(false);
   }
 }
 

@@ -22,7 +22,7 @@ import { BbLogo } from "@/components/ui/bb-logo";
 import {
   ConfirmDeleteDialog,
   ConfirmDeleteDialogContent,
-} from "@/components/dialogs/ConfirmDeleteDialog";
+} from "@bb/shared-ui/confirm-delete-dialog";
 import { CreateWithTemplatesButton } from "@/components/create-via-prompt-examples";
 import { ProvenancePill } from "@/components/tools/ProvenancePill";
 import { SkillDetailView } from "@/components/tools/SkillDetailView";
@@ -31,6 +31,7 @@ import { skillScopeLabel } from "@/components/tools/skill-taxonomy";
 import type { ProviderInfo } from "@bb/domain";
 import { ProviderIconMark } from "@/components/settings/ProviderIconMark";
 import { getProviderIconInfo } from "@/lib/provider-icon";
+import type { MarkdownLinkRouting } from "@/components/ui/markdown-link-routing";
 
 type ResourceProviderFilter = "bb" | SkillProvider;
 export type ProviderRoster = ReadonlyMap<string, ProviderInfo>;
@@ -106,7 +107,7 @@ export function ProviderLogo({
   provider?: ProviderInfo | undefined;
   className?: string;
 }) {
-  const info = getProviderIconInfo(providerId, provider ?? null);
+  const info = getProviderIconInfo("agent", providerId, provider ?? null);
   if (!info) {
     return null;
   }
@@ -340,7 +341,7 @@ export function SkillsOverview({
 }: SkillsOverviewProps) {
   const [providerFilters, setProviderFilters] = useState<
     ResourceProviderFilter[]
-  >(["bb"]);
+  >([]);
   const [sourceFilters, setSourceFilters] = useState<
     ResourceSkillSourceFilter[]
   >([]);
@@ -432,12 +433,10 @@ export function SkillsOverview({
       );
     });
     return [...filtered].sort((left, right) => {
-      if (providerFilters.length === 1 && providerFilters[0] === "bb") {
-        const officialResult =
-          Number(left.scope !== "bb-builtin") -
-          Number(right.scope !== "bb-builtin");
-        if (officialResult !== 0) return officialResult;
-      }
+      const officialResult =
+        Number(left.scope !== "bb-builtin") -
+        Number(right.scope !== "bb-builtin");
+      if (officialResult !== 0) return officialResult;
       const base =
         sortMode === "provider"
           ? providerLabel(left.provider, providerRoster).localeCompare(
@@ -508,6 +507,7 @@ export function SkillsOverview({
         ))}
       </ResourceListPanel>
       <ResourceInfiniteScrollSentinel
+        itemCount={libraryList.items.length}
         hasMore={libraryList.hasMore}
         onLoadMore={libraryList.loadMore}
       />
@@ -609,6 +609,7 @@ interface SkillDetailDialogViewProps {
   canDelete: boolean;
   canOpenInEditor: boolean;
   isDeleting: boolean;
+  markdownLinkRouting?: MarkdownLinkRouting;
   onEdit: () => void;
   onRetry: () => void;
   onDelete: () => void;
@@ -628,6 +629,7 @@ export function SkillDetailDialogView({
   canDelete,
   canOpenInEditor,
   isDeleting,
+  markdownLinkRouting,
   onEdit,
   onRetry,
   onDelete,
@@ -728,6 +730,7 @@ export function SkillDetailDialogView({
               : undefined
       }
       files={files.length > 0 ? files : ["SKILL.md"]}
+      markdownLinkRouting={markdownLinkRouting}
       selectedPath={selectedPath}
       onSelectFile={onSelectPath}
       contentState={

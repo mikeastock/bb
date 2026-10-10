@@ -4,7 +4,6 @@ import { screen } from "electron";
 import { z } from "zod";
 import {
   DEFAULT_WINDOW_STATE,
-  PRIMARY_WINDOW_STATE_KEY,
   type DisplayWorkArea,
   type PersistedWindowStateEntry,
   type PersistedWindowStateFile,
@@ -52,7 +51,6 @@ interface WritePersistedWindowStateEntriesArgs {
 }
 
 interface RestoreWindowStateArgs {
-  defaultState?: PersistedWindowState;
   displayWorkAreas: DisplayWorkArea[];
   persistedState: PersistedWindowState | null;
 }
@@ -114,23 +112,7 @@ function parsePersistedWindowStateFile(
 ): PersistedWindowStateFile | null {
   const parsedJson = JSON.parse(rawState);
   const parsedFile = persistedWindowStateFileSchema.safeParse(parsedJson);
-  if (parsedFile.success) {
-    return parsedFile.data;
-  }
-
-  const parsedLegacyState = persistedWindowStateSchema.safeParse(parsedJson);
-  if (!parsedLegacyState.success) {
-    return null;
-  }
-
-  return {
-    windows: [
-      {
-        ...parsedLegacyState.data,
-        stateKey: PRIMARY_WINDOW_STATE_KEY,
-      },
-    ],
-  };
+  return parsedFile.success ? parsedFile.data : null;
 }
 
 function intersectionArea(args: IntersectingAreaArgs): number {
@@ -149,7 +131,7 @@ function intersectionArea(args: IntersectingAreaArgs): number {
   return width * height;
 }
 
-export function hasVisibleArea(args: HasVisibleAreaArgs): boolean {
+function hasVisibleArea(args: HasVisibleAreaArgs): boolean {
   return args.displayWorkAreas.some(
     (workArea) =>
       intersectionArea({
@@ -162,9 +144,8 @@ export function hasVisibleArea(args: HasVisibleAreaArgs): boolean {
 export function restoreWindowState(
   args: RestoreWindowStateArgs,
 ): PersistedWindowState {
-  const defaultState = args.defaultState ?? DEFAULT_WINDOW_STATE;
   if (args.persistedState === null) {
-    return defaultState;
+    return DEFAULT_WINDOW_STATE;
   }
 
   if (
@@ -173,7 +154,7 @@ export function restoreWindowState(
       displayWorkAreas: args.displayWorkAreas,
     })
   ) {
-    return defaultState;
+    return DEFAULT_WINDOW_STATE;
   }
 
   return args.persistedState;

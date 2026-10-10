@@ -1,3 +1,4 @@
+import type { Writable } from "node:stream";
 import {
   resolveContextProjectId,
   resolveContextThreadId,
@@ -10,6 +11,21 @@ export interface PluginCliContributionEntry {
   name: string;
   summary: string;
   commands: Array<{ name: string; summary: string; usage: string }>;
+  rendersHelp?: boolean;
+}
+
+export function pluginCommandLabel(
+  contribution: PluginCliContributionEntry,
+  argv: readonly string[],
+): string {
+  const declared = new Set(contribution.commands.map((entry) => entry.name));
+  for (let words = Math.min(3, argv.length); words > 0; words -= 1) {
+    const candidate = argv.slice(0, words);
+    if (declared.has(candidate.join("-"))) {
+      return [contribution.name, ...candidate].join(" ");
+    }
+  }
+  return contribution.name;
 }
 
 const CONTRIBUTIONS_TIMEOUT_MS = 2000;
@@ -220,12 +236,7 @@ export async function findDisabledPluginForCommand(
   baseUrl: string,
   name: string,
   timeoutMs: number = CONTRIBUTIONS_TIMEOUT_MS,
-): Promise<{
-  id: string;
-  enabled: boolean;
-  status: string | null;
-  statusDetail: string | null;
-} | null> {
+): Promise<string | null> {
   try {
     const response = await cliFetch(`${baseUrl}/api/v1/plugins`, {
       signal: AbortSignal.timeout(timeoutMs),
@@ -234,14 +245,7 @@ export async function findDisabledPluginForCommand(
     const parsed = (await response.json()) as { plugins?: unknown } | null;
     if (!Array.isArray(parsed?.plugins)) return null;
     const match = parsed.plugins.find(
-      (
-        entry,
-      ): entry is {
-        id: string;
-        enabled: boolean;
-        status?: unknown;
-        statusDetail?: unknown;
-      } =>
+      (entry): entry is { id: string } =>
         typeof entry === "object" &&
         entry !== null &&
         (entry as { id?: unknown }).id === name &&
@@ -249,15 +253,7 @@ export async function findDisabledPluginForCommand(
         ((entry as { enabled?: unknown }).enabled === false ||
           (entry as { status?: unknown }).status === "disabled"),
     );
-    return match === undefined
-      ? null
-      : {
-          id: match.id,
-          enabled: match.enabled,
-          status: typeof match.status === "string" ? match.status : null,
-          statusDetail:
-            typeof match.statusDetail === "string" ? match.statusDetail : null,
-        };
+    return match === undefined ? null : match.id;
   } catch {
     return null;
   }
@@ -270,13 +266,64 @@ export function findPluginCliCommand(
   return contributions.find((entry) => entry.name === name);
 }
 
-interface PluginCliOutputStream {
-  write(chunk: string, callback: (error?: Error | null) => void): boolean;
-}
+type PluginCliOutputStream = Writable;
 
 interface PluginCliOutputStreams {
   stdout: PluginCliOutputStream;
   stderr: PluginCliOutputStream;
+}
+
+interface PluginCliInputStream extends AsyncIterable<Buffer | string> {
+  isTTY?: boolean;
+}
+
+const PLUGIN_CLI_STDIN_MAX_BYTES = 16 * 1024;
+const PLUGIN_CLI_STDIN_FLAG = /^--([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)-stdin$/u;
+
+async function materializeStdinFlag(
+  argv: readonly string[],
+  input: PluginCliInputStream,
+): Promise<string[]> {
+  const terminator = argv.indexOf("--");
+  const scanned = terminator === -1 ? argv : argv.slice(0, terminator);
+  const matches = scanned.flatMap((flag, index) => {
+    const match = PLUGIN_CLI_STDIN_FLAG.exec(flag);
+    const name = match?.[1];
+    return name === undefined ? [] : [{ flag, index, name }];
+  });
+  if (matches.length === 0) return [...argv];
+  if (matches.length > 1) throw new Error("Choose only one stdin input flag.");
+  const match = matches[0];
+  if (match === undefined) return [...argv];
+  const valueFlag = `--${match.name}`;
+  if (scanned.includes(valueFlag)) {
+    throw new Error(`Choose only one of ${match.flag} and ${valueFlag}.`);
+  }
+  if (input.isTTY === true) {
+    throw new Error(`${match.flag} requires piped stdin.`);
+  }
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of input) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > PLUGIN_CLI_STDIN_MAX_BYTES) {
+      throw new Error(`${match.flag} input exceeds 16 KiB.`);
+    }
+    chunks.push(buffer);
+  }
+  const value = Buffer.concat(chunks)
+    .toString("utf8")
+    .replace(/\r?\n$/u, "");
+  if (value.length === 0 || /[\r\n]/u.test(value)) {
+    throw new Error(`${match.flag} requires exactly one non-empty stdin line.`);
+  }
+  return [
+    ...argv.slice(0, match.index),
+    valueFlag,
+    value,
+    ...argv.slice(match.index + 1),
+  ];
 }
 
 async function writePluginCliOutput(
@@ -286,10 +333,36 @@ async function writePluginCliOutput(
   if (value.length === 0) return;
   const output = value.endsWith("\n") ? value : `${value}\n`;
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    stream.write(output, (error) => {
-      if (error) rejectPromise(error);
-      else resolvePromise();
-    });
+    const settle = (error?: Error | null) => {
+      stream.off("error", onError);
+      stream.off("close", onClose);
+      if (error && !("code" in error && error.code === "EPIPE")) {
+        rejectPromise(error);
+      } else {
+        resolvePromise();
+      }
+    };
+    const onError = (error: Error) => settle(error);
+    const onClose = () =>
+      settle(
+        stream.errored ??
+          new Error("Plugin CLI output stream closed before flushing"),
+      );
+    stream.once("error", onError);
+    stream.once("close", onClose);
+    if (stream.destroyed) {
+      if (stream.closed) process.nextTick(onClose);
+      return;
+    }
+    try {
+      stream.write(output, (error) => {
+        if (!error) settle();
+      });
+    } catch (error) {
+      stream.off("error", onError);
+      stream.off("close", onClose);
+      rejectPromise(error);
+    }
   });
 }
 
@@ -310,7 +383,18 @@ export async function runPluginCliCommand(
     stdout: process.stdout,
     stderr: process.stderr,
   },
+  input: PluginCliInputStream = process.stdin,
 ): Promise<number> {
+  let resolvedArgv: string[];
+  try {
+    resolvedArgv = await materializeStdinFlag(argv, input);
+  } catch (error) {
+    await writePluginCliOutput(
+      streams.stderr,
+      error instanceof Error ? error.message : String(error),
+    );
+    return 1;
+  }
   const threadId = resolveContextThreadId();
   const projectId = resolveContextProjectId();
   const response = await cliFetch(
@@ -319,7 +403,7 @@ export async function runPluginCliCommand(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        argv,
+        argv: resolvedArgv,
         cwd: process.cwd(),
         ...(threadId ? { threadId } : {}),
         ...(projectId ? { projectId } : {}),

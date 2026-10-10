@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import parcelWatcher from "@parcel/watcher";
+import { createDeferredPromise } from "@bb/test-helpers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { watchWorkspaceStatus } from "../src/watch-status.js";
 import type { WorkspaceStatusChangeEvent } from "../src/watch-status-types.js";
@@ -15,7 +16,6 @@ const realParcelSubscribe = parcelWatcher.subscribe.bind(parcelWatcher);
 
 const NESTED_REPOS = 4;
 const PACKAGES_PER_NESTED_REPO = 300;
-const EVENT_TIMEOUT_MS = 5_000;
 const TEST_TIMEOUT_MS = 60_000;
 const MAX_EXPECTED_WATCHES = 20;
 
@@ -68,7 +68,7 @@ async function buildUmbrellaRoot(args: {
     );
     nestedDirCount += packagesPerNestedRepo * 2;
   }
-  return { root, nestedDirCount };
+  return { root: await fs.realpath(root), nestedDirCount };
 }
 
 function countInotifyWatches(): number {
@@ -119,19 +119,6 @@ async function measureWorkspaceRootWatch(root: string): Promise<{
     };
   } finally {
     await stop();
-  }
-}
-
-async function waitFor(
-  predicate: () => boolean,
-  timeoutMs: number,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error("Timed out waiting for workspace change events");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
@@ -203,22 +190,34 @@ describe("workspace root watch events inside nested heavy directories (#1779)", 
         ".git",
         "bb-marker",
       );
+      const readyFile = path.join(realRoot, "apps", "child-0", "ready.txt");
       const visibleFile = path.join(realRoot, "apps", "child-0", "visible.txt");
       const events: WorkspaceStatusChangeEvent[] = [];
-      let ready!: () => void;
-      const readyPromise = new Promise<void>((resolve) => {
-        ready = resolve;
-      });
+      const ready = createDeferredPromise<void>();
+      const failed = createDeferredPromise<never>();
+      let stopped = false;
       const stop = watchWorkspaceStatus(root, {
         onChange: (event) => {
           events.push(event);
         },
-        onReady: () => ready(),
-        onWatchError: () => undefined,
+        onReady: () => ready.resolve(),
+        onWatchError: (error) => failed.reject(error),
       });
       try {
-        await readyPromise;
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await Promise.race([ready.promise, failed.promise]);
+        await Promise.race([
+          vi.waitFor(
+            async () => {
+              if (stopped) return;
+              await fs.writeFile(readyFile, `${Date.now()}\n`);
+              expect(events.flatMap((event) => event.changedPaths)).toContain(
+                readyFile,
+              );
+            },
+            { timeout: 10_000, interval: 100 },
+          ),
+          failed.promise,
+        ]);
 
         await fs.writeFile(
           nestedPackageFile,
@@ -226,12 +225,21 @@ describe("workspace root watch events inside nested heavy directories (#1779)", 
         );
         await fs.writeFile(nestedGitFile, "marker\n");
         await fs.writeFile(visibleFile, "visible\n");
-        await waitFor(
-          () =>
-            events.some((event) => event.changedPaths.includes(visibleFile)),
-          EVENT_TIMEOUT_MS,
-        );
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await Promise.race([
+          vi.waitFor(
+            () => {
+              expect(events.flatMap((event) => event.changedPaths)).toContain(
+                visibleFile,
+              );
+            },
+            { timeout: 10_000, interval: 100 },
+          ),
+          failed.promise,
+        ]);
+        await Promise.race([
+          new Promise((resolve) => setTimeout(resolve, 300)),
+          failed.promise,
+        ]);
 
         const changedPaths = events.flatMap((event) => event.changedPaths);
         expect(changedPaths).toContain(visibleFile);
@@ -240,11 +248,13 @@ describe("workspace root watch events inside nested heavy directories (#1779)", 
         expect(
           changedPaths.filter(
             (changedPath) =>
-              changedPath.includes(`${path.sep}node_modules${path.sep}`) ||
-              changedPath.includes(`${path.sep}.git${path.sep}`),
+              changedPath.startsWith(path.join(realRoot, "apps")) &&
+              (changedPath.includes(`${path.sep}node_modules${path.sep}`) ||
+                changedPath.includes(`${path.sep}.git${path.sep}`)),
           ),
         ).toEqual([]);
       } finally {
+        stopped = true;
         await stop();
       }
     },

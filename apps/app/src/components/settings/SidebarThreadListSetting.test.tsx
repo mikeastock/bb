@@ -8,36 +8,42 @@ import {
   setPluginSlotRegistrations,
 } from "@/lib/plugin-slots";
 import { threadListProviderAtom } from "@/components/sidebar/threadListProvider";
-import {
-  AUTOMATIC_REPLACEMENT_PROVIDER,
-  BUILT_IN_REPLACEMENT_PROVIDER,
-} from "@/lib/plugin-replacement-preference";
 import { SidebarThreadListSetting } from "./SidebarThreadListSetting";
+import { makePluginRegistrationSet } from "@/test/fixtures/plugins";
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
   window.localStorage.clear();
   resetPluginSlotStoreForTest();
 });
 
 describe("SidebarThreadListSetting", () => {
-  it("defaults to automatic and lets the user pin BB's list", async () => {
-    setPluginSlotRegistrations("inbox", {
-      homepageSections: [],
-      settingsSections: [],
-      navPanels: [],
-      threadPanelActions: [],
-      sidebarFooterActions: [],
-      threadLists: [
-        {
-          id: "inbox",
-          title: "Inbox",
-          component: () => null,
-        },
-      ],
-      fileOpeners: [],
-      messageDirectives: [],
-    });
+  it("defaults to Automatic, which prefers an installed plugin over the bundled Thread list", async () => {
+    setPluginSlotRegistrations(
+      "thread-list",
+      makePluginRegistrationSet({
+        threadLists: [
+          {
+            id: "thread-list",
+            title: "Thread list",
+            component: () => null,
+          },
+        ],
+      }),
+    );
+    setPluginSlotRegistrations(
+      "zen",
+      makePluginRegistrationSet({
+        threadLists: [
+          {
+            id: "inbox",
+            title: "Inbox",
+            component: () => null,
+          },
+        ],
+      }),
+    );
     const store = createStore();
     render(
       <JotaiProvider store={store}>
@@ -45,19 +51,25 @@ describe("SidebarThreadListSetting", () => {
       </JotaiProvider>,
     );
 
-    expect(store.get(threadListProviderAtom)).toBe(
-      AUTOMATIC_REPLACEMENT_PROVIDER,
-    );
+    expect(store.get(threadListProviderAtom)).toBe("__automatic__");
     const trigger = screen.getByRole("button", {
       name: "Sidebar thread list",
     });
     expect(trigger.textContent).toContain("Automatic");
 
     fireEvent.pointerDown(trigger, { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /built-in/u }));
-
-    expect(store.get(threadListProviderAtom)).toBe(
-      BUILT_IN_REPLACEMENT_PROVIDER,
+    expect(
+      (await screen.findByRole("menuitem", { name: /Automatic/u })).textContent,
+    ).toContain("Chooses Inbox (zen).");
+    const options = screen
+      .getAllByRole("menuitem")
+      .map((item) => item.textContent ?? "");
+    expect(options[1]).toContain("InboxFrom the zen plugin.");
+    expect(options[2]).toContain("Thread list (built-in)BB default.");
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: /^Thread list \(built-in\)/u }),
     );
+
+    expect(store.get(threadListProviderAtom)).toBe("thread-list/thread-list");
   });
 });

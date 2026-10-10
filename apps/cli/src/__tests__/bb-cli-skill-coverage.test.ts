@@ -10,26 +10,29 @@ import {
 
 const COMMAND_INDEX_PATH = fileURLToPath(
   new URL(
-    "../../../server/src/services/skills/builtin-skills/bb-cli/references/command-index.md",
+    "../../../../plugins/bb-guide/skills/bb-cli/references/command-index.md",
     import.meta.url,
   ),
 );
 
 const BB_CLI_SKILL_ROOT = fileURLToPath(
   new URL(
-    "../../../server/src/services/skills/builtin-skills/bb-cli/",
+    "../../../../plugins/bb-guide/skills/bb-cli/",
     import.meta.url,
   ),
 );
 
 function commandPaths(command: Command, prefix: string[] = []): string[] {
-  return command.commands.flatMap((child) => {
-    const path = [...prefix, child.name()];
-    const aliases = child
-      .aliases()
-      .map((alias) => [...prefix, alias].join(" "));
-    return [path.join(" "), ...aliases, ...commandPaths(child, path)];
-  });
+  const visible = new Set(command.createHelp().visibleCommands(command));
+  return command.commands
+    .filter((child) => visible.has(child))
+    .flatMap((child) => {
+      const path = [...prefix, child.name()];
+      const aliases = child
+        .aliases()
+        .map((alias) => [...prefix, alias].join(" "));
+      return [path.join(" "), ...aliases, ...commandPaths(child, path)];
+    });
 }
 
 function readMarkdownTree(directory: string): string {

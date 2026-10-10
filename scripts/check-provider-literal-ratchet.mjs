@@ -42,7 +42,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const SCAN_ROOTS = ["apps", "packages", "plugins"];
 
@@ -59,6 +59,7 @@ const EXCLUDED_SEGMENTS = new Set([
   "testing",
   "e2e",
   ".turbo",
+  ".wrangler",
   ".ladle",
   ".storybook",
   "stories",
@@ -73,8 +74,15 @@ const EXCLUDED_SEGMENTS = new Set([
  * today: it selects behavior by the agent's dialect, never by a provider id.
  */
 const EXCLUDED_PREFIXES = [
+  join("apps", "cli", ".packaged-plugin-build-"),
+  join("packages", "plugin-sdk", ".runtime-test-"),
   join("plugins", "provider-"),
+  join("plugins", "environment-"),
+  // Account Pool proxies one named provider's traffic; it is provider-side
+  // code like plugins/provider-*, not core.
+  join("plugins", "account-pool"),
   join("packages", "provider-bridge-acp"),
+  join("packages", "provider-bridge-acp-next"),
   // Test-only helpers: they name providers so tests can pick a model.
   join("packages", "test-helpers"),
   join("examples", ""),
@@ -176,7 +184,9 @@ export function checkAllowlist(scan, allowlist) {
   }
   for (const rel of Object.keys(entries)) {
     if (!(rel in scan.files)) {
-      problems.push(`  − ${rel}: allowlisted but has no reference left — remove the entry`);
+      problems.push(
+        `  − ${rel}: allowlisted but has no reference left — remove the entry`,
+      );
     }
   }
   return problems;
@@ -227,7 +237,8 @@ function baselineFromGit(root, ref) {
 // --- CLI ---------------------------------------------------------------------
 function main() {
   const ROOT =
-    process.env.BB_RATCHET_ROOT ?? fileURLToPath(new URL("..", import.meta.url));
+    process.env.BB_RATCHET_ROOT ??
+    fileURLToPath(new URL("..", import.meta.url));
   const BASELINE_PATH = join(ROOT, "scripts", "provider-literal-baseline.json");
   const argv = process.argv.slice(2);
   const flags = new Set(argv.filter((a) => a.startsWith("--")));
@@ -371,4 +382,8 @@ function main() {
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main());
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+)
+  process.exit(main());

@@ -1,4 +1,4 @@
-import type { ThreadEvent } from "@bb/domain";
+import type { ThreadEvent } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { describe, expect, it } from "vitest";
 import {
   createClaudeDeltaHarness,
@@ -281,7 +281,7 @@ describe("claude item presentation", () => {
   });
 
   it("emits a bb-injected tool call as server:bb with the definition's presentation", () => {
-    const translator = createClaudeDeltaTranslator();
+    const translator = createClaudeDeltaTranslator({ sandboxEnabled: false });
     translator.configureInjectedTools([
       {
         name: "bb_workflow_result",
@@ -371,15 +371,157 @@ describe("claude item presentation", () => {
     });
   });
 
-  it("uses the established skill glyph for native Skill calls", () => {
+  it("labels an inline Skill call as loading once its result arrives", () => {
     const harness = createClaudeDeltaHarness();
-    const events = harness.translate(
-      toolUse("skill-1", "Skill", { skill: "debugging" }),
-    );
-
-    expect(presentationOf(startedItems(events)[0])).toEqual({
+    const events = [
+      ...harness.translate(toolUse("skill-1", "Skill", { skill: "debugging" })),
+      ...harness.translate(toolResult("skill-1", "Launching skill: debugging")),
+    ];
+    const loading = {
       label: { pending: "Loading skill", completed: "Loaded skill" },
       icon: { glyph: "Zap" },
+      title: "debugging",
+    };
+
+    expect(events.map((event) => event.type)).toEqual([
+      "turn/started",
+      "item/started",
+      "item/completed",
+    ]);
+    expect(presentationOf(startedItems(events)[0])).toEqual(loading);
+    expect(presentationOf(completedItems(events)[0])).toEqual(loading);
+  });
+
+  it("labels a forked Skill call as running before its subagent task", () => {
+    const harness = createClaudeDeltaHarness();
+    const events = [
+      ...harness.translate(
+        toolUse("skill-1", "Skill", { skill: "code-review" }),
+      ),
+      ...harness.translate({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-1",
+        tool_use_id: "skill-1",
+        description: "/code-review",
+        task_type: "local_agent",
+        skip_transcript: true,
+        session_id: "sess-1",
+      }),
+      ...harness.translate(
+        toolResult(
+          "skill-1",
+          'Skill "code-review" completed (forked execution).',
+        ),
+      ),
+    ];
+    const running = {
+      label: { pending: "Running skill", completed: "Ran skill" },
+      icon: { glyph: "Zap" },
+      title: "code-review",
+    };
+
+    expect(startedItems(events).map((item) => item.type)).toEqual([
+      "toolCall",
+      "backgroundTask",
+    ]);
+    expect(presentationOf(startedItems(events)[0])).toEqual(running);
+    expect(presentationOf(completedItems(events)[0])).toEqual(running);
+  });
+
+  it("opens a Skill call before a tool call sharing its assistant message", () => {
+    const harness = createClaudeDeltaHarness();
+    const events = harness.translate({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "skill-1",
+            name: "Skill",
+            input: { skill: "debugging" },
+          },
+          {
+            type: "tool_use",
+            id: "read-1",
+            name: "Read",
+            input: { file_path: "/workspace/a.ts" },
+          },
+        ],
+      },
+      session_id: "sess-1",
+    });
+
+    expect(
+      startedItems(events).map((item) => presentationOf(item)),
+    ).toMatchObject([
+      { label: { pending: "Loading skill" }, title: "debugging" },
+      { title: "a.ts" },
+    ]);
+  });
+
+  it("does not label an inline Skill as running for another tool's task", () => {
+    const harness = createClaudeDeltaHarness();
+    const events = [
+      ...harness.translate(toolUse("skill-1", "Skill", { skill: "debugging" })),
+      ...harness.translate({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-other",
+        tool_use_id: "agent-other",
+        description: "Another agent",
+        task_type: "local_agent",
+        session_id: "sess-1",
+      }),
+    ];
+
+    expect(presentationOf(startedItems(events)[0])).toMatchObject({
+      label: { pending: "Loading skill" },
+      title: "debugging",
+    });
+  });
+
+  it("opens a held Skill before reporting a provider error", () => {
+    const harness = createClaudeDeltaHarness();
+    const context = { threadId: "skill-error-thread" };
+    const events = [
+      ...harness.translate(
+        toolUse("skill-1", "Skill", { skill: "debugging" }),
+        context,
+      ),
+      ...harness.translate(
+        {
+          jsonrpc: "2.0",
+          method: "error",
+          params: { message: "bridge failed" },
+        },
+        context,
+      ),
+    ];
+
+    expect(events.map((event) => event.type)).toEqual([
+      "turn/started",
+      "item/started",
+      "provider/error",
+      "turn/completed",
+    ]);
+    expect(presentationOf(startedItems(events)[0])).toMatchObject({
+      label: { pending: "Loading skill" },
+      title: "debugging",
+    });
+  });
+
+  it("keeps a Skill call whose session settles before its result", () => {
+    const harness = createClaudeDeltaHarness();
+    const events = [
+      ...harness.translate(toolUse("skill-1", "Skill", { skill: "debugging" })),
+      ...harness.settleSession(),
+    ];
+
+    expect(startedItems(events)).toHaveLength(1);
+    expect(presentationOf(startedItems(events)[0])).toMatchObject({
+      label: { pending: "Loading skill" },
       title: "debugging",
     });
   });
@@ -492,6 +634,67 @@ describe("claude item presentation", () => {
     });
   });
 
+  it("badges a Bash call that opts out of the session sandbox", () => {
+    const harness = createClaudeDeltaHarness({ sandboxEnabled: true });
+    const events = harness.translate({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "b-1",
+            name: "Bash",
+            input: {
+              command: "ls -la ~/.claude/ide",
+              dangerouslyDisableSandbox: true,
+            },
+          },
+          {
+            type: "tool_use",
+            id: "b-2",
+            name: "Bash",
+            input: { command: "ls -la ~/.claude/ide" },
+          },
+        ],
+      },
+      session_id: "sess-1",
+    });
+    const started = startedItems(events);
+    expect(presentationOf(started[0])).toEqual({
+      label: { pending: "Running command", completed: "Ran command" },
+      icon: { glyph: "Terminal" },
+      title: "ls -la ~/.claude/ide",
+      badge: {
+        glyph: "SquareUnlock02",
+        label: "Outside of sandbox",
+        hint: "Outside of sandbox",
+        tone: "destructive",
+      },
+    });
+    expect(presentationOf(started[1])).not.toHaveProperty("badge");
+  });
+
+  it("omits the sandbox badge when the session never enabled the sandbox", () => {
+    const harness = createClaudeDeltaHarness({ sandboxEnabled: false });
+    const events = harness.translate({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "b-1",
+            name: "Bash",
+            input: { command: "ls", dangerouslyDisableSandbox: true },
+          },
+        ],
+      },
+      session_id: "sess-1",
+    });
+    expect(presentationOf(startedItems(events)[0])).not.toHaveProperty("badge");
+  });
+
   it("presents a close without an open from the tool name alone", () => {
     const harness = createClaudeDeltaHarness();
     harness.translate({
@@ -527,7 +730,7 @@ describe("claude item presentation", () => {
   });
 
   it("attaches a presentation to every item.open and item.close delta", () => {
-    const translator = createClaudeDeltaTranslator();
+    const translator = createClaudeDeltaTranslator({ sandboxEnabled: false });
     const context = { threadId: "t" };
     const deltas = [
       ...translator.translate(

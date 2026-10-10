@@ -1,22 +1,12 @@
-import type { ReactNode } from "react";
-import type { PluginPanelActionEntry } from "@/components/plugin/PluginPanelActions";
+import { useNewTabActions, type UseNewTabActionsArgs } from "./NewTabActions";
 import {
-  NewTabActions,
   NewTabFileSearch,
   type NewTabFileSearchProps,
-  type OpenBrowserHandler,
-  type StartTerminalHandler,
 } from "./NewTabFileSearch";
 
-type NewTabPageFileSearchProps = Omit<NewTabFileSearchProps, "idleActions">;
+type NewTabPageFileSearchProps = Omit<NewTabFileSearchProps, "actions">;
 
-interface NewTabPageProps extends NewTabPageFileSearchProps {
-  onOpenBrowser?: OpenBrowserHandler;
-  onStartTerminal?: StartTerminalHandler;
-  pluginActions?: readonly PluginPanelActionEntry[];
-  startTerminalDisabled?: boolean;
-  startTerminalTrailing?: ReactNode;
-}
+type NewTabPageProps = NewTabPageFileSearchProps & UseNewTabActionsArgs;
 
 export function NewTabPage({
   autoFocus,
@@ -35,23 +25,26 @@ export function NewTabPage({
   startTerminalDisabled,
   startTerminalTrailing,
 }: NewTabPageProps) {
+  const actions = useNewTabActions({
+    onOpenBrowser,
+    onStartTerminal,
+    pluginActions,
+    startTerminalDisabled,
+    startTerminalTrailing,
+  });
+
   return (
-    <div className="flex min-h-full flex-col gap-3 bg-sidebar px-4 pb-3 pt-1">
+    <div
+      data-panel-new-tab-page=""
+      className="flex min-h-full flex-col gap-3 bg-sidebar px-4 pb-3 pt-1"
+    >
       <NewTabFileSearch
         projectId={projectId}
         environmentId={environmentId}
         hostId={hostId}
         currentThreadId={currentThreadId}
         autoFocus={autoFocus}
-        idleActions={
-          <NewTabActions
-            onOpenBrowser={onOpenBrowser}
-            onStartTerminal={onStartTerminal}
-            pluginActions={pluginActions}
-            startTerminalDisabled={startTerminalDisabled}
-            startTerminalTrailing={startTerminalTrailing}
-          />
-        }
+        actions={actions}
         initialQuery={initialQuery}
         onAutoFocusHandled={onAutoFocusHandled}
         onSelect={onSelect}

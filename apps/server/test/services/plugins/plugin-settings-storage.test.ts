@@ -1,3 +1,4 @@
+import { createPluginUpdateJobs } from "../../../src/services/plugins/plugin-update-jobs.js";
 import {
   mkdtemp,
   mkdir,
@@ -17,10 +18,12 @@ import {
   createConnection,
   getPluginSettingsValues,
   migrate,
+  setPluginSettingsValues,
   type DbConnection,
 } from "@bb/db";
 import type { Logger } from "@bb/logger";
 import { registerPluginRoutes } from "../../../src/routes/plugins.js";
+import { createPluginInstallJobs } from "../../../src/services/plugins/plugin-install-jobs.js";
 import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
 import {
   createPluginService,
@@ -117,6 +120,7 @@ describe("plugin settings + storage", () => {
               teamKey: { type: "string", label: "Team key", default: "ENG" },
               mode: { type: "select", label: "Mode", options: ["fast", "slow"], default: "fast" },
               autoSync: { type: "boolean", label: "Sync automatically", default: true },
+              retries: { type: "number", label: "Retries", default: 3 },
               note: { type: "string", label: "Note" },
             });
             const g = globalThis as any;
@@ -148,8 +152,20 @@ describe("plugin settings + storage", () => {
         teamKey: "ENG",
         mode: "fast",
         autoSync: true,
+        retries: 3,
         apiKey: undefined,
         note: undefined,
+      });
+    });
+
+    it("reads a legacy stored numeric string as a number", async () => {
+      await installConfigurable();
+      setPluginSettingsValues(db, "configurable", {
+        retries: JSON.stringify(" 5 "),
+      });
+
+      await expect(state().settings.get()).resolves.toMatchObject({
+        retries: 5,
       });
     });
 
@@ -158,6 +174,7 @@ describe("plugin settings + storage", () => {
       const view = await service.updateSettings("configurable", {
         apiKey: "sk-secret-123",
         autoSync: false,
+        retries: 4.5,
         note: "hello",
       });
 
@@ -169,11 +186,14 @@ describe("plugin settings + storage", () => {
         "apiKey",
       );
       expect(await readFile(secretPath, "utf8")).toBe("sk-secret-123");
-      expect((await stat(secretPath)).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect((await stat(secretPath)).mode & 0o777).toBe(0o600);
+      }
 
       expect(view?.values.apiKey).toEqual({ set: true });
       expect(JSON.stringify(view)).not.toContain("sk-secret-123");
       expect(view?.values.autoSync).toBe(false);
+      expect(view?.values.retries).toBe(4.5);
       expect(view?.values.note).toBe("hello");
 
       expect(await state().settings.get()).toEqual({
@@ -181,6 +201,7 @@ describe("plugin settings + storage", () => {
         teamKey: "ENG",
         mode: "fast",
         autoSync: false,
+        retries: 4.5,
         note: "hello",
       });
 
@@ -271,7 +292,13 @@ describe("plugin settings + storage", () => {
       ).rejects.toThrow("lowercase letters only");
 
       const app = new Hono();
-      registerPluginRoutes(app, { config: { serverPort: 3334 }, db }, service);
+      registerPluginRoutes(
+        app,
+        { config: { serverPort: 3334 }, db },
+        service,
+        createPluginInstallJobs({ notifyChanged: () => {} }),
+        createPluginUpdateJobs({ notifyChanged: () => {} }),
+      );
       const got = await app.request("/plugins/self-configuring/settings");
       const body = (await got.json()) as {
         schema: Record<string, Record<string, unknown>>;
@@ -298,6 +325,9 @@ describe("plugin settings + storage", () => {
       await expect(
         service.updateSettings("configurable", { autoSync: "yes" }),
       ).rejects.toThrow(/expects a boolean/);
+      await expect(
+        service.updateSettings("configurable", { retries: "4" }),
+      ).rejects.toThrow(/expects a finite number/);
       await expect(
         service.updateSettings("configurable", { mode: "warp" }),
       ).rejects.toThrow(/must be one of/);
@@ -327,7 +357,13 @@ describe("plugin settings + storage", () => {
     it("serves schema+values over the routes; PUT validates with 400s", async () => {
       await installConfigurable();
       const app = new Hono();
-      registerPluginRoutes(app, { config: { serverPort: 3334 }, db }, service);
+      registerPluginRoutes(
+        app,
+        { config: { serverPort: 3334 }, db },
+        service,
+        createPluginInstallJobs({ notifyChanged: () => {} }),
+        createPluginUpdateJobs({ notifyChanged: () => {} }),
+      );
 
       const got = await app.request("/plugins/configurable/settings");
       expect(got.status).toBe(200);

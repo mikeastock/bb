@@ -1,14 +1,19 @@
 import * as Notifications from "expo-notifications";
+import { getThreadRoutePath } from "@bb/client-core";
 import { useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
-import { useProfiles, useRealtimeConnectionState } from "@/app-shell";
+import {
+  useAppRevealed,
+  useProfiles,
+  useRealtimeConnectionState,
+} from "@/app-shell";
 import {
   parsePushNotificationData,
   resolvePushTargetProfile,
   isPushRegistrationAllowed,
+  shouldOfferPushPrompt,
   type PushNotificationTarget,
-  type PushSyncProfile,
 } from "@/data/notifications";
 import type { ServerProfile } from "@/lib/profiles";
 import { ActionSheet, toast, useSheet } from "@/ui";
@@ -35,20 +40,9 @@ export function PushNotificationsHost() {
     activeProfileIdRef.current = activeProfile?.id ?? null;
   }, [profiles, activeProfile]);
 
-  const syncProfile = useMemo<PushSyncProfile | null>(
-    () =>
-      activeProfile
-        ? {
-            id: activeProfile.id,
-            serverUrl: activeProfile.serverUrl,
-            mode: activeProfile.mode,
-          }
-        : null,
-    [activeProfile],
-  );
   const activeEnabled =
-    syncProfile !== null &&
-    storeSnapshot.enabledProfileIds.includes(syncProfile.id);
+    activeProfile !== null &&
+    storeSnapshot.enabledProfileIds.includes(activeProfile.id);
 
   useEffect(() => {
     Notifications.setNotificationHandler({
@@ -78,7 +72,13 @@ export function PushNotificationsHost() {
       router.push(
         webViewShellHref({
           profileId: profile.id,
-          path: `/threads/${target.threadId}`,
+          path:
+            target.projectId === null
+              ? `/threads/${target.threadId}`
+              : getThreadRoutePath({
+                  projectId: target.projectId,
+                  threadId: target.threadId,
+                }),
         }),
       );
     },
@@ -103,55 +103,36 @@ export function PushNotificationsHost() {
   }, [openTarget]);
 
   useEffect(() => {
-    const subscription = Notifications.addNotificationReceivedListener(
-      (notification) => {
-        const content = notification.request.content;
-        const target = parsePushNotificationData(content.data);
-        if (!target) return;
-        toast.message(content.title ?? "bb", {
-          description: content.body ?? undefined,
-          duration: 8_000,
-          action: { label: "Open", onClick: () => void openTarget(target) },
-        });
-      },
-    );
-    return () => subscription.remove();
-  }, [openTarget]);
-
-  useEffect(() => {
-    if (!syncProfile || !connected) return;
-    void controller.sync(syncProfile);
-  }, [controller, syncProfile, connected, activeEnabled]);
+    if (!activeProfile || !connected) return;
+    void controller.sync(activeProfile);
+  }, [controller, activeProfile, connected, activeEnabled]);
 
   useEffect(() => {
     const onChange = (state: AppStateStatus) => {
       if (state !== "active") return;
       void controller.refreshPermission().then(() => {
-        if (syncProfile) void controller.sync(syncProfile);
+        if (activeProfile) void controller.sync(activeProfile);
       });
     };
     const subscription = AppState.addEventListener("change", onChange);
     return () => subscription.remove();
-  }, [controller, syncProfile]);
+  }, [controller, activeProfile]);
 
   useEffect(
     () =>
       notifications.addTokenListener((deviceToken) => {
-        void controller.handleTokenRolled(
-          profilesRef.current.map((profile) => ({
-            id: profile.id,
-            serverUrl: profile.serverUrl,
-            mode: profile.mode,
-          })),
-          deviceToken,
-        );
+        void controller.handleTokenRolled(profilesRef.current, deviceToken);
       }),
     [controller, notifications],
   );
 
   useEffect(() => {
     if (status !== "ready") return;
-    void controller.reconcileRemovedProfiles(profiles.map((p) => p.id));
+    void controller
+      .reconcileRemovedProfiles(profiles.map((p) => p.id))
+      .catch((error) => {
+        console.warn("Could not clean up push registrations", error);
+      });
   }, [controller, status, profiles]);
 
   return (
@@ -162,9 +143,10 @@ export function PushNotificationsHost() {
         connected={connected}
         available={
           notifications.projectId !== null &&
-          (syncProfile === null || isPushRegistrationAllowed(syncProfile))
+          (activeProfile === null || isPushRegistrationAllowed(activeProfile))
         }
         prompted={storeSnapshot.prompted}
+        enabled={activeEnabled}
       />
     </>
   );
@@ -175,18 +157,22 @@ function FirstRunPrompt({
   connected,
   available,
   prompted,
+  enabled,
 }: {
   profile: ServerProfile | null;
   connected: boolean;
   available: boolean;
   prompted: boolean;
+  enabled: boolean;
 }) {
   const sheet = useSheet();
   const controller = getPushRegistrationController();
   const store = getPushStore();
   const notifications = getPushNotificationsModule();
   const [presentedFor, setPresentedFor] = useState<string | null>(null);
+  const revealed = useAppRevealed();
   const shouldAsk =
+    revealed &&
     available &&
     !prompted &&
     connected &&
@@ -197,40 +183,32 @@ function FirstRunPrompt({
     if (!shouldAsk || !profile) return;
     let cancelled = false;
     void notifications.getPermission().then((permission) => {
-      if (cancelled || permission !== "undetermined") return;
+      if (cancelled || !shouldOfferPushPrompt({ permission, enabled })) {
+        return;
+      }
       setPresentedFor(profile.id);
       sheet.present();
     });
     return () => {
       cancelled = true;
     };
-  }, [shouldAsk, profile, notifications, sheet]);
-
-  const target = useMemo(
-    () =>
-      profile
-        ? {
-            id: profile.id,
-            serverUrl: profile.serverUrl,
-            mode: profile.mode,
-          }
-        : null,
-    [profile],
-  );
+  }, [shouldAsk, profile, enabled, notifications, sheet]);
 
   return (
     <ActionSheet
+      presentation="prompt"
       controller={sheet}
       title="Get notified when a thread needs you?"
+      cancelLabel={process.env.EXPO_OS === "ios" ? "Cancel" : null}
       message="bb can send a push notification when a thread finishes, hits an error, or is waiting for your input. You can change this per server in Settings."
       actions={[
         {
           key: "enable",
           label: "Turn on notifications",
-          icon: "Zap",
+          icon: "Bell",
           onPress: () => {
-            if (!target) return;
-            void controller.setEnabled(target, true).then((outcome) => {
+            if (!profile) return;
+            void controller.setEnabled(profile, true).then((outcome) => {
               if (outcome.action === "failed") {
                 toast.error("Could not turn on notifications", {
                   description: outcome.error,

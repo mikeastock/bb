@@ -1,10 +1,12 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import ts from "typescript";
 import * as pluginSdkApp from "@get-bb/plugin-sdk/app";
 import {
   type BbPluginApi,
+  type ExperimentalAppOverlayProps,
   type PluginAppBuilder,
   type PluginAppSlots,
   type PluginContentScriptContext,
@@ -13,23 +15,27 @@ import {
   type PluginFileOpenerProps,
   type PluginHomepageSectionProps,
   type PluginHttpAuthMode,
-  type PluginCommandPaletteActionContext,
-  type PluginCommandPaletteActionRegistration,
+  type PluginCommandContext,
+  type PluginCommandRegistration,
   type PluginMessageActionContext,
   type PluginMessageActionRegistration,
+  type ThreadChatMessageReference,
   type PluginMessageDirectiveProps,
   type PluginNavPanelProps,
   type PluginNavPanelRegistration,
   type PluginNewThreadPanelProps,
   type PluginPendingInteractionProps,
+  type PluginEnvironmentProviderInputsProps,
+  type PluginMachineProviderInputsProps,
   type PluginProviderIconRegistration,
   type PluginTimelineRendererProps,
   type PluginSettingDescriptor,
   type PluginSettingsSectionProps,
   type PluginSidebarFooterActionProps,
-  type ExperimentalSidebarNavigationProps,
   type PluginSourceCodeRendererProps,
   type PluginThreadHeaderActionProps,
+  type PluginThreadActionItemInput,
+  type ExperimentalPluginBrowserToolbarActionProps,
   type PluginThreadListProps,
   type PluginSidebarFooterActionRegistration,
   type PluginThreadEventPayloads,
@@ -43,7 +49,7 @@ const REPO_ROOT = fileURLToPath(new URL("../../../../../", import.meta.url));
 
 const SKILL_ROOT = fileURLToPath(
   new URL(
-    "../../../src/services/skills/builtin-skills/bb-plugin-authoring/",
+    "../../../../../plugins/bb-guide/skills/bb-plugin-authoring/",
     import.meta.url,
   ),
 );
@@ -65,8 +71,13 @@ function readReference(name: string): string {
 }
 
 function exportedTypeNames(source: string): string[] {
-  return [...source.matchAll(/^export (?:interface|type) ([A-Za-z0-9_]+)/gm)]
-    .map((match) => match[1])
+  return [
+    ...source.matchAll(
+      /(\/\*\*(?:(?!\*\/)[\s\S])*\*\/\s*)?^export (?:interface|type) ([A-Za-z0-9_]+)/gm,
+    ),
+  ]
+    .filter((match) => !(match[1] ?? "").includes("@internal"))
+    .map((match) => match[2])
     .filter((name): name is string => name !== undefined);
 }
 
@@ -128,7 +139,6 @@ const FRONTEND_TEST_EXPORT_NAMES = [
 
 const PUBLIC_PLUGIN_SDK_EXPORT_NAMES = [
   "bb-plugin-sdk.d.ts",
-  "bb-plugin-sdk-ai-services.d.ts",
   "bb-plugin-sdk-provider-bridge.d.ts",
   "bb-plugin-sdk-provider-bridge-testing.d.ts",
   "bb-plugin-sdk-provider-bridge-acp.d.ts",
@@ -162,8 +172,12 @@ const BB_PLUGIN_API_KEYS = [
   "hosts",
   "experimental_aiServices",
   "experimental_hooks",
+  "experimental_environments",
+  "experimental_machines",
+  "experimental_serverAccess",
   "sdk",
   "onDispose",
+  "onInstall",
 ] as const satisfies readonly (keyof BbPluginApi)[];
 
 type MissingApiKey = Exclude<
@@ -176,6 +190,7 @@ void _assertAllApiKeysListed;
 
 const SETTING_DESCRIPTOR_TYPES = [
   "string",
+  "number",
   "boolean",
   "select",
   "project",
@@ -205,15 +220,22 @@ const _assertAllAuthModesListed: MissingAuthMode extends never ? true : never =
 void _assertAllAuthModesListed;
 
 const THREAD_EVENT_PAYLOAD_FIELDS = {
+  "experimental_thread.events": ["thread", "sequence"],
+  "experimental_thread.parentChanged": ["thread", "previousParentThreadId"],
+  "experimental_terminal.input": ["terminal"],
+  "experimental_host.deleted": ["host"],
+  "experimental_environment.removed": ["removal"],
   "thread.created": ["thread"],
   "thread.active": ["thread"],
   "thread.idle": ["thread", "lastAssistantText"],
   "thread.failed": ["thread", "error"],
   "thread.archived": ["thread"],
+  "thread.unarchived": ["thread"],
   "thread.deleted": ["thread"],
   "interaction.pending": ["thread", "interaction"],
   "message.queued": ["entry"],
   "message.dispatched": ["entry"],
+  "message.cancelled": ["entry"],
   "turn.failed": [
     "threadId",
     "requestId",
@@ -224,7 +246,9 @@ const THREAD_EVENT_PAYLOAD_FIELDS = {
     "attemptNumber",
   ],
 } as const satisfies {
-  [E in keyof PluginThreadEventPayloads]: readonly (keyof PluginThreadEventPayloads[E])[];
+  [
+    E in keyof PluginThreadEventPayloads
+  ]: readonly (keyof PluginThreadEventPayloads[E])[];
 };
 
 type MissingThreadEventField = {
@@ -241,22 +265,26 @@ void _assertAllThreadEventFieldsListed;
 type SlotPropsByName = {
   homepageSection: PluginHomepageSectionProps;
   settingsSection: PluginSettingsSectionProps;
+  experimental_appOverlay: ExperimentalAppOverlayProps;
   navPanel: PluginNavPanelProps;
   threadPanelAction: PluginThreadPanelProps;
   experimental_newThreadPanelAction: PluginNewThreadPanelProps;
   pendingInteraction: PluginPendingInteractionProps;
   sidebarFooterAction: PluginSidebarFooterActionProps;
-  experimental_sidebarNavigation: ExperimentalSidebarNavigationProps;
   experimental_threadList: PluginThreadListProps;
   experimental_threadHeaderAction: PluginThreadHeaderActionProps;
+  experimental_threadAction: PluginThreadActionItemInput<unknown>;
+  experimental_browserToolbarAction: ExperimentalPluginBrowserToolbarActionProps;
   fileOpener: PluginFileOpenerProps;
   experimental_sourceCodeRenderer: PluginSourceCodeRendererProps;
   experimental_diffRenderer: PluginDiffRendererProps;
   messageDirective: PluginMessageDirectiveProps;
   messageAction: PluginMessageActionContext;
-  commandPaletteAction: PluginCommandPaletteActionContext;
+  commandPaletteAction: PluginCommandContext;
   experimental_providerIcon: PluginProviderIconRegistration;
   experimental_timelineRenderer: PluginTimelineRendererProps;
+  experimental_environmentProviderInputs: PluginEnvironmentProviderInputsProps;
+  experimental_machineProviderInputs: PluginMachineProviderInputsProps;
 };
 
 type MissingSlot = Exclude<keyof PluginAppSlots, keyof SlotPropsByName>;
@@ -264,9 +292,12 @@ const _assertAllSlotsListed: MissingSlot extends never ? true : never = true;
 void _assertAllSlotsListed;
 
 const APP_BUILDER_FIELDS = [
+  "commands",
+  "experimental_icons",
   "slots",
   "composer",
   "contentScripts",
+  "experimental_sidebarFooter",
 ] as const satisfies readonly (keyof PluginAppBuilder)[];
 
 type MissingAppBuilderField = Exclude<
@@ -311,40 +342,39 @@ void _assertAllContentScriptRegistrationFieldsListed;
 const FRONTEND_SLOT_PROP_FIELDS = {
   homepageSection: ["projectId"],
   settingsSection: [],
+  experimental_appOverlay: [],
   navPanel: ["subPath"],
   threadPanelAction: ["threadId", "params"],
   experimental_newThreadPanelAction: ["projectId", "params"],
   pendingInteraction: ["interaction", "submit", "cancel"],
   sidebarFooterAction: [],
-  experimental_sidebarNavigation: [
-    "items",
-    "activeItemId",
-    "isCompactViewport",
-    "experimental_activate",
-    "experimental_Original",
-  ],
   experimental_threadList: [
     "activeThreadId",
     "activeProjectId",
     "isCompactViewport",
     "onNavigate",
     "searchQuery",
-    "Original",
-    "experimental_Original",
   ],
   experimental_threadHeaderAction: [
     "threadId",
     "projectId",
     "isCompactViewport",
   ],
-  fileOpener: ["path", "source", "Original", "experimental_Original"],
+  experimental_threadAction: ["thread", "data", "sdk", "navigate"],
+  experimental_browserToolbarAction: [
+    "threadId",
+    "tabId",
+    "url",
+    "experimental_page",
+    "isCompactViewport",
+  ],
+  fileOpener: ["path", "source", "experimental_lineRange", "Original"],
   experimental_sourceCodeRenderer: [
     "content",
     "path",
     "overflow",
     "highlightedLines",
     "Original",
-    "experimental_Original",
   ],
   experimental_diffRenderer: [
     "patch",
@@ -354,12 +384,17 @@ const FRONTEND_SLOT_PROP_FIELDS = {
     "showLineNumbers",
     "experimental_fullFileContents",
     "Original",
-    "experimental_Original",
   ],
   messageDirective: ["attributes", "source", "message", "openWorkspaceFile"],
-  messageAction: ["threadId", "message", "selectedText", "openPanel"],
+  messageAction: [
+    "threadId",
+    "message",
+    "selectedText",
+    "openPanel",
+    "composer",
+  ],
   commandPaletteAction: ["threadId", "projectId", "openPanel"],
-  experimental_providerIcon: ["providerId", "icon"],
+  experimental_providerIcon: ["providerKind", "providerId", "icon"],
   experimental_timelineRenderer: [
     "row",
     "payload",
@@ -367,6 +402,13 @@ const FRONTEND_SLOT_PROP_FIELDS = {
     "thread",
     "Original",
   ],
+  experimental_environmentProviderInputs: [
+    "projectId",
+    "target",
+    "value",
+    "onChange",
+  ],
+  experimental_machineProviderInputs: ["value", "onChange"],
 } as const satisfies {
   [S in keyof SlotPropsByName]: readonly (keyof SlotPropsByName[S])[];
 };
@@ -434,15 +476,34 @@ const _assertAllMessageActionRegistrationFieldsListed: MissingMessageActionRegis
   : never = true;
 void _assertAllMessageActionRegistrationFieldsListed;
 
+const MESSAGE_REFERENCE_FIELDS = [
+  "id",
+  "threadId",
+  "role",
+  "text",
+  "sourceSeqEnd",
+  "experimental_messageSeq",
+] as const satisfies readonly (keyof ThreadChatMessageReference)[];
+
+type MissingMessageReferenceField = Exclude<
+  keyof ThreadChatMessageReference,
+  (typeof MESSAGE_REFERENCE_FIELDS)[number]
+>;
+const _assertAllMessageReferenceFieldsListed: MissingMessageReferenceField extends never
+  ? true
+  : never = true;
+void _assertAllMessageReferenceFieldsListed;
+
 const COMMAND_PALETTE_ACTION_REGISTRATION_FIELDS = [
+  "defaultShortcut",
   "id",
   "title",
   "isAvailable",
   "run",
-] as const satisfies readonly (keyof PluginCommandPaletteActionRegistration)[];
+] as const satisfies readonly (keyof PluginCommandRegistration)[];
 
 type MissingCommandPaletteActionRegistrationField = Exclude<
-  keyof PluginCommandPaletteActionRegistration,
+  keyof PluginCommandRegistration,
   (typeof COMMAND_PALETTE_ACTION_REGISTRATION_FIELDS)[number]
 >;
 const _assertAllCommandPaletteActionRegistrationFieldsListed: MissingCommandPaletteActionRegistrationField extends never
@@ -491,6 +552,43 @@ describe("bb-plugin-authoring skill", () => {
   const skillEntry = readFileSync(SKILL_PATH, "utf8");
   const skill = readSkillTree();
 
+  it("typechecks the machine provider guide example against the public SDK", () => {
+    const source = readReference("backend-machines.md").match(
+      /```ts\n([\s\S]*?)```/u,
+    )?.[1];
+    expect(source).toBeDefined();
+    const filename = fileURLToPath(
+      new URL("./machine-guide-example.ts", import.meta.url),
+    );
+    const options: ts.CompilerOptions = {
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    };
+    const host = ts.createCompilerHost(options);
+    const readSource = host.getSourceFile.bind(host);
+    host.getSourceFile = (
+      file,
+      languageVersion,
+      onError,
+      shouldCreateNewSourceFile,
+    ) =>
+      resolve(file) === filename
+        ? ts.createSourceFile(file, source!, languageVersion)
+        : readSource(file, languageVersion, onError, shouldCreateNewSourceFile);
+    const program = ts.createProgram([filename], options, host);
+    expect(
+      ts
+        .getPreEmitDiagnostics(program)
+        .map((diagnostic) =>
+          ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+        ),
+    ).toEqual([]);
+  });
+
   it("has frontmatter naming the skill after its directory", () => {
     expect(skillEntry).toMatch(/^---\nname: bb-plugin-authoring\n/);
   });
@@ -507,6 +605,16 @@ describe("bb-plugin-authoring skill", () => {
     for (const name of FRONTEND_RUNTIME_EXPORT_NAMES) {
       expect(skill, `${name} is not documented in the skill`).toContain(name);
     }
+  });
+
+  it("warns that environment provider inputs are persisted configuration, not credentials", () => {
+    const documented = readReference("backend-events.md").replace(/\s+/g, " ");
+    expect(documented).toContain(
+      "Parsed inputs are persisted on the environment and are readable by every plugin through the SDK, including after the environment is destroyed.",
+    );
+    expect(documented).toContain(
+      "They are configuration, not a credential store; keep credentials in secret settings.",
+    );
   });
 
   it("accounts for every @get-bb/plugin-sdk/app type export", () => {
@@ -599,6 +707,39 @@ describe("bb-plugin-authoring skill", () => {
     }
   });
 
+  it("keeps environment app symbols and composer and event guidance current", () => {
+    const frontendIndex = readReference("frontend-api-index.md");
+    const backendIndex = readReference("backend-api-index.md");
+    const appSymbols = [
+      "experimental_BranchPicker",
+      "BranchPickerProps",
+      "experimental_useBranches",
+      "UseBranchesArgs",
+      "BranchesState",
+      "experimental_useCheckoutState",
+      "UseCheckoutStateArgs",
+      "CheckoutState",
+      "PluginEnvironmentProviderInputsChange",
+      "PluginEnvironmentProviderInputsProps",
+      "PluginEnvironmentProviderInputsRegistration",
+    ];
+    for (const symbol of appSymbols) {
+      expect(frontendIndex).toContain(`\`${symbol}\``);
+      expect(backendIndex).not.toContain(`\`${symbol}\``);
+    }
+
+    expect(readReference("frontend-components.md")).not.toContain(
+      'workspace: { type: "personal" }',
+    );
+    expect(readReference("backend-events.md")).toContain("Fourteen events.");
+    expect(readReference("backend-events.md")).toContain(
+      "The seven `thread.*` ones",
+    );
+    expect(readReference("testing.md")).toContain(
+      "Thread events are observe-only; there are exactly seven",
+    );
+  });
+
   it("documents every navPanel registration field", () => {
     for (const field of NAV_PANEL_REGISTRATION_FIELDS) {
       expect(
@@ -625,7 +766,12 @@ describe("bb-plugin-authoring skill", () => {
         `messageAction registration field "${field}" is not documented in the skill`,
       ).toContain(field);
     }
-    expect(skill).toContain("sourceSeqEnd");
+    for (const field of MESSAGE_REFERENCE_FIELDS) {
+      expect(
+        skill,
+        `message reference field "${field}" is not documented in the skill`,
+      ).toContain(field);
+    }
   });
 
   it("documents every commandPaletteAction registration field", () => {

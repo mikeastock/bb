@@ -14,10 +14,12 @@ import {
   THREAD_DELTA_NOTIFICATION_METHOD,
 } from "@bb/provider-bridge-protocol";
 import type {
+  BridgeExecutionOptions,
   InitializeResult,
   ThreadDelta,
 } from "@bb/provider-bridge-protocol";
 import {
+  PROVIDER_TOOL_CALL_CANCELLED_METHOD,
   BridgeRecoveryError,
   bridgeRequestEnvelopeSchema,
   createBridgeIo,
@@ -29,20 +31,20 @@ import {
   runBridgeRequest,
   withoutBridgeRuntimeEnv,
 } from "@bb/provider-bridge-protocol/bridge-kit";
-import type { BridgeJsonRpcResponse } from "@bb/provider-bridge-protocol/bridge-kit";
-import { execFile } from "node:child_process";
+import type {
+  BridgeJsonRpcResponse,
+  BridgeToolCallContent,
+  BridgeToolCallImage,
+} from "@bb/provider-bridge-protocol/bridge-kit";
+import { execPortableFile } from "@bb/process-utils";
 import { randomBytes } from "node:crypto";
 import { promises as fs, readFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, basename, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-
-type DecodedToolCallResponse = ReturnType<typeof decodeToolCallResponsePayload>;
-type BridgeToolCallContent = DecodedToolCallResponse["contentBlocks"][number];
-type BridgeToolCallImage = DecodedToolCallResponse["images"][number];
 import {
-  ACP_BRIDGE_NO_ACTIVE_TURN_ERROR_CODE,
   ACP_COMPACTION_COMPLETED_METHOD,
   ACP_COMPACTION_STARTED_METHOD,
   ACP_DEFAULT_MODEL_ID,
@@ -64,6 +66,8 @@ import {
 } from "../delta-translation.js";
 import {
   compactionOutcomeForEndTurn,
+  grokContextUsageFromPromptResult,
+  grokContextWindowSizeFromSessionModels,
   resolveAcpDialect,
   type AcpDialect,
 } from "../dialect.js";
@@ -74,12 +78,14 @@ import {
 } from "../interactions.js";
 import {
   buildAcpModelListParams,
+  buildAcpModelSelectionParams,
   buildAcpSessionParams,
   type AcpAgentCommandParam,
   type AcpModelListParams,
   type AcpSessionParams,
   type AcpSkillRoot,
 } from "../session-params.js";
+import { buildCursorParameterizedModelCatalog } from "../cursor-model-selection.js";
 import {
   getAcpProviderHealth,
   getAcpProviderInstallationRun,
@@ -87,10 +93,8 @@ import {
   getAcpProviderUsage,
 } from "./provider-maintenance.js";
 import {
-  ACP_PROTOCOL_VERSION,
   type AcpConfigOption,
   acpConfigStateResultSchema,
-  acpInitializeResultSchema,
   acpPromptResultSchema,
   acpReadTextFileParamsSchema,
   acpRequestPermissionParamsSchema,
@@ -111,6 +115,7 @@ import {
 import {
   AcpAgentResponseError,
   createAcpAgentConnection,
+  requestAcpInitialize,
   type AcpAgentConnection,
   type AcpAgentRequestResponder,
 } from "./agent-connection.js";
@@ -136,6 +141,7 @@ import {
 import {
   ACP_BRIDGE_MCP_SERVER_NAME,
   buildAcpMcpServerConfig,
+  dynamicToolBridgeRequestSchema,
   runAcpDynamicToolMcpServer,
   type AcpMcpServerConfig,
 } from "./tool-proxy-mcp.js";
@@ -154,10 +160,18 @@ interface AcpPendingTurnInput {
   clientRequestId: string;
   input: PromptInput[];
   requestId: AcpBridgeRequestId | null;
+  options: BridgeExecutionOptions;
+}
+
+interface AcpNativeConfigState {
+  configOptions: readonly AcpConfigOption[] | undefined;
+  models: AcpSessionModels | undefined;
 }
 
 interface AcpThreadSession {
   bbThreadId: string;
+  construction: AcpSessionParams;
+  nativeConfig: AcpNativeConfigState;
   providerThreadId: string;
   cwd: string;
   dialect: AcpDialect;
@@ -172,12 +186,15 @@ interface AcpThreadSession {
   queuedInputs: AcpPendingTurnInput[];
   promptRequestPending: boolean;
   cancelRequested: boolean;
+  restartAfterCancelError: boolean;
   loading: boolean;
   loadingSessionId: string | undefined;
   pendingLoadUsageUpdate: AcpUsageUpdate | undefined;
+  grokContextWindowSize: number | undefined;
   stopping: boolean;
   turnSettled: Promise<void> | undefined;
   pendingPermissions: Set<PendingAcpPermission>;
+  pendingToolCalls: Set<AbortController>;
   cursorMcpApproval: CursorMcpApproval | undefined;
   deferStartEmit: AcpDeferredStartEmitter | undefined;
 }
@@ -228,11 +245,20 @@ function sendNotification(
 function sendRuntimeRequest(
   method: string,
   params: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<unknown> {
+  signal?.throwIfAborted();
   runtimeRequestIdCounter += 1;
   const requestId = runtimeRequestIdCounter;
+  let abort: () => void;
   const responsePromise = new Promise<unknown>(
     (resolveResponse, rejectResponse) => {
+      abort = () => {
+        pendingRuntimeRequests.delete(requestId);
+        sendNotification(PROVIDER_TOOL_CALL_CANCELLED_METHOD, { requestId });
+        rejectResponse(new Error("ACP dynamic tool call cancelled"));
+      };
+      signal?.addEventListener("abort", abort, { once: true });
       pendingRuntimeRequests.set(requestId, (response) => {
         if ("error" in response) {
           rejectResponse(
@@ -250,7 +276,9 @@ function sendRuntimeRequest(
     method,
     params,
   });
-  return responsePromise;
+  return responsePromise.finally(() =>
+    signal?.removeEventListener("abort", abort),
+  );
 }
 
 let configuredSkillRoots: AcpSkillRoot[] | null = null;
@@ -268,6 +296,37 @@ function sendThreadDeltas(
   });
 }
 
+function rememberGrokContextWindow(
+  session: AcpThreadSession,
+  models: unknown,
+): void {
+  if (session.dialect.id !== "grok") {
+    return;
+  }
+  const size = grokContextWindowSizeFromSessionModels(models);
+  if (size !== undefined) {
+    session.grokContextWindowSize = size;
+  }
+}
+
+function emitGrokContextWindow(session: AcpThreadSession, used: number): void {
+  if (
+    session.dialect.id !== "grok" ||
+    session.grokContextWindowSize === undefined
+  ) {
+    return;
+  }
+  sendThreadDeltas(session.bbThreadId, [
+    {
+      kind: "contextWindow",
+      used,
+      size: session.grokContextWindowSize,
+      estimated: false,
+      attach: "open",
+    },
+  ]);
+}
+
 function emitForSession(
   session: AcpThreadSession,
   method: string,
@@ -283,6 +342,7 @@ function emitForSession(
 }
 
 function emitSessionError(session: AcpThreadSession, message: string): void {
+  for (const controller of session.pendingToolCalls) controller.abort();
   if (session.activePromptKind !== null) {
     emitForSession(session, "error", {
       threadId: session.bbThreadId,
@@ -311,12 +371,15 @@ function resolveBridgeProcessEnvForMcpServer(): AcpMcpServerConfig["env"] {
   return [{ name: "ELECTRON_RUN_AS_NODE", value: electronRunAsNode }];
 }
 
-async function forwardDynamicToolCall(args: {
-  arguments: Record<string, unknown>;
-  callId: string;
-  threadId: string;
-  tool: string;
-}): Promise<
+async function forwardDynamicToolCall(
+  args: {
+    arguments: Record<string, unknown>;
+    callId: string;
+    threadId: string;
+    tool: string;
+  },
+  signal: AbortSignal,
+): Promise<
   | {
       ok: true;
       content: string;
@@ -327,26 +390,39 @@ async function forwardDynamicToolCall(args: {
   | { ok: false; error: string }
 > {
   const session = sessionsByBbThreadId.get(args.threadId);
-  if (!session || !session.providerThreadId || session.stopping) {
+  if (
+    !session ||
+    !session.providerThreadId ||
+    session.stopping ||
+    session.connection.exited
+  ) {
     return { ok: false, error: "No active ACP session for dynamic tool call." };
   }
 
+  const controller = new AbortController();
+  session.pendingToolCalls.add(controller);
   session.translator.noteInjectedToolCall(session.bbThreadId, args.tool);
   try {
-    const result = await sendRuntimeRequest("item/tool/call", {
-      providerThreadId: session.providerThreadId,
-      threadId: session.bbThreadId,
-      turnId: null,
-      callId: args.callId,
-      tool: args.tool,
-      arguments: args.arguments,
-    });
+    const result = await sendRuntimeRequest(
+      "item/tool/call",
+      {
+        providerThreadId: session.providerThreadId,
+        threadId: session.bbThreadId,
+        turnId: null,
+        callId: args.callId,
+        tool: args.tool,
+        arguments: args.arguments,
+      },
+      AbortSignal.any([signal, controller.signal]),
+    );
     return { ok: true, ...decodeToolCallResponsePayload(result) };
   } catch (error) {
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    session.pendingToolCalls.delete(controller);
   }
 }
 
@@ -354,15 +430,20 @@ function handleDynamicToolBridgeSocket(
   bridge: AcpDynamicToolBridge,
   socket: Socket,
 ): void {
+  const controller = new AbortController();
+  socket.once("close", () => controller.abort());
+  let handled = false;
   let buffer = "";
   socket.setEncoding("utf8");
   socket.on("error", () => {});
   socket.on("data", (chunk) => {
+    if (handled) return;
     buffer += chunk;
     const newlineIndex = buffer.indexOf("\n");
     if (newlineIndex === -1) {
       return;
     }
+    handled = true;
     const line = buffer.slice(0, newlineIndex);
     let parsed: unknown;
     try {
@@ -385,9 +466,12 @@ function handleDynamicToolBridgeSocket(
       socket.end(`${JSON.stringify({ ok: true, content: "" })}\n`);
       return;
     }
-    void forwardDynamicToolCall(request.data).then((response) => {
-      socket.end(`${JSON.stringify(response)}\n`);
-    });
+    void forwardDynamicToolCall(request.data, controller.signal).then(
+      (response) => {
+        if (controller.signal.aborted) return;
+        socket.end(`${JSON.stringify(response)}\n`);
+      },
+    );
   });
 }
 
@@ -639,23 +723,6 @@ interface AcpDynamicToolBridge {
   token: string;
 }
 
-const dynamicToolBridgeRequestSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("initialized"),
-    threadId: z.string().min(1),
-    token: z.string().min(1),
-    toolCount: z.number().int().nonnegative(),
-  }),
-  z.object({
-    kind: z.literal("toolCall"),
-    arguments: z.record(z.string(), z.unknown()).default({}),
-    callId: z.string().min(1),
-    threadId: z.string().min(1),
-    token: z.string().min(1),
-    tool: z.string().min(1),
-  }),
-]);
-
 let cachedModelCatalog: { key: string; catalog: AgentModelCatalog } | null =
   null;
 const SESSION_MODEL_DISCOVERY_TTL_MS = 60_000;
@@ -707,51 +774,36 @@ async function authenticateAcpAgent(args: {
   }
 }
 
-function acpClientCapabilities(
-  parameterizedModelPicker: boolean,
-  fsAccess = false,
-) {
-  return {
-    fs: { readTextFile: fsAccess, writeTextFile: fsAccess },
-    terminal: false,
-    ...(parameterizedModelPicker === true
-      ? { _meta: { parameterizedModelPicker: true } }
-      : {}),
-  };
-}
-
 async function loadAgentModelCatalog(
   listCommand: AcpAgentCommandParam,
 ): Promise<AgentModelCatalog | null> {
-  const stdout = await new Promise<string | null>((resolveExec, rejectExec) => {
-    execFile(
-      listCommand.command,
-      listCommand.args,
-      {
-        ...(listCommand.cwd !== undefined ? { cwd: listCommand.cwd } : {}),
-        env: {
-          ...withoutBridgeRuntimeEnv(process.env),
-          ...(listCommand.envVars ?? {}),
-        },
-        timeout: MODEL_LIST_TIMEOUT_MS,
-      },
-      (error, out, stderr) => {
-        if (!error) {
-          resolveExec(out);
-          return;
-        }
-        if (isMissingExecutableError(error)) {
-          rejectExec(error);
-          return;
-        }
-        if (isAuthRequiredModelListError(error, out, stderr)) {
-          rejectExec(new AcpModelListAuthRequiredError());
-          return;
-        }
-        resolveExec(null);
-      },
-    );
-  });
+  const stdout = await execPortableFile(listCommand.command, listCommand.args, {
+    cwd: listCommand.cwd ?? process.cwd(),
+    env: {
+      ...withoutBridgeRuntimeEnv(process.env),
+      ...(listCommand.envVars ?? {}),
+    },
+    maxBuffer: 1024 * 1024,
+    timeout: MODEL_LIST_TIMEOUT_MS,
+  }).then(
+    ({ stdout }) => stdout,
+    (error: unknown) => {
+      if (isMissingExecutableError(error)) throw error;
+      const output = z
+        .object({ stdout: z.string(), stderr: z.string() })
+        .safeParse(error);
+      if (
+        isAuthRequiredModelListError(
+          error,
+          output.success ? output.data.stdout : "",
+          output.success ? output.data.stderr : "",
+        )
+      ) {
+        throw new AcpModelListAuthRequiredError();
+      }
+      return null;
+    },
+  );
   const key = JSON.stringify(listCommand);
   if (stdout === null) {
     process.stderr.write(
@@ -820,14 +872,9 @@ async function loadSessionDiscoveredModels(
   try {
     const newSession = await Promise.race([
       (async () => {
-        const initializeResult = await connection.request({
-          method: "initialize",
-          params: {
-            protocolVersion: ACP_PROTOCOL_VERSION,
-            clientInfo: { name: "bb", version: "1.0.0" },
-            clientCapabilities: acpClientCapabilities(parameterizedModelPicker),
-          },
-          resultSchema: acpInitializeResultSchema,
+        const initializeResult = await requestAcpInitialize(connection, {
+          parameterizedModelPicker,
+          fsAccess: false,
         });
         await authenticateAcpAgent({
           connection,
@@ -869,10 +916,10 @@ async function loadSessionDiscoveredModels(
       modelOption,
       reasoningProbePriorityModelIds,
     });
-    const models =
-      reasoningByModel === null
-        ? configOptionModels
-        : buildModelCatalogFromConfigOptions(modelOption, reasoningByModel);
+    const models = buildModelCatalogFromConfigOptions(
+      modelOption,
+      reasoningByModel,
+    );
     cachedSessionDiscoveredModels = {
       key,
       models,
@@ -890,7 +937,7 @@ async function loadSessionDiscoveredModels(
     if (timeout !== undefined) {
       clearTimeout(timeout);
     }
-    connection.kill();
+    await connection.kill();
   }
 }
 
@@ -899,10 +946,10 @@ async function discoverAcpNativeReasoningByModel(args: {
   sessionId: string;
   modelOption: AcpConfigOption | undefined;
   reasoningProbePriorityModelIds: readonly string[];
-}): Promise<ReadonlyMap<string, AcpNativeReasoningSupport> | null> {
+}): Promise<ReadonlyMap<string, AcpNativeReasoningSupport>> {
   const modelOptions = args.modelOption?.options ?? [];
   if (!args.modelOption || modelOptions.length === 0) {
-    return null;
+    return new Map();
   }
   const modelOption = args.modelOption;
   const modelByValue = new Map(
@@ -924,11 +971,13 @@ async function discoverAcpNativeReasoningByModel(args: {
   }
 
   const supportByModel = new Map<string, AcpNativeReasoningSupport>();
+  let timedOut = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timeoutReached = new Promise<
     ReadonlyMap<string, AcpNativeReasoningSupport>
   >((resolve) => {
     timeout = setTimeout(() => {
+      timedOut = true;
       args.connection.kill();
       resolve(supportByModel);
     }, ACP_NATIVE_REASONING_DISCOVERY_TIMEOUT_MS);
@@ -938,28 +987,37 @@ async function discoverAcpNativeReasoningByModel(args: {
     return await Promise.race([
       (async () => {
         for (const model of modelsToProbe) {
-          const configState = await args.connection.request({
-            method: "session/set_config_option",
-            params: {
-              sessionId: args.sessionId,
-              configId: modelOption.id,
-              value: model.value,
-            },
-            resultSchema: acpConfigStateResultSchema,
-          });
-          supportByModel.set(
-            model.value,
-            buildAcpNativeReasoningSupport(
-              findAcpThoughtLevelConfigOption(configState.configOptions),
-            ),
-          );
+          try {
+            const configState = await args.connection.request({
+              method: "session/set_config_option",
+              params: {
+                sessionId: args.sessionId,
+                configId: modelOption.id,
+                value: model.value,
+              },
+              resultSchema: acpConfigStateResultSchema,
+            });
+            supportByModel.set(
+              model.value,
+              buildAcpNativeReasoningSupport(
+                findAcpThoughtLevelConfigOption(configState.configOptions),
+              ),
+            );
+          } catch (error) {
+            if (timedOut) {
+              break;
+            }
+            process.stderr.write(
+              `acp bridge: ACP-native reasoning discovery for model "${model.value}" failed: ${
+                error instanceof Error ? error.message : String(error)
+              }\n`,
+            );
+          }
         }
         return supportByModel;
       })(),
       timeoutReached,
     ]);
-  } catch {
-    return supportByModel.size > 0 ? supportByModel : null;
   } finally {
     if (timeout !== undefined) {
       clearTimeout(timeout);
@@ -1102,10 +1160,8 @@ async function resolveAgentLaunchArgs(
 }
 
 async function selectAcpNativeModel(args: {
-  connection: AcpAgentConnection;
+  session: AcpThreadSession;
   sessionId: string;
-  configOptions: readonly AcpConfigOption[] | undefined;
-  models: AcpSessionModels | undefined;
   modelSelection: AcpSessionParams["modelSelection"];
   nativeReasoning: AcpBridgeNativeReasoning | undefined;
 }): Promise<void> {
@@ -1113,9 +1169,10 @@ async function selectAcpNativeModel(args: {
   if (!selection || !("modelId" in selection)) {
     return;
   }
-  let configOptions = args.configOptions;
-  const modelOption = findAcpModelConfigOption(args.configOptions);
-  const availableSessionModels = args.models?.availableModels ?? [];
+  const { session } = args;
+  const { configOptions, models } = session.nativeConfig;
+  const modelOption = findAcpModelConfigOption(configOptions);
+  const availableSessionModels = models?.availableModels ?? [];
   const sessionModelsIncludeSelection = availableSessionModels.some(
     (model) => model.modelId === selection.modelId,
   );
@@ -1123,13 +1180,13 @@ async function selectAcpNativeModel(args: {
     (modelOption && modelOption.currentValue !== selection.modelId) ||
     (!modelOption &&
       sessionModelsIncludeSelection &&
-      args.models?.currentModelId !== selection.modelId);
+      models?.currentModelId !== selection.modelId);
   if (shouldSetModel) {
     let configState: AcpConfigStateResult | null = null;
     let setModel = true;
     if (modelOption) {
       try {
-        configState = await args.connection.request({
+        configState = await session.connection.request({
           method: "session/set_config_option",
           params: {
             sessionId: args.sessionId,
@@ -1144,33 +1201,84 @@ async function selectAcpNativeModel(args: {
       }
     }
     if (setModel) {
-      configState = await args.connection.request({
+      configState = await session.connection.request({
         method: "session/set_model",
         params: { sessionId: args.sessionId, modelId: selection.modelId },
         resultSchema: z.union([acpConfigStateResultSchema, z.null()]),
       });
     }
-    configOptions = configState?.configOptions ?? configOptions;
+    const current = session.nativeConfig;
+    session.nativeConfig = {
+      configOptions:
+        configState?.configOptions ??
+        withAcpConfigValue(
+          current.configOptions,
+          modelOption?.id,
+          selection.modelId,
+        ),
+      models:
+        configState?.models ??
+        (current.models && {
+          ...current.models,
+          currentModelId: selection.modelId,
+        }),
+    };
   }
   await selectAcpNativeReasoning({
-    connection: args.connection,
+    session,
     sessionId: args.sessionId,
-    configOptions,
     modelSelection: selection,
     nativeReasoning: args.nativeReasoning,
   });
   await selectAcpNativeServiceTier({
-    connection: args.connection,
+    session,
     sessionId: args.sessionId,
-    configOptions,
     modelSelection: selection,
   });
 }
 
+function withAcpConfigValue(
+  configOptions: readonly AcpConfigOption[] | undefined,
+  configId: string | undefined,
+  value: string,
+): readonly AcpConfigOption[] | undefined {
+  return configOptions?.map((option) =>
+    option.id === configId ? { ...option, currentValue: value } : option,
+  );
+}
+
+function recordAcpConfigValue(
+  session: AcpThreadSession,
+  configState: AcpConfigStateResult | null,
+  configId: string,
+  value: string,
+): void {
+  session.nativeConfig = {
+    ...session.nativeConfig,
+    configOptions:
+      configState?.configOptions ??
+      withAcpConfigValue(session.nativeConfig.configOptions, configId, value),
+  };
+}
+
+function acpNativeModelDrifted(
+  nativeConfig: AcpNativeConfigState,
+  modelSelection: AcpSessionParams["modelSelection"],
+): boolean {
+  if (!modelSelection || !("modelId" in modelSelection)) {
+    return false;
+  }
+  const currentModelId =
+    findAcpModelConfigOption(nativeConfig.configOptions)?.currentValue ??
+    nativeConfig.models?.currentModelId;
+  return (
+    currentModelId !== undefined && currentModelId !== modelSelection.modelId
+  );
+}
+
 async function selectAcpNativeReasoning(args: {
-  connection: AcpAgentConnection;
+  session: AcpThreadSession;
   sessionId: string;
-  configOptions: readonly AcpConfigOption[] | undefined;
   modelSelection: Extract<
     AcpSessionParams["modelSelection"],
     { modelId: string }
@@ -1182,7 +1290,7 @@ async function selectAcpNativeReasoning(args: {
     return;
   }
   const thoughtLevelOption =
-    findAcpThoughtLevelConfigOption(args.configOptions) ??
+    findAcpThoughtLevelConfigOption(args.session.nativeConfig.configOptions) ??
     nativeReasoningToThoughtLevelOption(args.nativeReasoning);
   if (!thoughtLevelOption) {
     return;
@@ -1194,23 +1302,26 @@ async function selectAcpNativeReasoning(args: {
   if (value === undefined) {
     return;
   }
+  let configState: AcpConfigStateResult | null;
   try {
-    await args.connection.request({
+    configState = await args.session.connection.request({
       method: "session/set_config_option",
       params: {
         sessionId: args.sessionId,
         configId: thoughtLevelOption.id,
         value,
       },
-      resultSchema: acpConfigStateResultSchema,
+      resultSchema: z.union([acpConfigStateResultSchema, z.null()]),
     });
-  } catch {}
+  } catch {
+    return;
+  }
+  recordAcpConfigValue(args.session, configState, thoughtLevelOption.id, value);
 }
 
 async function selectAcpNativeServiceTier(args: {
-  connection: AcpAgentConnection;
+  session: AcpThreadSession;
   sessionId: string;
-  configOptions: readonly AcpConfigOption[] | undefined;
   modelSelection: Extract<
     AcpSessionParams["modelSelection"],
     { modelId: string }
@@ -1220,22 +1331,23 @@ async function selectAcpNativeServiceTier(args: {
   if (serviceTier === undefined) {
     return;
   }
-  const fastOption = (args.configOptions ?? []).find(
+  const fastOption = (args.session.nativeConfig.configOptions ?? []).find(
     (option) => option.id === "fast" && option.type === "select",
   );
   const value = serviceTier === "fast" ? "true" : "false";
   if (!fastOption?.options?.some((option) => option.value === value)) {
     return;
   }
-  await args.connection.request({
+  const configState = await args.session.connection.request({
     method: "session/set_config_option",
     params: {
       sessionId: args.sessionId,
       configId: fastOption.id,
       value,
     },
-    resultSchema: acpConfigStateResultSchema,
+    resultSchema: z.union([acpConfigStateResultSchema, z.null()]),
   });
+  recordAcpConfigValue(args.session, configState, fastOption.id, value);
 }
 
 function buildPromptContentBlocks(
@@ -1426,39 +1538,37 @@ function handlePermissionRequest(
         }
       : undefined;
 
-  {
-    const payload = buildAcpPermissionInteractionPayload({
-      toolCall: normalizedToolCall,
-      options: parsed.data.options,
-      cwd: session.cwd,
-      classifyToolCall: session.dialect.classifyToolCall,
-    });
-    void sendRuntimeRequest(BRIDGE_INBOUND_REQUEST_METHODS.interactionRequest, {
-      providerThreadId: session.providerThreadId,
-      threadId: session.bbThreadId,
-      turnId: null,
-      payload,
+  const payload = buildAcpPermissionInteractionPayload({
+    toolCall: normalizedToolCall,
+    options: parsed.data.options,
+    cwd: session.cwd,
+    classifyToolCall: session.dialect.classifyToolCall,
+  });
+  void sendRuntimeRequest(BRIDGE_INBOUND_REQUEST_METHODS.interactionRequest, {
+    providerThreadId: session.providerThreadId,
+    threadId: session.bbThreadId,
+    turnId: null,
+    payload,
+  })
+    .then((result) => {
+      if (!session.pendingPermissions.delete(pending)) {
+        return;
+      }
+      const resolution = pendingInteractionResolutionSchema.safeParse(result);
+      const response = resolution.success
+        ? resolveAcpPermissionDecision({
+            payload,
+            resolution: resolution.data,
+          })
+        : null;
+      respondPermission(pending, response?.decision ?? null);
     })
-      .then((result) => {
-        if (!session.pendingPermissions.delete(pending)) {
-          return;
-        }
-        const resolution = pendingInteractionResolutionSchema.safeParse(result);
-        const response = resolution.success
-          ? resolveAcpPermissionDecision({
-              payload,
-              resolution: resolution.data,
-            })
-          : null;
-        respondPermission(pending, response?.decision ?? null);
-      })
-      .catch(() => {
-        if (!session.pendingPermissions.delete(pending)) {
-          return;
-        }
-        respondPermission(pending, null);
-      });
-  }
+    .catch(() => {
+      if (!session.pendingPermissions.delete(pending)) {
+        return;
+      }
+      respondPermission(pending, null);
+    });
 }
 
 function isPathInsideRoots(targetPath: string, roots: string[]): boolean {
@@ -1547,7 +1657,7 @@ async function handleFsWriteTextFile(
       ...(oldText === undefined ? {} : { oldText }),
       content: parsed.data.content,
     });
-    responder.result(null);
+    responder.result({});
   } catch (error) {
     responder.error(
       -32603,
@@ -1567,6 +1677,7 @@ function liveSessionForThread(
 }
 
 function removeSession(session: AcpThreadSession): void {
+  for (const controller of session.pendingToolCalls) controller.abort();
   if (sessionsByBbThreadId.get(session.bbThreadId) === session) {
     sessionsByBbThreadId.delete(session.bbThreadId);
   }
@@ -1669,6 +1780,9 @@ async function startAgentSession(
   const childEnv = {
     ...withoutBridgeRuntimeEnv(process.env),
     ...params.envVars,
+    ...(dialect.id === "opencode"
+      ? { OPENCODE_CLIENT: "acp", OPENCODE_ENABLE_QUESTION_TOOL: "false" }
+      : {}),
   };
   const connection = createAcpAgentConnection({
     command: params.agent.command,
@@ -1683,8 +1797,8 @@ async function startAgentSession(
     onExit: (info) => {
       const wasCurrent = sessionsByBbThreadId.get(bbThreadId) === session;
       cancelPendingPermissions(session);
-      removeSession(session);
       if (!wasCurrent || session.stopping || session.providerThreadId === "") {
+        removeSession(session);
         return;
       }
       void releaseCursorMcpApproval(session);
@@ -1694,10 +1808,13 @@ async function startAgentSession(
           `${info.code !== null ? ` (code ${info.code})` : ""}` +
           `${info.stderrTail ? `: ${info.stderrTail}` : ""}`,
       );
+      session.activePromptKind = null;
     },
   });
   session = {
     bbThreadId,
+    construction: params,
+    nativeConfig: { configOptions: undefined, models: undefined },
     providerThreadId: "",
     cwd: params.cwd,
     dialect,
@@ -1715,29 +1832,24 @@ async function startAgentSession(
     queuedInputs: [],
     promptRequestPending: false,
     cancelRequested: false,
+    restartAfterCancelError: false,
     loading: false,
     loadingSessionId: undefined,
     pendingLoadUsageUpdate: undefined,
+    grokContextWindowSize: undefined,
     stopping: false,
     turnSettled: undefined,
     pendingPermissions: new Set(),
+    pendingToolCalls: new Set(),
     cursorMcpApproval: undefined,
     deferStartEmit: emitStartNotification,
   };
   sessionsByBbThreadId.set(bbThreadId, session);
 
   try {
-    const initializeResult = await connection.request({
-      method: "initialize",
-      params: {
-        protocolVersion: ACP_PROTOCOL_VERSION,
-        clientInfo: { name: "bb", version: "1.0.0" },
-        clientCapabilities: acpClientCapabilities(
-          params.parameterizedModelPicker,
-          true,
-        ),
-      },
-      resultSchema: acpInitializeResultSchema,
+    const initializeResult = await requestAcpInitialize(connection, {
+      parameterizedModelPicker: params.parameterizedModelPicker,
+      fsAccess: true,
     });
     await authenticateAcpAgent({
       connection,
@@ -1775,6 +1887,7 @@ async function startAgentSession(
     let sessionId: string | undefined;
     let loadedConfigOptions: readonly AcpConfigOption[] | undefined;
     let loadedModels: AcpSessionModels | undefined;
+    let createdFreshSession = false;
     if (request.kind === "fork") {
       const forkedSession = await connection.request({
         method: "session/fork",
@@ -1796,6 +1909,7 @@ async function startAgentSession(
       sessionId = forkedSession.sessionId;
       loadedConfigOptions = forkedSession.configOptions;
       loadedModels = forkedSession.models;
+      rememberGrokContextWindow(session, forkedSession.models);
     } else if (request.kind === "resume" && supportsLoadSession) {
       session.loading = true;
       session.loadingSessionId = request.resumeProviderThreadId;
@@ -1812,6 +1926,7 @@ async function startAgentSession(
         });
         loadedConfigOptions = configState?.configOptions;
         loadedModels = configState?.models;
+        rememberGrokContextWindow(session, configState?.models);
         sessionId = request.resumeProviderThreadId;
       } catch {
         sessionId = undefined;
@@ -1831,11 +1946,15 @@ async function startAgentSession(
         resultSchema: acpSessionNewResultSchema,
       });
       sessionId = newSession.sessionId;
-      await selectAcpNativeModel({
-        connection,
-        sessionId,
+      createdFreshSession = true;
+      rememberGrokContextWindow(session, newSession.models);
+      session.nativeConfig = {
         configOptions: newSession.configOptions,
         models: newSession.models,
+      };
+      await selectAcpNativeModel({
+        session,
+        sessionId,
         modelSelection: params.modelSelection,
         nativeReasoning: params.nativeReasoning,
       });
@@ -1846,11 +1965,13 @@ async function startAgentSession(
         });
       }
     } else {
-      await selectAcpNativeModel({
-        connection,
-        sessionId,
+      session.nativeConfig = {
         configOptions: loadedConfigOptions,
         models: loadedModels,
+      };
+      await selectAcpNativeModel({
+        session,
+        sessionId,
         modelSelection: params.modelSelection,
         nativeReasoning: params.nativeReasoning,
       });
@@ -1879,6 +2000,9 @@ async function startAgentSession(
       sessionRestorable: session.supportsLoadSession,
     });
     sendThreadDeltas(bbThreadId, [{ kind: "session.reset" }]);
+    if (createdFreshSession) {
+      emitGrokContextWindow(session, 0);
+    }
     session.deferStartEmit = undefined;
     for (const deferred of deferredEmits) {
       if (
@@ -1894,7 +2018,7 @@ async function startAgentSession(
   } catch (error) {
     session.stopping = true;
     session.deferStartEmit = undefined;
-    connection.kill();
+    await connection.kill();
     removeSession(session);
     await releaseCursorMcpApproval(session);
     throw error;
@@ -1927,7 +2051,7 @@ async function stopSession(session: AcpThreadSession): Promise<void> {
   }
   settleInterruptedPrompt(session);
 
-  session.connection.kill();
+  await session.connection.kill();
   removeSession(session);
   await releaseCursorMcpApproval(session);
 }
@@ -1955,7 +2079,7 @@ async function releaseSession(session: AcpThreadSession): Promise<void> {
     "ACP session released before the steer was sent",
   );
   cancelPendingPermissions(session);
-  session.connection.kill();
+  await session.connection.kill();
   removeSession(session);
   await releaseCursorMcpApproval(session);
 }
@@ -2017,6 +2141,7 @@ function finishTurn(
   if (session.activePromptKind !== "turn") {
     return;
   }
+  for (const controller of session.pendingToolCalls) controller.abort();
   session.activePromptKind = null;
   dropQueuedTurnInputs(session, "ACP turn ended before the steer was sent");
   session.promptRequestPending = false;
@@ -2048,6 +2173,21 @@ function runTurn(
       let stopReason: z.infer<typeof acpStopReasonSchema>;
       session.cancelRequested = false;
       try {
+        const previousSession = session;
+        const reconciled = reconcileExecutionSettings(session, pending.options);
+        session = reconciled instanceof Promise ? await reconciled : reconciled;
+        if (session.stopping) {
+          dropTurnInput(pending, "ACP session is stopping");
+          finishTurn(session, "cancelled");
+          return;
+        }
+        session.activePromptKind = "turn";
+        session.turnSettled = previousSession.turnSettled;
+        if (session !== previousSession) {
+          emitForSession(session, ACP_TURN_STARTED_METHOD, {
+            threadId: session.bbThreadId,
+          });
+        }
         session.promptRequestPending = true;
         const promptResult = session.connection.request({
           method: "session/prompt",
@@ -2063,7 +2203,12 @@ function runTurn(
         }
         const result = await promptResult;
         stopReason = result.stopReason;
+        const grokUsage = grokContextUsageFromPromptResult(result);
+        if (grokUsage !== undefined) {
+          emitGrokContextWindow(session, grokUsage.used);
+        }
       } catch (error) {
+        session.restartAfterCancelError = session.cancelRequested;
         session.promptRequestPending = false;
         dropTurnInput(pending, "ACP turn failed before the prompt was sent");
         dropQueuedTurnInputs(
@@ -2071,11 +2216,17 @@ function runTurn(
           "ACP turn failed before the steer was sent",
         );
         session.cancelRequested = false;
-        if (!session.stopping && !session.connection.exited) {
-          emitSessionError(
-            session,
-            error instanceof Error ? error.message : String(error),
-          );
+        if (!session.stopping) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          if (!session.connection.exited) {
+            emitSessionError(session, message);
+          } else if (session.activePromptKind === "turn") {
+            emitForSession(session, "error", {
+              threadId: session.bbThreadId,
+              message,
+            });
+          }
         }
         session.activePromptKind = null;
         return;
@@ -2094,6 +2245,153 @@ function runTurn(
       return;
     }
   })();
+}
+
+function reconcileExecutionSettings(
+  session: AcpThreadSession,
+  options: BridgeExecutionOptions,
+): AcpThreadSession | Promise<AcpThreadSession> {
+  if (options.permissionMode === "auto") {
+    throw new Error('ACP does not support permission mode "auto".');
+  }
+  const launchSpec = decodeLaunchSpec(options.providerOptions);
+  const envVars =
+    Object.keys(options.envVars ?? {}).length > 0
+      ? {
+          ...(launchSpec?.env ?? {}),
+          ...options.envVars,
+        }
+      : session.construction.envVars;
+  const workspaceWriteRoots =
+    options.providerOptions?.additionalWorkspaceWriteRoots !== undefined
+      ? [
+          session.cwd,
+          ...decodeAdditionalWorkspaceWriteRoots(options.providerOptions),
+        ]
+      : session.policy.workspaceWriteRoots;
+  const modelParams =
+    launchSpec === null
+      ? session.construction
+      : buildAcpModelSelectionParams(
+          launchSpec,
+          options,
+          decodeAcpModelPickerOptions(options.providerOptions)
+            .parameterizedModelPicker,
+          decodeDialectId(options.providerOptions),
+        );
+  const construction: AcpSessionParams = {
+    ...session.construction,
+    modelSelection: modelParams.modelSelection,
+    launchReasoningLevel: modelParams.launchReasoningLevel,
+    envVars,
+    permissionMode: options.permissionMode,
+    workspaceWriteRoots,
+  };
+  const launchArgsChanged =
+    !isDeepStrictEqual(
+      permissionCliArgsForMode(
+        session.construction.permissionCli,
+        session.construction.permissionMode,
+      ),
+      permissionCliArgsForMode(
+        construction.permissionCli,
+        construction.permissionMode,
+      ),
+    ) ||
+    !isDeepStrictEqual(
+      launchModelSelection(session.construction),
+      launchModelSelection(construction),
+    );
+  const restart =
+    session.connection.exited ||
+    session.restartAfterCancelError ||
+    launchArgsChanged ||
+    !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});
+  cancelPendingPermissions(session);
+  session.policy = {
+    permissionMode: options.permissionMode,
+    workspaceWriteRoots,
+  };
+  if (restart) {
+    return rebuildAgentSession(session, construction);
+  }
+  if (
+    isDeepStrictEqual(
+      construction.modelSelection,
+      session.construction.modelSelection,
+    ) &&
+    !acpNativeModelDrifted(session.nativeConfig, construction.modelSelection)
+  ) {
+    session.construction = construction;
+    return session;
+  }
+  return applyNativeModelSelection(session, construction);
+}
+
+function launchModelSelection(params: AcpSessionParams): {
+  modelSelection: AcpSessionParams["modelSelection"];
+  launchReasoningLevel: AcpSessionParams["launchReasoningLevel"];
+} {
+  return {
+    modelSelection:
+      params.modelSelection && "selectFlag" in params.modelSelection
+        ? params.modelSelection
+        : undefined,
+    launchReasoningLevel: params.launchReasoningLevel,
+  };
+}
+
+async function applyNativeModelSelection(
+  session: AcpThreadSession,
+  construction: AcpSessionParams,
+): Promise<AcpThreadSession> {
+  await selectAcpNativeModel({
+    session,
+    sessionId: session.providerThreadId,
+    modelSelection: construction.modelSelection,
+    nativeReasoning: construction.nativeReasoning,
+  });
+  session.construction = construction;
+  return session;
+}
+
+async function rebuildAgentSession(
+  session: AcpThreadSession,
+  construction: AcpSessionParams,
+): Promise<AcpThreadSession> {
+  const previousProviderThreadId = session.providerThreadId;
+  const reason = session.connection.exited
+    ? "The ACP agent exited unexpectedly; its session was rebuilt before continuing."
+    : session.restartAfterCancelError
+      ? "The ACP agent failed during cancellation; its session was rebuilt before continuing."
+      : "Execution settings changed; the ACP session was rebuilt to apply them.";
+  const queuedInputs = session.queuedInputs.splice(0);
+  const continuingTurn = session.activePromptKind === "turn";
+  finishTurn(session, "cancelled");
+  let replacement: AcpThreadSession;
+  try {
+    replacement = await startAgentSession({
+      kind: "resume",
+      params: construction,
+      resumeProviderThreadId: previousProviderThreadId,
+    });
+  } catch (error) {
+    if (continuingTurn) {
+      emitSessionError(
+        session,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    throw error;
+  }
+  replacement.queuedInputs.push(...queuedInputs);
+  sendNotification(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+    threadId: session.bbThreadId,
+    providerThreadId: replacement.providerThreadId,
+    reason,
+    contextLost: replacement.providerThreadId !== previousProviderThreadId,
+  });
+  return replacement;
 }
 
 function startCompaction(
@@ -2122,6 +2420,10 @@ function startCompaction(
 
   session.turnSettled = promptResult
     .then((result) => {
+      const grokUsage = grokContextUsageFromPromptResult(result);
+      if (grokUsage !== undefined) {
+        emitGrokContextWindow(session, grokUsage.used);
+      }
       finish(
         result.stopReason === "end_turn"
           ? compactionOutcomeForEndTurn(
@@ -2241,6 +2543,17 @@ function handleAgentNotification(
   if (parsed.data.sessionId !== session.providerThreadId) {
     return;
   }
+  if (parsed.data.update.sessionUpdate === "config_option_update") {
+    const configState = acpConfigStateResultSchema.safeParse(
+      parsed.data.update,
+    );
+    if (configState.success && configState.data.configOptions) {
+      session.nativeConfig = {
+        ...session.nativeConfig,
+        configOptions: configState.data.configOptions,
+      };
+    }
+  }
   if (session.activePromptKind === "compaction") {
     const chunk = acpAgentMessageChunkUpdateSchema.safeParse(
       parsed.data.update,
@@ -2266,7 +2579,7 @@ type DecodedAcpBridgeRequest =
 
 function decodeAcpBridgeJsonRpcRequest(raw: unknown): DecodedAcpBridgeRequest {
   const envelope = bridgeRequestEnvelopeSchema.safeParse(raw);
-  if (!envelope.success || envelope.data.id === undefined) {
+  if (!envelope.success) {
     return { kind: "ignored" };
   }
   const command = acpBridgeCommandSchema.safeParse({
@@ -2303,20 +2616,29 @@ function decodeAcpBridgeJsonRpcRequest(raw: unknown): DecodedAcpBridgeRequest {
 async function handleModelList(
   id: string | number,
   params: AcpModelListParams,
+  dialectId: string | undefined,
 ): Promise<void> {
-  const catalog = params.listCommand
-    ? await loadAgentModelCatalog(params.listCommand)
-    : null;
-  if (catalog) {
+  function sendModels(models: readonly AvailableModel[]): void {
     sendResult(
       id,
       splitPrimaryModels(
-        applyConfiguredReasoningToModels(catalog.models, {
+        applyConfiguredReasoningToModels(models, {
           reasoningCli: params.reasoningCli,
           nativeReasoning: params.nativeReasoning,
         }),
         params.primaryModels,
       ),
+    );
+  }
+
+  const catalog = params.listCommand
+    ? await loadAgentModelCatalog(params.listCommand)
+    : null;
+  if (catalog) {
+    sendModels(
+      params.parameterizedModelPicker && dialectId === "cursor"
+        ? buildCursorParameterizedModelCatalog(catalog.models)
+        : catalog.models,
     );
     return;
   }
@@ -2329,16 +2651,7 @@ async function handleModelList(
         )
       : null;
   if (sessionDiscoveredModels) {
-    sendResult(
-      id,
-      splitPrimaryModels(
-        applyConfiguredReasoningToModels(sessionDiscoveredModels, {
-          reasoningCli: params.reasoningCli,
-          nativeReasoning: params.nativeReasoning,
-        }),
-        params.primaryModels,
-      ),
-    );
+    sendModels(sessionDiscoveredModels);
     return;
   }
   sendResult(id, {
@@ -2407,15 +2720,25 @@ function decodeDialectId(
   return acpProviderOptionsSchema.parse(providerOptions ?? {}).acpDialect;
 }
 
-function maintenanceForRequest(
+function maintenanceTarget(
   providerOptions: Record<string, unknown> | undefined,
-  launchSpec: AcpLaunchSpec | null,
-): AcpMaintenanceDialect | undefined {
-  const dialectId = decodeDialectId(providerOptions);
-  return resolveAcpDialect({
-    ...(dialectId === undefined ? {} : { dialectId }),
+): {
+  maintenance: AcpMaintenanceDialect | undefined;
+  command: string | null;
+  dialectId: string;
+  env: NodeJS.ProcessEnv;
+} {
+  const launchSpec = decodeLaunchSpec(providerOptions);
+  const dialect = resolveAcpDialect({
+    dialectId: decodeDialectId(providerOptions),
     command: launchSpec?.command ?? "",
-  }).maintenance;
+  });
+  return {
+    maintenance: dialect.maintenance,
+    command: launchSpec?.command ?? null,
+    dialectId: dialect.id,
+    env: { ...process.env, ...launchSpec?.env },
+  };
 }
 
 async function handleRequest(
@@ -2451,70 +2774,47 @@ async function handleRequest(
           decodeLaunchSpec(request.params.providerOptions),
           modelPicker,
         ),
+        decodeDialectId(request.params.providerOptions),
       );
       return;
     }
 
-    case "provider/health": {
-      const launchSpec = decodeLaunchSpec(request.params.providerOptions);
+    case "provider/health":
       sendResult(
         request.id,
-        await getAcpProviderHealth({
-          maintenance: maintenanceForRequest(
-            request.params.providerOptions,
-            launchSpec,
-          ),
-          command: launchSpec?.command ?? null,
-        }),
+        await getAcpProviderHealth(
+          maintenanceTarget(request.params.providerOptions),
+        ),
       );
       return;
-    }
 
-    case "provider/usage": {
-      const launchSpec = decodeLaunchSpec(request.params.providerOptions);
+    case "provider/usage":
       sendResult(
         request.id,
-        await getAcpProviderUsage({
-          maintenance: maintenanceForRequest(
-            request.params.providerOptions,
-            launchSpec,
-          ),
-          command: launchSpec?.command ?? null,
-        }),
+        await getAcpProviderUsage(
+          maintenanceTarget(request.params.providerOptions),
+        ),
       );
       return;
-    }
 
-    case "provider/installation/status": {
-      const launchSpec = decodeLaunchSpec(request.params.providerOptions);
+    case "provider/installation/status":
       sendResult(
         request.id,
-        await getAcpProviderInstallationStatus({
-          maintenance: maintenanceForRequest(
-            request.params.providerOptions,
-            launchSpec,
-          ),
-          command: launchSpec?.command ?? null,
-        }),
+        await getAcpProviderInstallationStatus(
+          maintenanceTarget(request.params.providerOptions),
+        ),
       );
       return;
-    }
 
-    case "provider/installation/run": {
-      const launchSpec = decodeLaunchSpec(request.params.providerOptions);
+    case "provider/installation/run":
       sendResult(
         request.id,
         await getAcpProviderInstallationRun({
-          maintenance: maintenanceForRequest(
-            request.params.providerOptions,
-            launchSpec,
-          ),
-          command: launchSpec?.command ?? null,
+          ...maintenanceTarget(request.params.providerOptions),
           action: request.params.action,
         }),
       );
       return;
-    }
 
     case "thread/start":
     case "thread/resume":
@@ -2583,7 +2883,7 @@ async function handleRequest(
 
     case "turn/start": {
       const params = request.params;
-      const session = liveSessionForThread(params.threadId);
+      let session = liveSessionForThread(params.threadId);
       if (session === undefined) {
         sendError(request.id, -32000, "No active ACP session");
         return;
@@ -2592,10 +2892,13 @@ async function handleRequest(
         sendError(request.id, -32000, "A turn is already active");
         return;
       }
+      const reconciled = reconcileExecutionSettings(session, params.options);
+      session = reconciled instanceof Promise ? await reconciled : reconciled;
       const pending: AcpPendingTurnInput = {
         clientRequestId: params.clientRequestId,
         input: params.input,
         requestId: request.id,
+        options: params.options,
       };
       if (isStandaloneBuiltinCompactCommand(params.input)) {
         startCompaction(session, pending);
@@ -2614,7 +2917,7 @@ async function handleRequest(
       }
       if (session.activePromptKind !== "turn") {
         const message = "No active turn to steer";
-        sendError(request.id, ACP_BRIDGE_NO_ACTIVE_TURN_ERROR_CODE, message, {
+        sendError(request.id, BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN, message, {
           recovery: { kind: "staleTurn", message, retryable: false },
         });
         return;
@@ -2623,6 +2926,7 @@ async function handleRequest(
         clientRequestId: params.clientRequestId,
         input: params.input,
         requestId: null,
+        options: params.options,
       });
       requestSteerCancel(session);
       sendResult(request.id, { threadId: params.threadId });

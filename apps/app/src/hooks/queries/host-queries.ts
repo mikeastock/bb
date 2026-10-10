@@ -1,38 +1,62 @@
 import { useMemo } from "react";
 import { keepPreviousData, skipToken, useQuery } from "@tanstack/react-query";
 import type { Host } from "@bb/domain";
-import type { HostDirectoryListing } from "@bb/server-contract";
+import type {
+  HostDirectoryListing,
+  HostDiscoveredReposResponse,
+} from "@bb/server-contract";
 import { sdk } from "@/lib/sdk";
 import { useHostListRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
 import { useSystemConfig } from "@/hooks/queries/system-queries";
 import {
   hostCloneDefaultPathQueryKey,
   hostDirectoryQueryKey,
+  hostDiscoveredReposQueryKey,
   hostsQueryKey,
 } from "./query-keys";
 import type { QueryOptions } from "./query-helpers";
 
-export function useHosts(options?: QueryOptions) {
+export function useHosts(
+  options?: QueryOptions & { includeCreating?: boolean },
+) {
   const enabled = options?.enabled ?? true;
+  const includeCreating = options?.includeCreating ?? false;
   useHostListRealtimeSubscription({ enabled });
 
   return useQuery<Host[]>({
-    queryKey: hostsQueryKey(),
-    queryFn: ({ signal }) => sdk.hosts.list({ signal }),
+    queryKey: hostsQueryKey(includeCreating),
+    queryFn: ({ signal }) => sdk.hosts.list({ signal, includeCreating }),
     enabled,
     staleTime: 60_000,
   });
+}
+
+export type HostScope = "persistent" | "all";
+
+export function selectHosts(
+  hosts: readonly Host[] | undefined,
+  scope: HostScope,
+): Host[] {
+  const everyHost = hosts ? [...hosts] : [];
+  return scope === "all"
+    ? everyHost
+    : everyHost.filter((host) => host.type !== "ephemeral");
 }
 
 export function selectPrimaryHost(
   hosts: readonly Host[] | undefined,
   primaryHostId: string | null,
 ): Host | null {
-  if (!hosts || hosts.length === 0) return null;
+  const availableHosts = selectHosts(hosts, "persistent");
+  if (availableHosts.length === 0) return null;
   if (primaryHostId !== null) {
-    return hosts.find((host) => host.id === primaryHostId) ?? null;
+    return availableHosts.find((host) => host.id === primaryHostId) ?? null;
   }
-  return hosts.find((host) => host.status === "connected") ?? hosts[0] ?? null;
+  return (
+    availableHosts.find((host) => host.status === "connected") ??
+    availableHosts[0] ??
+    null
+  );
 }
 
 export function usePrimaryHost(options?: QueryOptions): Host | null {
@@ -59,6 +83,23 @@ export function useHostCloneDefaultPath(
               .path
         : skipToken,
     staleTime: 60_000,
+  });
+}
+
+export function useHostDiscoveredRepos(
+  hostId: string | null,
+  options?: QueryOptions,
+) {
+  return useQuery<HostDiscoveredReposResponse>({
+    queryKey: hostDiscoveredReposQueryKey(hostId),
+    queryFn:
+      hostId === null
+        ? skipToken
+        : ({ signal }) =>
+            sdk.hosts.experimental_discoverRepos({ hostId, signal }),
+    enabled: options?.enabled ?? true,
+    staleTime: 5 * 60_000,
+    retry: false,
   });
 }
 

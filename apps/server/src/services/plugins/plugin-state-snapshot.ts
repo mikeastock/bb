@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { CURATED_MARKETPLACE_NAME } from "../plugin-catalog/marketplace-manifest.js";
+import { CURATED_PLUGIN_MARKETPLACE_NAME } from "@bb/server-contract";
 import {
   createPluginStateSnapshot,
   getInstalledPlugin,
@@ -80,6 +80,7 @@ const installedPluginRowFields = {
   rootDir: z.string(),
   version: z.string(),
   enabled: z.boolean(),
+  enabledFollowsDefault: z.boolean().default(false),
   removedAt: z.number().int().nullable(),
   installedAt: z.number().int(),
   updatedAt: z.number().int(),
@@ -269,7 +270,7 @@ export async function readPluginSnapshotRegistration(args: {
   const installed = getInstalledPlugin(args.db, legacy.id);
   if (
     legacy.provenance === "marketplace" &&
-    marketplaceId === CURATED_MARKETPLACE_NAME &&
+    marketplaceId === CURATED_PLUGIN_MARKETPLACE_NAME &&
     marketplaceEntryId !== null &&
     installed?.provenance === "catalog" &&
     installed.catalogEntryId === marketplaceEntryId
@@ -278,7 +279,7 @@ export async function readPluginSnapshotRegistration(args: {
       ...registration,
       provenance: "catalog",
       catalogEntryId: marketplaceEntryId,
-      catalogMarketplaceName: CURATED_MARKETPLACE_NAME,
+      catalogMarketplaceName: CURATED_PLUGIN_MARKETPLACE_NAME,
     };
   }
   return {

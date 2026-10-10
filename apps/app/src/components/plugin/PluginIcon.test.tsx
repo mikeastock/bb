@@ -7,6 +7,9 @@ import {
   setPluginLogoUrls,
 } from "@/lib/plugin-logos";
 
+import { SidebarNavigationIcon } from "@/components/sidebar/SidebarNavigationModel";
+import { PluginPanelHeaderCenter } from "./PluginPanelHeader";
+
 const { PluginIcon } = await import("./PluginIcon");
 
 afterEach(() => {
@@ -81,6 +84,13 @@ it("uses Zap compactly when a logo-only plugin has no contribution hint", () => 
   expect(view.container.querySelector("img")).toBeNull();
 });
 
+it("can omit the fallback when plugin branding is unavailable", () => {
+  const view = render(
+    <PluginIcon pluginId="unavailable" icon={null} fallbackIcon={null} />,
+  );
+  expect(view.container.querySelector("[data-icon]")).toBeNull();
+});
+
 it("uses a plugin-owned compact SVG before named icon hints", () => {
   const compactIconUrl = "/api/v1/plugins/omega/assets/icon?h=abc";
   setPluginLogoUrls(
@@ -112,7 +122,7 @@ it("resolves every named branding.icon the shipped plugins declare", async () =>
   const { readdir, readFile } = await import("node:fs/promises");
   const { dirname, join, resolve } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
-  const { pluginIconName } = await import("./PluginIcon");
+  const { isBuiltinIconName } = await import("@bb/shared-ui/icon");
 
   const pluginsDir = resolve(
     dirname(fileURLToPath(import.meta.url)),
@@ -131,7 +141,39 @@ it("resolves every named branding.icon the shipped plugins declare", async () =>
   }
 
   expect(declared.length).toBeGreaterThan(0);
-  expect(declared.filter(([, icon]) => pluginIconName(icon) !== icon)).toEqual(
-    [],
-  );
+  expect(declared.filter(([, icon]) => !isBuiltinIconName(icon))).toEqual([]);
 });
+
+it.each(["sidebar", "header"])(
+  "uses the nav panel icon before branding in its %s",
+  (surface) => {
+    setPluginLogoUrls(
+      new Map([
+        [
+          "demo",
+          {
+            displayName: "Demo",
+            icon: "Check",
+            compactIconUrl: "/demo.svg",
+            logoUrl: null,
+            logoDarkUrl: null,
+            icons: new Map(),
+          },
+        ],
+      ]),
+    );
+    const view = render(
+      surface === "sidebar" ? (
+        <SidebarNavigationIcon
+          icon={{ kind: "plugin", pluginId: "demo", icon: "Zap" }}
+        />
+      ) : (
+        <PluginPanelHeaderCenter
+          chrome={{ pluginId: "demo", icon: "Zap", title: "Inspect" }}
+        />
+      ),
+    );
+    expect(view.container.querySelector('[data-icon="Zap"]')).not.toBeNull();
+    expect(view.container.querySelector("[data-plugin-icon-asset]")).toBeNull();
+  },
+);

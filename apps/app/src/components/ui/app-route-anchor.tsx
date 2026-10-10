@@ -18,6 +18,8 @@ import { isRoutePath, resolveRouteHref } from "@/lib/route-paths";
 import { getDesktopBrowserApi } from "@/lib/bb-desktop";
 import { openPaneContentInSplit } from "@/lib/split-layout/openPaneContentInSplit";
 import { paneContentForPathname } from "@/views/thread-detail/splitThreadNavigation";
+import { useOptionalPaneContext } from "@/views/thread-detail/PaneContext";
+import { usePublishPluginDetailOpener } from "@/components/plugin/plugin-detail-opener";
 
 interface RouteNavigationProviderProps {
   children: ReactNode;
@@ -27,7 +29,7 @@ interface RouteAnchorProps extends Omit<ComponentPropsWithoutRef<"a">, "href"> {
   href: string | undefined;
 }
 
-interface ShouldHandleRouteAnchorClickArgs {
+interface RouteAnchorClickActionArgs {
   event: ReactMouseEvent<HTMLAnchorElement>;
 }
 
@@ -40,6 +42,7 @@ type RouteNavigate = (path: string, options?: RouteNavigateOptions) => void;
 
 interface RouteNavigation {
   navigate: RouteNavigate;
+  navigateImmediately: RouteNavigate;
   openInSplit: (path: string) => boolean;
 }
 
@@ -60,9 +63,16 @@ export function useRouteNavigate(): RouteNavigate {
   );
 }
 
+export function useImmediateRouteNavigate(): RouteNavigate {
+  return (
+    useContext(RouteNavigationContext)?.navigateImmediately ??
+    navigateWithoutProvider
+  );
+}
+
 function navigateWithoutProvider(path: string): void {
   throw new Error(
-    `useRouteNavigate: no <RouteNavigationProvider> above the caller (navigating to "${path}")`,
+    `route navigation: no <RouteNavigationProvider> above the caller (navigating to "${path}")`,
   );
 }
 
@@ -70,22 +80,25 @@ function currentOrigin(): string | null {
   return typeof window === "undefined" ? null : window.location.origin;
 }
 
-function shouldHandleRouteAnchorClick({
+type RouteAnchorClickAction = "navigate" | "split" | null;
+
+function routeAnchorClickAction({
   event,
-}: ShouldHandleRouteAnchorClickArgs): boolean {
+}: RouteAnchorClickActionArgs): RouteAnchorClickAction {
   if (
     event.defaultPrevented ||
     event.button !== 0 ||
     event.altKey ||
-    event.ctrlKey ||
-    event.metaKey ||
     event.shiftKey
   ) {
-    return false;
+    return null;
   }
 
   const target = event.currentTarget.getAttribute("target");
-  return target === null || target === "" || target === "_self";
+  if (target !== null && target !== "" && target !== "_self") {
+    return null;
+  }
+  return event.metaKey || event.ctrlKey ? "split" : "navigate";
 }
 
 export function RouteNavigationProvider({
@@ -99,17 +112,20 @@ export function RouteNavigationProvider({
     navigateRef.current = navigate;
   }, [navigate]);
   const [isNavigationPending, startNavigationTransition] = useTransition();
+  const navigateImmediately = useCallback<RouteNavigate>((path, options) => {
+    if (options === undefined) {
+      navigateRef.current(path);
+      return;
+    }
+    navigateRef.current(path, options);
+  }, []);
   const navigateRoute = useCallback<RouteNavigate>(
     (path, options) => {
       startNavigationTransition(() => {
-        if (options === undefined) {
-          navigateRef.current(path);
-          return;
-        }
-        navigateRef.current(path, options);
+        navigateImmediately(path, options);
       });
     },
-    [startNavigationTransition],
+    [navigateImmediately, startNavigationTransition],
   );
   const openInSplit = useCallback<RouteNavigation["openInSplit"]>(
     (path) => {
@@ -140,8 +156,8 @@ export function RouteNavigationProvider({
   }, [navigateRoute]);
 
   const value = useMemo<RouteNavigation>(
-    () => ({ navigate: navigateRoute, openInSplit }),
-    [navigateRoute, openInSplit],
+    () => ({ navigate: navigateRoute, navigateImmediately, openInSplit }),
+    [navigateImmediately, navigateRoute, openInSplit],
   );
   return (
     <RouteNavigationContext.Provider value={value}>
@@ -159,10 +175,24 @@ export function PluginDetailRouteNavigationProvider({
   children: ReactNode;
   onOpenPluginDetail: (pluginId: string) => boolean;
 }) {
+  const pane = useOptionalPaneContext();
+  usePublishPluginDetailOpener(
+    ({ pluginId }) => onOpenPluginDetail(pluginId),
+    pane?.isFocused ?? true,
+  );
   return (
     <PluginDetailRouteNavigationContext.Provider value={onOpenPluginDetail}>
       {children}
     </PluginDetailRouteNavigationContext.Provider>
+  );
+}
+
+function anchorInScope(root: HTMLElement, anchor: HTMLAnchorElement): boolean {
+  if (root.contains(anchor)) return true;
+  const pluginId = root.getAttribute("data-bb-plugin");
+  const overlay = anchor.closest("[data-bb-portaled-overlay]");
+  return (
+    pluginId !== null && overlay?.getAttribute("data-bb-plugin") === pluginId
   );
 }
 
@@ -178,7 +208,9 @@ export function useRouteAnchorDelegate(): (
         event.target instanceof Element
           ? event.target.closest<HTMLAnchorElement>("a[href]")
           : null;
-      if (anchor === null || !event.currentTarget.contains(anchor)) return;
+      if (anchor === null || !anchorInScope(event.currentTarget, anchor)) {
+        return;
+      }
       const target = anchor.getAttribute("target");
       if (target !== null && target !== "" && target !== "_self") return;
       if (event.button !== 0 || event.altKey || event.shiftKey) return;
@@ -229,16 +261,18 @@ export function RouteAnchor({
   const handleClick = useCallback(
     (event: ReactMouseEvent<HTMLAnchorElement>): void => {
       onClick?.(event);
-      if (
-        route === null ||
-        navigation === null ||
-        !shouldHandleRouteAnchorClick({ event })
-      ) {
+      if (route === null || navigation === null) {
         return;
       }
-
-      event.preventDefault();
-      navigation.navigate(route.path);
+      const action = routeAnchorClickAction({ event });
+      if (action === "split") {
+        if (navigation.openInSplit(route.path)) event.preventDefault();
+        return;
+      }
+      if (action === "navigate") {
+        event.preventDefault();
+        navigation.navigate(route.path);
+      }
     },
     [navigation, onClick, route],
   );

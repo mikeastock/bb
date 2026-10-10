@@ -1,15 +1,10 @@
-import {
-  DEFAULT_DESTROYED_ENVIRONMENT_EVENT_DETACH_BATCH_SIZE,
-  DEFAULT_DESTROYED_ENVIRONMENT_PRUNE_BATCH_SIZE,
-  DESTROYED_ENVIRONMENT_TTL_MS,
-  environments,
-  getThread,
-  pruneDestroyedEnvironments,
-} from "@bb/db";
+import { environments, getThread } from "@bb/db";
 import type { ThreadStatus } from "@bb/domain";
-import { apiErrorSchema } from "@bb/server-contract";
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { requestThreadProvision } from "../../src/services/threads/thread-provisioning.js";
+import { getThreadProvisionContext } from "../../src/services/threads/thread-startup-store.js";
+import { textInput } from "../helpers/prompt-input.js";
 import { readJson } from "../helpers/json.js";
 import {
   seedEnvironment,
@@ -17,9 +12,7 @@ import {
   seedProjectWithSource,
   seedThread,
 } from "../helpers/seed.js";
-import { withTestHarness, type TestAppHarness } from "../helpers/test-app.js";
-
-const EIGHT_DAYS_MS = 8 * 24 * 60 * 60_000;
+import { withTestHarness } from "../helpers/test-app.js";
 
 function seedThreadWithPrunedEnvironment(
   deps: Parameters<typeof seedThread>[0],
@@ -29,26 +22,15 @@ function seedThreadWithPrunedEnvironment(
   const environment = seedEnvironment(deps, {
     hostId: host.id,
     projectId: project.id,
-    managed: true,
-    workspaceProvisionType: "managed-worktree",
+    environmentProviderId: "personal-workspace",
+    isGitRepo: false,
   });
   const thread = seedThread(deps, {
     environmentId: environment.id,
     projectId: project.id,
     status: "idle",
   });
-  deps.db
-    .update(environments)
-    .set({ status: "destroyed", updatedAt: Date.now() - EIGHT_DAYS_MS })
-    .where(eq(environments.id, environment.id))
-    .run();
-  expect(
-    pruneDestroyedEnvironments(deps.db, deps.hub, {
-      updatedBefore: Date.now() - DESTROYED_ENVIRONMENT_TTL_MS,
-      eventBatchSize: DEFAULT_DESTROYED_ENVIRONMENT_EVENT_DETACH_BATCH_SIZE,
-      limit: DEFAULT_DESTROYED_ENVIRONMENT_PRUNE_BATCH_SIZE,
-    }).deleted,
-  ).toBe(1);
+  deps.db.delete(environments).where(eq(environments.id, environment.id)).run();
 
   const threadAfterPrune = getThread(deps.db, thread.id);
   expect(threadAfterPrune?.environmentId).toBeNull();
@@ -62,40 +44,35 @@ function seedPointerlessThread(
 ) {
   const { host } = seedHostSession(deps);
   const { project } = seedProjectWithSource(deps, { hostId: host.id });
-  return seedThread(deps, { projectId: project.id, status });
-}
-
-async function expectArchiveRefused(
-  harness: TestAppHarness,
-  threadId: string,
-  route: "archive" | "archive-all",
-): Promise<void> {
-  const response = await harness.app.request(
-    `/api/v1/threads/${threadId}/${route}`,
-    { method: "POST" },
-  );
-  expect(response.status).toBe(409);
-  expect(apiErrorSchema.parse(await readJson(response))).toMatchObject({
-    code: "thread_environment_unavailable",
-    details: { reason: "never_attached" },
-  });
-  expect(getThread(harness.deps.db, threadId)?.archivedAt).toBeNull();
-}
-
-describe("archive after environment prune", () => {
-  it("POST /threads/:id/archive succeeds for a thread whose environment was pruned", async () => {
-    await withTestHarness(async (harness) => {
-      const { thread } = seedThreadWithPrunedEnvironment(harness.deps);
-      const response = await harness.app.request(
-        `/api/v1/threads/${thread.id}/archive`,
-        { method: "POST" },
-      );
-      expect(response.status).toBe(200);
-      expect(await readJson(response)).toEqual({ ok: true });
-      expect(getThread(harness.deps.db, thread.id)?.archivedAt).not.toBeNull();
+  const thread = seedThread(deps, { projectId: project.id, status });
+  if (status === "starting") {
+    requestThreadProvision(deps, {
+      thread,
+      environmentIntent: {
+        type: "provider",
+        environmentProviderId: "project-checkout",
+        machine: { type: "existing", hostId: host.id },
+        inputs: {},
+        selectionResolved: true,
+      },
+      execution: {
+        model: "gpt-5",
+        serviceTier: "default",
+        reasoningLevel: "medium",
+        permissionMode: "full",
+        source: "client/turn/requested",
+      },
+      fork: null,
+      input: textInput("start this workspace"),
+      startedOnBehalfOf: null,
+      titleProvided: true,
     });
-  });
+    expect(getThreadProvisionContext(deps.db, thread.id)).not.toBeNull();
+  }
+  return thread;
+}
 
+describe("archive without an attached environment", () => {
   it("POST /threads/:id/archive-all succeeds for a thread whose environment was pruned", async () => {
     await withTestHarness(async (harness) => {
       const { thread } = seedThreadWithPrunedEnvironment(harness.deps);
@@ -113,12 +90,27 @@ describe("archive after environment prune", () => {
   });
 
   it.each<ThreadStatus>(["starting", "stopping"])(
-    "keeps refusing archive for a %s thread that has no environment yet",
+    "archives and stops a %s thread that has no environment yet",
     async (status) => {
       await withTestHarness(async (harness) => {
         const thread = seedPointerlessThread(harness.deps, status);
-        await expectArchiveRefused(harness, thread.id, "archive");
-        await expectArchiveRefused(harness, thread.id, "archive-all");
+        const response = await harness.app.request(
+          `/api/v1/threads/${thread.id}/archive-all`,
+          { method: "POST" },
+        );
+        expect(response.status).toBe(200);
+        expect(await readJson(response)).toEqual({
+          ok: true,
+          archivedThreadIds: [thread.id],
+        });
+        expect(getThread(harness.deps.db, thread.id)).toMatchObject({
+          archivedAt: expect.any(Number),
+          status: "idle",
+          environmentId: null,
+        });
+        expect(
+          getThreadProvisionContext(harness.deps.db, thread.id),
+        ).toBeNull();
       });
     },
   );

@@ -3,15 +3,15 @@ import type { Project, Task } from "../shared/contract.js";
 import { groupTasksByStatus } from "../views/list/lib.js";
 import { listAllTasks, useTasksQuery } from "./data.js";
 import type { ResolvedTasksRoute, TaskViewMode, TasksRoute } from "./routes.js";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
+} from "@/components/ui/tooltip";
 import { useTasksRefresh } from "./refresh.js";
 
 const REFRESH_TASKS_LABEL = "Refresh tasks";
@@ -67,7 +67,6 @@ function TaskPager({
   };
   return (
     <div className="hidden shrink-0 items-center gap-0.5 text-xs tabular-nums text-muted-foreground @sm:flex">
-      {}
       <span className="hidden px-1 @md:inline">
         {position.index} / {position.total}
       </span>
@@ -238,7 +237,6 @@ export function TasksTopbar({
             >
               <Icon name="ChevronLeft" className="size-4" />
             </Button>
-            {}
             {project ? (
               <button
                 type="button"
@@ -274,7 +272,7 @@ export function TasksTopbar({
   })();
 
   return (
-    <header className="flex h-11 shrink-0 items-center gap-2.5 border-b border-border-hairline bg-background px-3.5 text-sm max-md:h-12 max-md:pl-12 max-md:pointer-coarse:pl-14">
+    <header className="flex h-11 shrink-0 items-center gap-2.5 border-b border-border-hairline bg-background px-3.5 text-sm max-md:pointer-coarse:h-12 max-md:pl-12 max-md:pointer-coarse:pl-14">
       <div className="min-w-0 flex-1 overflow-hidden">{breadcrumb}</div>
       {route.kind === "task" &&
       (pagerScope !== null || projects !== undefined) ? (
@@ -294,7 +292,6 @@ export function TasksTopbar({
           />
         </span>
       ) : null}
-      {}
       <RefreshTasksButton />
       {route.kind !== "task" && route.kind !== "manage" ? (
         <Button
@@ -304,7 +301,6 @@ export function TasksTopbar({
           onClick={onNewTask}
         >
           <Icon name="Plus" className="size-3.5" />
-          {}
           <span className="hidden @lg:inline">New task</span>
         </Button>
       ) : null}

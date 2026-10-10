@@ -1,14 +1,12 @@
+import { normalizePromptTextMentions } from "@bb/client-core";
 import type { ComponentType } from "react";
 import type { Nodes, Parent, PhrasingContent, Text } from "mdast";
 import type {} from "mdast-util-to-hast";
 import { visit } from "unist-util-visit";
 import type { PromptTextMention } from "@bb/domain";
-import {
-  normalizePromptTextMentions,
-  PromptMentionPill,
-} from "@/components/thread/timeline/ConversationMessageMentions.js";
+import { PromptMentionPill } from "@/components/thread/timeline/ConversationMessageMentions.js";
 import type { PromptMentionLinkResolver } from "@/components/promptbox/editor/prompt-mention-link";
-import type { TimelineTitleLinkResolver } from "@/components/thread/timeline/TimelineTitleView.js";
+import { replaceTextMatches } from "./markdown-text-matches.js";
 
 const SENTINEL_OPEN = String.fromCharCode(0xe000);
 const SENTINEL_CLOSE = String.fromCharCode(0xe001);
@@ -38,10 +36,7 @@ export function substitutePromptMentions(
   text: string,
   mentions: readonly PromptTextMention[],
 ): SubstitutePromptMentionsResult {
-  const normalized = normalizePromptTextMentions({
-    mentions,
-    textLength: text.length,
-  });
+  const normalized = normalizePromptTextMentions(mentions, text.length);
   if (normalized.length === 0) {
     return { content: text, mentions: [] };
   }
@@ -77,32 +72,10 @@ function promptMentionNode(index: number): Text {
 }
 
 function splitTextNodeOnMentions(node: Text): PhrasingContent[] {
-  const { value } = node;
-  PROMPT_MENTION_PATTERN.lastIndex = 0;
-  const replacements: PhrasingContent[] = [];
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = PROMPT_MENTION_PATTERN.exec(value)) !== null) {
+  return replaceTextMatches(node, PROMPT_MENTION_PATTERN, (match) => {
     const index = match[1] === undefined ? Number.NaN : Number(match[1]);
-    if (!Number.isInteger(index)) {
-      continue;
-    }
-    if (match.index > cursor) {
-      replacements.push({
-        type: "text",
-        value: value.slice(cursor, match.index),
-      });
-    }
-    replacements.push(promptMentionNode(index));
-    cursor = match.index + match[0].length;
-  }
-  if (replacements.length === 0) {
-    return [node];
-  }
-  if (cursor < value.length) {
-    replacements.push({ type: "text", value: value.slice(cursor) });
-  }
-  return replacements;
+    return Number.isInteger(index) ? promptMentionNode(index) : null;
+  });
 }
 
 export function remarkPromptMentions() {
@@ -123,13 +96,11 @@ export function remarkPromptMentions() {
 
 export interface MarkdownPromptMentions {
   mentions: readonly PromptTextMention[];
-  resolveLinkHref?: TimelineTitleLinkResolver;
   resolveMentionLink?: PromptMentionLinkResolver;
 }
 
 interface BuildPromptMentionComponentArgs {
   mentions: readonly IndexedPromptMention[];
-  resolveLinkHref?: TimelineTitleLinkResolver;
   resolveMentionLink?: PromptMentionLinkResolver;
 }
 
@@ -145,22 +116,8 @@ declare module "react" {
   }
 }
 
-function resolveThreadMentionHref(
-  resource: PromptTextMention["resource"],
-  resolveLinkHref: TimelineTitleLinkResolver | undefined,
-): string | undefined {
-  if (resource.kind !== "thread" || !resolveLinkHref) {
-    return undefined;
-  }
-  return (
-    resolveLinkHref({ kind: "thread", threadId: resource.threadId }) ??
-    undefined
-  );
-}
-
 export function buildPromptMentionComponent({
   mentions,
-  resolveLinkHref,
   resolveMentionLink,
 }: BuildPromptMentionComponentArgs): ComponentType<PromptMentionElementProps> {
   function PromptMentionElement(props: PromptMentionElementProps) {
@@ -177,7 +134,6 @@ export function buildPromptMentionComponent({
         resource={mention.resource}
         resolveMentionLink={resolveMentionLink}
         serializedText={mention.serializedText}
-        linkHref={resolveThreadMentionHref(mention.resource, resolveLinkHref)}
       />
     );
   }

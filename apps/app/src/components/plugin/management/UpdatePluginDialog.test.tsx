@@ -1,44 +1,36 @@
+import { pluginUpdateJobsQueryKey } from "@/hooks/queries/query-keys";
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
+import type { QueryClient } from "@tanstack/react-query";
 import {
   EMPTY_PLUGIN_UPDATE_STATE,
   type PluginListItem,
   type PluginUpdateState,
 } from "@/hooks/queries/plugin-settings-queries";
+import {
+  getNotifications,
+  resetNotificationStore,
+} from "@/lib/notifications/notification-store";
 import { UpdatePluginDialog } from "./UpdatePluginDialog";
+import { makePluginListItem } from "@/test/fixtures/plugins";
 
 function plugin(updateState: Partial<PluginUpdateState>): PluginListItem {
-  return {
+  return makePluginListItem({
     id: "linear",
     source: "npm:@example/linear@^1.6.0",
     rootDir: "/plugins/linear",
     version: "1.6.2",
-    enabled: true,
-    status: "running",
-    statusDetail: null,
-    description: null,
     name: "Linear",
-    icon: null,
-    compactIconUrl: null,
-    logoUrl: null,
-    logoDarkUrl: null,
-    hasSettings: false,
     provenance: "catalog",
-    isOrphanedBuiltin: false,
     catalogEntryId: "linear",
     publisherLabel: "BB Community",
     sourceDisplay: "npm · @bb-plugins/linear · tracks compatible",
     updateState: { ...EMPTY_PLUGIN_UPDATE_STATE, ...updateState },
-    handlerStats: { count: 0, totalMs: 0, maxMs: 0, errorCount: 0 },
-    services: [],
-    schedules: [],
-    cliCommand: null,
-    capabilities: [],
-    app: { hasApp: false, bundle: null },
-  };
+  });
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -48,15 +40,42 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-afterEach(() => {
+const queryClients: QueryClient[] = [];
+
+function createDialogTestHarness() {
+  const harness = createQueryClientTestHarness();
+  queryClients.push(harness.queryClient);
+  const Wrapper = harness.wrapper;
+  return {
+    ...harness,
+    wrapper: ({ children }: { children: import("react").ReactNode }) => (
+      <MemoryRouter>
+        <Wrapper>{children}</Wrapper>
+      </MemoryRouter>
+    ),
+  };
+}
+
+afterEach(async () => {
   cleanup();
-  vi.unstubAllGlobals();
+  try {
+    await vi.waitFor(() => {
+      expect(queryClients.every((client) => client.isMutating() === 0)).toBe(
+        true,
+      );
+    });
+  } finally {
+    for (const client of queryClients.splice(0)) client.clear();
+    resetNotificationStore();
+    sessionStorage.clear();
+    vi.unstubAllGlobals();
+  }
 });
 
 describe("UpdatePluginDialog", () => {
   it("always shows the rollback promise for a compatible update and keeps details collapsed", () => {
     vi.stubGlobal("fetch", vi.fn());
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     render(
       <UpdatePluginDialog
         plugin={plugin({ availableVersion: "1.7.0" })}
@@ -79,7 +98,7 @@ describe("UpdatePluginDialog", () => {
 
   it("renders the incompatible variant pre-expanded with Update disabled", () => {
     vi.stubGlobal("fetch", vi.fn());
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     render(
       <UpdatePluginDialog
         plugin={plugin({
@@ -110,16 +129,22 @@ describe("UpdatePluginDialog", () => {
 
   it("opens persisted failure details and retries an available update", async () => {
     const fetchMock = vi.fn(async () =>
-      jsonResponse({
-        applied: true,
-        from: { version: "1.6.2", display: "1.6.2" },
-        to: { version: "1.8.0", display: "1.8.0" },
-        outcome: "updated",
-      }),
+      jsonResponse(
+        {
+          job: {
+            id: "update-1",
+            pluginId: "linear",
+            displayName: "Linear",
+            state: "running",
+            phase: "preparing",
+          },
+        },
+        202,
+      ),
     );
     vi.stubGlobal("fetch", fetchMock);
     const onOpenChange = vi.fn();
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     const failedAt = new Date(2026, 6, 22).getTime();
     render(
       <UpdatePluginDialog
@@ -156,7 +181,7 @@ describe("UpdatePluginDialog", () => {
 
   it("keeps a persisted failure actionable without offering an unavailable retry", () => {
     vi.stubGlobal("fetch", vi.fn());
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     render(
       <UpdatePluginDialog
         plugin={plugin({
@@ -176,20 +201,41 @@ describe("UpdatePluginDialog", () => {
     expect(screen.queryByRole("button", { name: /Retry update/ })).toBeNull();
   });
 
-  it("renders a rolled-back outcome pointing at the canonical failure state", async () => {
+  it("closes on job acceptance without waiting for the update to finish", async () => {
+    const job = {
+      id: "update-1",
+      pluginId: "linear",
+      displayName: "Linear",
+      state: "running",
+      phase: "checking",
+    };
+    const fetchMock = vi.fn(async () => jsonResponse({ job }, 202));
+    vi.stubGlobal("fetch", fetchMock);
+    const { wrapper, queryClient } = createDialogTestHarness();
+    const onOpenChange = vi.fn();
+    render(
+      <UpdatePluginDialog
+        plugin={plugin({ availableVersion: "1.7.0" })}
+        open
+        onOpenChange={onOpenChange}
+      />,
+      { wrapper },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await vi.waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(queryClient.getQueryData(pluginUpdateJobsQueryKey())).toEqual([job]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getNotifications()).toHaveLength(0);
+  });
+
+  it("records one alert when an update request fails", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
-        jsonResponse({
-          applied: false,
-          from: { version: "1.6.2", display: "1.6.2" },
-          to: { version: "1.7.0", display: "1.7.0" },
-          outcome: "rolled-back",
-          detail: "factory threw during activation",
-        }),
+        jsonResponse({ error: "plugin source is unavailable" }, 502),
       ),
     );
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     render(
       <UpdatePluginDialog
         plugin={plugin({ availableVersion: "1.7.0" })}
@@ -201,13 +247,15 @@ describe("UpdatePluginDialog", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Update" }));
 
-    expect(await screen.findByText("Update failed")).toBeTruthy();
-    expect(screen.getByText("factory threw during activation")).toBeTruthy();
-    expect(
-      screen.getByText(
-        "The plugin is marked “Update failed” in the installed list until an update succeeds.",
-      ),
-    ).toBeTruthy();
+    await vi.waitFor(() => {
+      expect(getNotifications()).toHaveLength(1);
+    });
+    const notification = getNotifications()[0];
+    expect(notification?.title).toBe("Plugin update failed");
+
+    expect(notification?.description).toBe(
+      "Linear — plugin source is unavailable",
+    );
   });
 
   it("treats a malformed 2xx update response as an error, never success", async () => {
@@ -215,7 +263,7 @@ describe("UpdatePluginDialog", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "ok" })),
     );
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper } = createDialogTestHarness();
     render(
       <UpdatePluginDialog
         plugin={plugin({ availableVersion: "1.7.0" })}
@@ -226,6 +274,11 @@ describe("UpdatePluginDialog", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await vi.waitFor(() => {
+      expect(getNotifications()).toHaveLength(1);
+    });
+    expect(getNotifications()[0]?.title).toBe("Plugin update failed");
 
     await vi.waitFor(() => {
       expect(

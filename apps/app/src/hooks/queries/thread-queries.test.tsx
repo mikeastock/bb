@@ -9,9 +9,10 @@ import type {
   ThreadWithIncludesResponse,
 } from "@bb/server-contract";
 import { COMPACT_VIEWPORT_QUERY } from "@bb/shared-ui/hooks/use-compact-viewport";
+import { POINTER_COARSE_QUERY } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import * as api from "@/lib/api";
 import { sdk } from "@/lib/sdk";
-import { makeThreadListEntry } from "@/test/fixtures/thread-list-entries";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
 import { ARCHIVED_THREADS_PAGE_SIZE } from "./archived-threads-page-size";
 import {
@@ -23,10 +24,10 @@ import {
   threadQueryKey,
   threadTimelineQueryKey,
 } from "./query-keys";
+import { usePaletteRecentArchivedThreads } from "./palette-thread-queries";
 import {
   COMPACT_THREAD_TIMELINE_SEGMENT_LIMIT,
   didThreadDetailBootstrapRefreshAfterMount,
-  isPendingInteractionStateUnknown,
   useArchivedThreads,
   useChildThreads,
   useThread,
@@ -38,6 +39,20 @@ import {
   useThreadStorageLocation,
   useThreadTimeline,
 } from "./thread-queries";
+import {
+  COARSE_POINTER_THREAD_OPEN_CACHE_MAX_THREADS,
+  THREAD_OPEN_CACHE_GC_MS,
+  THREAD_OPEN_CACHE_MAX_THREADS,
+} from "../cache-owners/thread-open-cache-owner";
+import { removeThreadScopedQueries } from "../cache-owners/mutation-cache-effects";
+import {
+  makeProjectWithThreadsResponse,
+  makeSidebarBootstrapResponse,
+} from "@/test/fixtures/projects";
+import {
+  makeThreadResponse,
+  makeThreadTimelineResponse,
+} from "@/test/fixtures/thread-responses";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -52,6 +67,7 @@ vi.mock("@/lib/sdk", () => ({
     threads: {
       get: vi.fn(),
       list: vi.fn(),
+      search: vi.fn(),
       queuedMessages: { list: vi.fn() },
       interactions: { list: vi.fn() },
       storageLocation: vi.fn(),
@@ -66,33 +82,16 @@ vi.mock("@/hooks/useRealtimeSubscription", () => ({
 }));
 
 const THREAD_WITH_INCLUDES = {
-  id: "thread-1",
-  projectId: "project-1",
-  environmentId: null,
-  providerId: "codex",
-  title: "Thread",
-  titleFallback: "Thread",
-  sectionId: null,
-  status: "idle",
-  parentThreadId: null,
-  sourceThreadId: null,
-  originKind: null,
-  originPluginId: null,
-  visibility: "visible",
-  archivedAt: null,
-  pinnedAt: null,
-  deletedAt: null,
-  lastReadAt: null,
-  latestAttentionAt: 1,
-  createdAt: 1,
-  updatedAt: 1,
-  runtime: {
-    displayStatus: "idle",
-    hostReconnectGraceExpiresAt: null,
-  },
-  activeBackgroundAgentCount: 0,
-  canSpawnChild: true,
-  queuedMessageCount: 0,
+  ...makeThreadResponse({
+    id: "thread-1",
+    projectId: "project-1",
+    environmentId: null,
+    title: "Thread",
+    titleFallback: "Thread",
+    latestAttentionAt: 1,
+    createdAt: 1,
+    updatedAt: 1,
+  }),
   environment: null,
   host: null,
 } satisfies ThreadWithIncludesResponse;
@@ -101,33 +100,25 @@ function makeSidebarNavigation(
   projectThreads: ThreadListEntry[],
   personalThreads: ThreadListEntry[] = [],
 ): SidebarBootstrapResponse {
-  return {
-    sections: [],
+  return makeSidebarBootstrapResponse({
     projects: [
-      {
+      makeProjectWithThreadsResponse({
         id: "project-1",
-        kind: "standard",
         name: "Project",
-        gitRemoteUrl: null,
         createdAt: 1,
         updatedAt: 1,
-        sources: [],
         threads: projectThreads,
-        defaultExecutionOptions: null,
-      },
+      }),
     ],
-    personalProject: {
+    personalProject: makeProjectWithThreadsResponse({
       id: "proj_personal",
       kind: "personal",
       name: "Personal",
-      gitRemoteUrl: null,
       createdAt: 1,
       updatedAt: 1,
-      sources: [],
       threads: personalThreads,
-      defaultExecutionOptions: null,
-    },
-  };
+    }),
+  });
 }
 
 function mockMatchMedia(matching: readonly string[]) {
@@ -158,28 +149,21 @@ beforeEach(() => {
     hostId: "host-1",
     storageRootPath: "/tmp/thread-storage/thread-1",
   });
-  vi.mocked(sdk.threads.timeline).mockResolvedValue({
-    rows: [],
-    activePromptMode: null,
-    activeThinking: null,
-    activeWorkflows: [],
-    activeBackgroundCommands: [],
-    pendingTodos: null,
-    goal: null,
-    modelFallback: null,
-    timelinePage: {
-      kind: "latest",
-      segmentLimit: 100,
-      returnedSegmentCount: 0,
-      hasOlderRows: false,
-      olderCursor: null,
-    },
-    maxSeq: 0,
-  } satisfies ThreadTimelineResponse);
+  vi.mocked(sdk.threads.timeline).mockResolvedValue(
+    makeThreadTimelineResponse({
+      timelinePage: {
+        kind: "latest",
+        segmentLimit: 100,
+        returnedSegmentCount: 0,
+        hasOlderRows: false,
+        olderCursor: null,
+      },
+    }),
+  );
   vi.mocked(api.getThreadHostFilePreview).mockResolvedValue({
     kind: "text",
     path: "/tmp/log.txt",
-    url: "/api/v1/threads/thread-1/host-files/content?path=%2Ftmp%2Flog.txt",
+    url: "/api/v1/threads/thread-1/host-files/tmp/log.txt",
     mimeType: "text/plain",
     content: "preview",
   });
@@ -217,7 +201,7 @@ describe("useThreadDetailBootstrap", () => {
   });
 
   it("uses the cached timeline sequence and merges a prefetched delta", async () => {
-    const previousTimeline = {
+    const previousTimeline = makeThreadTimelineResponse({
       rows: [
         {
           id: "row-1",
@@ -234,13 +218,6 @@ describe("useThreadDetailBootstrap", () => {
           status: null,
         },
       ],
-      activePromptMode: null,
-      activeThinking: null,
-      activeWorkflows: [],
-      activeBackgroundCommands: [],
-      pendingTodos: null,
-      goal: null,
-      modelFallback: null,
       timelinePage: {
         kind: "latest",
         segmentLimit: 100,
@@ -249,7 +226,7 @@ describe("useThreadDetailBootstrap", () => {
         olderCursor: null,
       },
       maxSeq: 7,
-    } satisfies ThreadTimelineResponse;
+    });
     vi.mocked(sdk.threads.timeline).mockResolvedValueOnce({
       ...previousTimeline,
       rows: [],
@@ -273,6 +250,7 @@ describe("useThreadDetailBootstrap", () => {
 
     await waitFor(() => {
       expect(sdk.threads.timeline).toHaveBeenCalledWith({
+        deferContent: "true",
         afterSequence: "7",
         signal: expect.any(AbortSignal),
         threadId: "thread-1",
@@ -373,6 +351,39 @@ describe("useThreadDetailBootstrap", () => {
 });
 
 describe("useArchivedThreads", () => {
+  it("fetches pages only while selected and continues from the loaded offset", async () => {
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    vi.mocked(sdk.threads.list)
+      .mockResolvedValueOnce(
+        Array.from({ length: ARCHIVED_THREADS_PAGE_SIZE }, (_, index) =>
+          makeThreadListEntry({
+            id: `archived-${index}`,
+            archivedAt: 1,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce([]);
+    const { result, rerender } = renderHook(
+      ({ enabled }) => useArchivedThreads({}, { enabled }),
+      { wrapper, initialProps: { enabled: false } },
+    );
+    expect(sdk.threads.list).not.toHaveBeenCalled();
+    rerender({ enabled: true });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    expect(vi.mocked(sdk.threads.list).mock.calls[1]?.[0]?.offset).toBe(
+      ARCHIVED_THREADS_PAGE_SIZE,
+    );
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    rerender({ enabled: false });
+    await act(async () => {
+      await queryClient.invalidateQueries();
+    });
+    expect(sdk.threads.list).toHaveBeenCalledTimes(2);
+  });
+
   it("loads archived threads across all projects when no scope is selected", async () => {
     const { wrapper } = createQueryClientTestHarness();
 
@@ -450,11 +461,6 @@ describe("useThreadQueuedMessages", () => {
 });
 
 describe("useThreadPendingInteractions", () => {
-  it("keeps cached empty interactions unknown while their refresh is pending", () => {
-    expect(isPendingInteractionStateUnknown([], true)).toBe(true);
-    expect(isPendingInteractionStateUnknown([], false)).toBe(false);
-  });
-
   it("reuses the first owner's fresh baseline when a second owner mounts", async () => {
     const { queryClient, wrapper } = createQueryClientTestHarness();
     const first = renderHook(() => useThreadPendingInteractions("thread-1"), {
@@ -819,6 +825,7 @@ describe("useThreadTimeline segment limit", () => {
       expect(result.current.isSuccess).toBe(true);
     });
     expect(vi.mocked(sdk.threads.timeline).mock.calls[0]?.[0]).toEqual({
+      deferContent: "true",
       threadId: "thread-1",
       segmentLimit: String(COMPACT_THREAD_TIMELINE_SEGMENT_LIMIT),
       signal: expect.any(AbortSignal),
@@ -828,6 +835,7 @@ describe("useThreadTimeline segment limit", () => {
       queryKey: threadTimelineQueryKey("thread-1"),
     });
     expect(vi.mocked(sdk.threads.timeline).mock.calls[1]?.[0]).toEqual({
+      deferContent: "true",
       threadId: "thread-1",
       segmentLimit: String(COMPACT_THREAD_TIMELINE_SEGMENT_LIMIT),
       afterSequence: "0",
@@ -846,7 +854,277 @@ describe("useThreadTimeline segment limit", () => {
       expect(result.current.isSuccess).toBe(true);
     });
     expect(vi.mocked(sdk.threads.timeline).mock.calls[0]?.[0]).toEqual({
+      deferContent: "true",
       threadId: "thread-1",
+      signal: expect.any(AbortSignal),
+    });
+  });
+});
+
+describe("thread open cache retention", () => {
+  function seedThreadOpenCache(
+    queryClient: ReturnType<typeof createQueryClientTestHarness>["queryClient"],
+    threadId: string,
+  ) {
+    queryClient.setQueryData(threadDetailBootstrapQueryKey(threadId), {
+      ...THREAD_WITH_INCLUDES,
+      id: threadId,
+    });
+  }
+
+  async function openTimelines(
+    threadIds: readonly string[],
+    wrapper: ReturnType<typeof createQueryClientTestHarness>["wrapper"],
+  ) {
+    const { result, rerender, unmount } = renderHook(
+      ({ threadId }: { threadId: string }) => useThreadTimeline(threadId),
+      { initialProps: { threadId: threadIds[0] ?? "" }, wrapper },
+    );
+    for (const threadId of threadIds) {
+      rerender({ threadId });
+      await waitFor(() => {
+        expect(result.current.isFetchedAfterMount).toBe(true);
+        expect(result.current.isFetching).toBe(false);
+      });
+    }
+    unmount();
+  }
+
+  function hasTimeline(
+    queryClient: ReturnType<typeof createQueryClientTestHarness>["queryClient"],
+    threadId: string,
+  ): boolean {
+    return (
+      queryClient.getQueryData(threadTimelineQueryKey(threadId)) !== undefined
+    );
+  }
+
+  function hasBootstrap(
+    queryClient: ReturnType<typeof createQueryClientTestHarness>["queryClient"],
+    threadId: string,
+  ): boolean {
+    return (
+      queryClient.getQueryData(threadDetailBootstrapQueryKey(threadId)) !==
+      undefined
+    );
+  }
+
+  it("keeps timeline and bootstrap queries for an hour", async () => {
+    const { queryClient, wrapper } = createQueryClientTestHarness({
+      queries: { gcTime: 0 },
+    });
+
+    const { result } = renderHook(
+      () => ({
+        bootstrap: useThreadDetailBootstrap("thread-1"),
+        timeline: useThreadTimeline("thread-1"),
+      }),
+      { wrapper },
+    );
+    await waitFor(() => {
+      expect(result.current.bootstrap.isSuccess).toBe(true);
+      expect(result.current.timeline.isSuccess).toBe(true);
+    });
+
+    const queryCache = queryClient.getQueryCache();
+    expect(
+      queryCache.find({ queryKey: threadTimelineQueryKey("thread-1") })?.gcTime,
+    ).toBe(THREAD_OPEN_CACHE_GC_MS);
+    expect(
+      queryCache.find({ queryKey: threadDetailBootstrapQueryKey("thread-1") })
+        ?.gcTime,
+    ).toBe(THREAD_OPEN_CACHE_GC_MS);
+  });
+
+  it("reopens a retained timeline with a delta from its cached sequence", async () => {
+    mockMatchMedia([]);
+    const existingRow = {
+      id: "row-1",
+      kind: "system",
+      threadId: "thread-1",
+      turnId: null,
+      sourceSeqStart: 7,
+      sourceSeqEnd: 7,
+      startedAt: 1,
+      createdAt: 1,
+      systemKind: "debug",
+      title: "Existing row",
+      detail: null,
+      status: null,
+    } satisfies ThreadTimelineResponse["rows"][number];
+    const appendedRow = {
+      ...existingRow,
+      id: "row-2",
+      sourceSeqStart: 9,
+      sourceSeqEnd: 9,
+      title: "Appended row",
+    } satisfies ThreadTimelineResponse["rows"][number];
+    const firstTimeline = makeThreadTimelineResponse({
+      rows: [existingRow],
+      timelinePage: {
+        kind: "latest",
+        segmentLimit: 100,
+        returnedSegmentCount: 1,
+        hasOlderRows: false,
+        olderCursor: null,
+      },
+      maxSeq: 7,
+    });
+    vi.mocked(sdk.threads.timeline)
+      .mockResolvedValueOnce(firstTimeline)
+      .mockResolvedValueOnce({
+        ...firstTimeline,
+        rows: [],
+        maxSeq: 9,
+        delta: {
+          upsertRows: [appendedRow],
+          rowOrder: ["row-1", "row-2"],
+        },
+      });
+    const { queryClient, wrapper } = createQueryClientTestHarness({
+      queries: { gcTime: 0, staleTime: 0 },
+    });
+
+    const first = renderHook(() => useThreadTimeline("thread-1"), {
+      wrapper,
+    });
+    await waitFor(() => {
+      expect(first.result.current.isSuccess).toBe(true);
+    });
+    first.unmount();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(hasTimeline(queryClient, "thread-1")).toBe(true);
+
+    const reopened = renderHook(() => useThreadTimeline("thread-1"), {
+      wrapper,
+    });
+    expect(reopened.result.current.data?.rows).toEqual([existingRow]);
+    await waitFor(() => {
+      expect(reopened.result.current.data?.maxSeq).toBe(9);
+    });
+
+    expect(vi.mocked(sdk.threads.timeline).mock.calls[1]?.[0]).toEqual({
+      deferContent: "true",
+      afterSequence: "7",
+      signal: expect.any(AbortSignal),
+      threadId: "thread-1",
+    });
+    expect(reopened.result.current.data?.rows).toEqual([
+      existingRow,
+      appendedRow,
+    ]);
+  });
+
+  it("evicts the least recently opened inactive thread past the cap", async () => {
+    mockMatchMedia([]);
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    const threadIds = Array.from(
+      { length: THREAD_OPEN_CACHE_MAX_THREADS + 1 },
+      (_, index) => `thread-${index}`,
+    );
+    for (const threadId of threadIds) {
+      seedThreadOpenCache(queryClient, threadId);
+    }
+
+    await openTimelines(threadIds, wrapper);
+
+    expect(hasTimeline(queryClient, "thread-0")).toBe(false);
+    expect(hasBootstrap(queryClient, "thread-0")).toBe(false);
+    for (const threadId of threadIds.slice(1)) {
+      expect(hasTimeline(queryClient, threadId)).toBe(true);
+      expect(hasBootstrap(queryClient, threadId)).toBe(true);
+    }
+  });
+
+  it("frees a deleted thread's slot instead of evicting a retained thread", async () => {
+    mockMatchMedia([]);
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    const threadIds = Array.from(
+      { length: THREAD_OPEN_CACHE_MAX_THREADS + 1 },
+      (_, index) => `thread-${index}`,
+    );
+    for (const threadId of threadIds) {
+      seedThreadOpenCache(queryClient, threadId);
+    }
+    const deletedThreadId = threadIds[THREAD_OPEN_CACHE_MAX_THREADS - 1];
+    if (deletedThreadId === undefined) {
+      throw new Error("Expected a thread to delete");
+    }
+
+    await openTimelines(threadIds.slice(0, -1), wrapper);
+    removeThreadScopedQueries({ queryClient, threadId: deletedThreadId });
+    await openTimelines(threadIds.slice(-1), wrapper);
+
+    expect(hasTimeline(queryClient, deletedThreadId)).toBe(false);
+    expect(hasBootstrap(queryClient, deletedThreadId)).toBe(false);
+    for (const threadId of threadIds) {
+      if (threadId === deletedThreadId) {
+        continue;
+      }
+      expect(hasTimeline(queryClient, threadId)).toBe(true);
+      expect(hasBootstrap(queryClient, threadId)).toBe(true);
+    }
+  });
+
+  it("keeps a thread that is still open in another pane", async () => {
+    mockMatchMedia([]);
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    const threadIds = Array.from(
+      { length: THREAD_OPEN_CACHE_MAX_THREADS + 1 },
+      (_, index) => `thread-${index}`,
+    );
+    const pinned = renderHook(() => useThreadTimeline("thread-0"), {
+      wrapper,
+    });
+    await waitFor(() => {
+      expect(pinned.result.current.isSuccess).toBe(true);
+    });
+
+    await openTimelines(threadIds.slice(1), wrapper);
+
+    expect(hasTimeline(queryClient, "thread-0")).toBe(true);
+    expect(hasTimeline(queryClient, "thread-1")).toBe(false);
+  });
+
+  it("uses the smaller cap on coarse pointers", async () => {
+    mockMatchMedia([POINTER_COARSE_QUERY]);
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    const threadIds = Array.from(
+      { length: COARSE_POINTER_THREAD_OPEN_CACHE_MAX_THREADS + 1 },
+      (_, index) => `thread-${index}`,
+    );
+
+    await openTimelines(threadIds, wrapper);
+
+    expect(hasTimeline(queryClient, "thread-0")).toBe(false);
+    expect(hasTimeline(queryClient, "thread-1")).toBe(true);
+    expect(
+      hasTimeline(
+        queryClient,
+        `thread-${COARSE_POINTER_THREAD_OPEN_CACHE_MAX_THREADS}`,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("palette lifecycle queries", () => {
+  it("loads bounded archived recents only while selected before typing", async () => {
+    const { wrapper } = createQueryClientTestHarness();
+    const archived = makeThreadListEntry({ id: "archived", archivedAt: 1 });
+    vi.mocked(sdk.threads.list).mockResolvedValue([archived]);
+    const { result, rerender } = renderHook(
+      ({ recent, selected }) =>
+        usePaletteRecentArchivedThreads({ enabled: recent && selected }),
+      { wrapper, initialProps: { recent: true, selected: false } },
+    );
+    expect(sdk.threads.list).not.toHaveBeenCalled();
+    rerender({ recent: false, selected: true });
+    expect(sdk.threads.list).not.toHaveBeenCalled();
+    rerender({ recent: true, selected: true });
+    await waitFor(() => expect(result.current.data).toEqual([archived]));
+    expect(sdk.threads.list).toHaveBeenCalledExactlyOnceWith({
+      archived: true,
+      limit: 20,
       signal: expect.any(AbortSignal),
     });
   });

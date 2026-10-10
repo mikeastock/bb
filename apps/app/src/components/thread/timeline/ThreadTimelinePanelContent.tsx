@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { isRunningThreadRuntimeDisplayStatus } from "@bb/client-core";
 import { EmptyStatePanel } from "@bb/shared-ui/empty-state";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { ThreadTimelinePanelLoadingSkeleton } from "./ThreadChatLoading";
 import type { PromptMentionLinkResolver } from "@/components/promptbox/editor/prompt-mention-link";
 import { ConversationTimeline } from "@/components/ui/conversation.js";
 import { useThread } from "@/hooks/queries/thread-queries";
@@ -19,7 +19,6 @@ interface ThreadTimelinePanelContentProps {
   isTurnSubmitting?: boolean;
   leadingContent?: ReactNode;
   onMessageAddToChat?: ThreadTimelineSurfaceProps["onMessageAddToChat"];
-  onSendToMainMessage?: ThreadTimelineSurfaceProps["onSendToMainMessage"];
   onSelectionAddToChat?: ThreadTimelineSurfaceProps["onSelectionAddToChat"];
   consumerMessageActions?: ThreadTimelineSurfaceProps["consumerMessageActions"];
   includePluginMessageActions?: ThreadTimelineSurfaceProps["includePluginMessageActions"];
@@ -37,7 +36,6 @@ export function ThreadTimelinePanelContent({
   isTurnSubmitting = false,
   leadingContent,
   onMessageAddToChat,
-  onSendToMainMessage,
   onSelectionAddToChat,
   consumerMessageActions,
   includePluginMessageActions,
@@ -68,12 +66,9 @@ export function ThreadTimelinePanelContent({
     displayStatus === "idle" && hasActiveBackgroundWork
       ? "Background work running"
       : undefined;
-  const ongoingIndicatorLabel =
-    displayStatus === "host-reconnecting"
-      ? "Waiting for reconnection"
-      : isProvisioningDisplayStatus
-        ? "Provisioning thread..."
-        : backgroundOnlyIndicatorLabel;
+  const ongoingIndicatorLabel = isProvisioningDisplayStatus
+    ? "Provisioning thread..."
+    : backgroundOnlyIndicatorLabel;
   const showOngoingIndicator =
     threadQuery.data?.status !== "stopping" &&
     (isProvisioningDisplayStatus ||
@@ -100,7 +95,9 @@ export function ThreadTimelinePanelContent({
   return (
     <ThreadTimelineSurface
       activeThinking={resolvedTimeline.activeThinking}
+      contextBoundarySeq={resolvedTimeline.contextBoundarySeq}
       hasOlderTimelineRows={resolvedTimeline.hasOlderTimelineRows}
+      isCatchingUpTimeline={resolvedTimeline.isCatchingUpTimeline}
       isLoadingOlderTimelineRows={resolvedTimeline.isLoadingOlderTimelineRows}
       isThreadTimelinePending={
         resolvedTimeline.timelineLoading &&
@@ -113,7 +110,6 @@ export function ThreadTimelinePanelContent({
       loadingContent={<ThreadTimelinePanelLoadingSkeleton />}
       leadingContent={leadingContent}
       onMessageAddToChat={onMessageAddToChat}
-      onSendToMainMessage={onSendToMainMessage}
       onSelectionAddToChat={onSelectionAddToChat}
       consumerMessageActions={consumerMessageActions}
       includePluginMessageActions={includePluginMessageActions}
@@ -130,15 +126,5 @@ export function ThreadTimelinePanelContent({
       threadRuntimeDisplayStatus={displayStatus}
       workspaceRootPath={workspaceRootPath}
     />
-  );
-}
-
-function ThreadTimelinePanelLoadingSkeleton() {
-  return (
-    <div className="space-y-2 px-2 pt-2">
-      <Skeleton className="h-4 w-3/4 rounded-sm" />
-      <Skeleton className="h-4 w-2/3 rounded-sm" />
-      <Skeleton className="h-4 w-1/2 rounded-sm" />
-    </div>
   );
 }

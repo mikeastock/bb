@@ -1,6 +1,6 @@
-import type { ChangedMessage } from "@bb/domain";
 import { createDeferredPromise, type DeferredPromise } from "@bb/test-helpers";
 import { describe, expect, it } from "vitest";
+import type { ServerChangedMessage } from "../../ws/hub.js";
 import {
   EnvironmentReadCache,
   WorkspaceReadCaches,
@@ -33,15 +33,15 @@ function createCounter<T>(values: T[]) {
 }
 
 function createFakeHub() {
-  const listeners = new Set<(message: ChangedMessage) => void>();
+  const listeners = new Set<(message: ServerChangedMessage) => void>();
   return {
-    onChangedMessage(listener: (message: ChangedMessage) => void) {
+    onChangedMessage(listener: (message: ServerChangedMessage) => void) {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
       };
     },
-    emit(message: ChangedMessage) {
+    emit(message: ServerChangedMessage) {
       for (const listener of listeners) {
         listener(message);
       }
@@ -195,17 +195,30 @@ describe("WorkspaceReadCaches", () => {
     };
   }
 
-  it("drops both caches for an environment on work-status-changed and git-refs-changed", async () => {
-    for (const change of ["work-status-changed", "git-refs-changed"] as const) {
+  it("refreshes local status on file edits and refreshes pull requests only on ref or lifecycle changes", async () => {
+    for (const { changes, expectedPullRequestLoads } of [
+      { changes: ["work-status-changed"], expectedPullRequestLoads: 1 },
+      { changes: ["git-refs-changed"], expectedPullRequestLoads: 2 },
+      { changes: ["status-changed"], expectedPullRequestLoads: 2 },
+      {
+        changes: ["work-status-changed", "git-refs-changed"],
+        expectedPullRequestLoads: 2,
+      },
+      {
+        changes: ["work-status-changed", "metadata-changed"],
+        expectedPullRequestLoads: 1,
+      },
+    ] as const) {
       const hub = createFakeHub();
-      const caches = new WorkspaceReadCaches({ hub, now: () => 0 });
+      const clock = createClock();
+      const caches = new WorkspaceReadCaches({ hub, now: clock.now });
       const primed = await primeBoth(caches);
 
       hub.emit({
         type: "changed",
         entity: "environment",
         id: "env-2",
-        changes: [change],
+        changes: [...changes],
       });
       expect(await primed.readBoth()).toEqual({ status: 1, pullRequest: 1 });
 
@@ -213,9 +226,18 @@ describe("WorkspaceReadCaches", () => {
         type: "changed",
         entity: "environment",
         id: "env-1",
-        changes: [change],
+        changes: [...changes],
       });
-      expect(await primed.readBoth()).toEqual({ status: 2, pullRequest: 2 });
+      expect(await primed.readBoth()).toEqual({
+        status: 2,
+        pullRequest: expectedPullRequestLoads,
+      });
+
+      clock.advance(10_000);
+      expect(await primed.readBoth()).toEqual({
+        status: 3,
+        pullRequest: expectedPullRequestLoads + 1,
+      });
     }
   });
 
@@ -253,6 +275,20 @@ describe("WorkspaceReadCaches", () => {
       changes: ["host-connected"],
     });
     expect(await primed.readBoth()).toEqual({ status: 2, pullRequest: 2 });
+  });
+
+  it("keeps a host's cached reads when only its provider model catalog changed", async () => {
+    const hub = createFakeHub();
+    const caches = new WorkspaceReadCaches({ hub, now: () => 0 });
+    const primed = await primeBoth(caches);
+
+    hub.emit({
+      type: "changed",
+      entity: "host",
+      id: "host-1",
+      changes: ["provider-model-catalog-changed"],
+    });
+    expect(await primed.readBoth()).toEqual({ status: 1, pullRequest: 1 });
   });
 
   it("drops both caches when a server-side mutation invalidates the environment or host", async () => {

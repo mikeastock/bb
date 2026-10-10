@@ -1,20 +1,18 @@
 import { useMemo, useRef, useState } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import {
-  ArrowUp02Icon,
-  AttachmentIcon,
-  File01Icon,
-  Notification02Icon,
-  NotificationOff02Icon,
-} from "@hugeicons/core-free-icons";
-import { Button } from "@bb/shared-ui/button";
+import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
+import AttachmentIcon from "@hugeicons/core-free-icons/AttachmentIcon";
+import File01Icon from "@hugeicons/core-free-icons/File01Icon";
+import Notification02Icon from "@hugeicons/core-free-icons/Notification02Icon";
+import NotificationOff02Icon from "@hugeicons/core-free-icons/NotificationOff02Icon";
+import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { TasksEditor } from "../../editor/tasks-editor.js";
 import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import {
@@ -22,21 +20,22 @@ import {
   useTasksQuery,
   useTasksRpc,
 } from "../../shell/data.js";
-import {
-  attachmentDownloadUrl,
-  Lightbox,
-  uploadAttachment,
-} from "../detail/attachments.js";
+import { Lightbox } from "../detail/attachments.js";
 import {
   AttachmentChip,
+  settleStagedUploads,
   stageFiles,
+  uploadStagedAttachments,
+  useStagedAttachmentRetry,
   type StagedAttachment,
 } from "../../components/staged-attachments.js";
+import { attachmentDownloadUrl } from "../../shared/attachments.js";
 import type {
   Attachment,
   Comment,
   DisplayComment,
 } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   formatFileSize,
   formatRelativeTime,
@@ -51,26 +50,38 @@ interface FeedEntry {
   attachments: Attachment[];
 }
 
+export function activityFeedEntries(
+  comments: readonly DisplayComment[],
+  attachments: readonly Attachment[],
+): FeedEntry[] {
+  const attachmentsByCommentId = new Map<string, Attachment[]>();
+  for (const attachment of attachments) {
+    if (attachment.commentId === null) continue;
+    const entries = attachmentsByCommentId.get(attachment.commentId);
+    if (entries === undefined) {
+      attachmentsByCommentId.set(attachment.commentId, [attachment]);
+    } else {
+      entries.push(attachment);
+    }
+  }
+  return comments.map((comment) => ({
+    comment,
+    attachments: attachmentsByCommentId.get(comment.id) ?? [],
+  }));
+}
+
 function useActivityFeed(taskId: string) {
   return useTasksQuery<FeedEntry[]>(
     async (rpc) => {
-      const { comments } = await rpc.call("listComments", { taskId });
-      const attachments = await Promise.all(
-        comments.map((comment) =>
-          comment.kind === "system"
-            ? Promise.resolve<Attachment[]>([])
-            : rpc
-                .call("listAttachments", { commentId: comment.id })
-                .then((result) => result.attachments),
-        ),
-      );
-      return comments.map((comment, index) => ({
-        comment,
-        attachments: attachments[index] ?? [],
-      }));
+      const [{ comments }, { attachments }] = await Promise.all([
+        rpc.call("listComments", { taskId }),
+        rpc.call("listAttachments", { commentsOfTaskId: taskId }),
+      ]);
+      return activityFeedEntries(comments, attachments);
     },
     ["comments:changed", "tasks:changed"],
     [taskId],
+    { relevantTaskIds: [taskId] },
   );
 }
 
@@ -152,7 +163,6 @@ function ImageAttachmentFigure({
           className="h-24 w-auto min-w-15 max-w-full cursor-zoom-in rounded-md border border-border bg-muted object-cover hover:border-input @2xl:h-32 @2xl:min-w-20"
         />
       </button>
-      {}
       <figcaption
         title={attachment.fileName}
         className="mt-0.5 w-0 min-w-full truncate px-1 text-center text-2xs text-muted-foreground"
@@ -302,32 +312,9 @@ export function CommentComposer({ taskId, notificationTarget }: ComposerProps) {
   const removeFile = (id: number) =>
     setPendingFiles((files) => files.filter((entry) => entry.id !== id));
 
-  const retryingRef = useRef(new Set<number>());
-  const retryUpload = async (entry: StagedAttachment) => {
-    if (entry.owner === undefined || retryingRef.current.has(entry.id)) return;
-    retryingRef.current.add(entry.id);
-    setPendingFiles((files) =>
-      files.map((candidate) =>
-        candidate.id === entry.id ? { ...candidate, busy: true } : candidate,
-      ),
-    );
-    try {
-      await uploadAttachment(entry.file, entry.owner);
-      removeFile(entry.id);
-      setError(null);
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setPendingFiles((files) =>
-        files.map((candidate) =>
-          candidate.id === entry.id
-            ? { ...candidate, busy: false, error: message }
-            : candidate,
-        ),
-      );
-    } finally {
-      retryingRef.current.delete(entry.id);
-    }
-  };
+  const retryUpload = useStagedAttachmentRetry(setPendingFiles, () =>
+    setError(null),
+  );
 
   const send = async () => {
     if (!canSend || sendingRef.current) return;
@@ -345,35 +332,17 @@ export function CommentComposer({ taskId, notificationTarget }: ComposerProps) {
         })
       ).comment;
       setBody("");
-      const failed: StagedAttachment[] = [];
-      for (const entry of staged) {
-        try {
-          await uploadAttachment(entry.file, { commentId: comment.id });
-        } catch (cause) {
-          failed.push({
-            ...entry,
-            status: "failed",
-            owner: { commentId: comment.id },
-            error: cause instanceof Error ? cause.message : String(cause),
-          });
-        }
-      }
-      setPendingFiles((files) =>
-        files.flatMap((entry) => {
-          const failure = failed.find((candidate) => candidate.id === entry.id);
-          if (failure) return [failure];
-          return staged.some((candidate) => candidate.id === entry.id)
-            ? []
-            : [entry];
-        }),
-      );
+      const failed = await uploadStagedAttachments(staged, {
+        commentId: comment.id,
+      });
+      setPendingFiles((files) => settleStagedUploads(files, staged, failed));
       if (failed.length > 0) {
         setError(
           `The comment posted, but ${failed.length} attachment${failed.length > 1 ? "s" : ""} failed to upload — retry below.`,
         );
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(errorMessage(cause));
     } finally {
       sendingRef.current = false;
       setSending(false);
@@ -507,13 +476,12 @@ export function AgentNotificationControl({
 
 interface TaskActivityProps {
   taskId: string;
-  taskKey: string;
 }
 
 export function TaskActivity({ taskId }: TaskActivityProps) {
   const feed = useActivityFeed(taskId);
   const nowMs = useNowTick();
-  const entries = feed.data ?? [];
+  const entries = useMemo(() => feed.data ?? [], [feed.data]);
   const notificationTarget = useMemo(
     () => agentNotificationTarget(entries.map((entry) => entry.comment)),
     [entries],

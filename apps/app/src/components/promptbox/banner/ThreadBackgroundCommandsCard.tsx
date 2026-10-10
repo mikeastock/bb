@@ -1,14 +1,14 @@
 import { useRef, useState } from "react";
 import { isBackgroundAgentTaskType } from "@bb/domain";
 import type { TimelineWorkflowWorkRow } from "@bb/server-contract";
-import { durationToCompactString } from "@bb/thread-view";
 import { useResizeObserver } from "usehooks-ts";
-import { AnimatedBody } from "@/components/promptbox/banner/AnimatedBody";
+import { AnimatedDisclosureBody } from "@/components/promptbox/banner/AnimatedBody";
 import {
+  PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
   PROMPT_STACK_CARD_ROW_HEIGHT,
   PromptStackCard,
 } from "@/components/promptbox/banner/PromptStackCard";
-import { useSecondTick } from "@/hooks/useSecondTick";
+import { LiveDurationText } from "@/components/thread/timeline/LiveDurationText";
 import { Icon } from "@bb/shared-ui/icon";
 import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
 import {
@@ -18,6 +18,12 @@ import {
   activityTextClass,
 } from "@bb/shared-ui/activity-row-styles";
 import { cn } from "@bb/shared-ui/lib/utils";
+import {
+  PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+  PromptStackCountSlot,
+  PromptStackHoverChevron,
+  useDisclosureFocusHandoff,
+} from "@bb/shared-ui/prompt-stack-disclosure";
 
 const BODY_ID = "thread-background-commands-card-body";
 const TOGGLE_ID = "thread-background-commands-card-toggle";
@@ -103,45 +109,27 @@ function compactBackgroundActivityLabel(
   return `Running ${rows.length} background activities`;
 }
 
-function BackgroundActivityDuration({ startedAt }: { startedAt: number }) {
-  const elapsed = useSecondTick() - startedAt;
-  if (elapsed <= 1_000) {
-    return null;
-  }
-  return (
-    <span className="tabular-nums">{durationToCompactString(elapsed)}</span>
-  );
-}
-
 function BackgroundActivitySummary({
   row,
   showDuration,
-  active = false,
 }: {
   row: TimelineWorkflowWorkRow;
   showDuration: boolean;
-  active?: boolean;
 }) {
   const display = backgroundActivityDisplay(row);
   const model = backgroundActivityModel(row);
   return (
     <span className="flex min-w-0 flex-1 items-center gap-1 text-left">
-      {}
       <span
         className={cn(
           "shrink-0 whitespace-nowrap",
-          active ? activityMetaClass("active") : "text-muted-foreground",
+          activityMetaClass("active"),
         )}
       >
         {display.runningPrefix}
       </span>
       <span
-        className={cn(
-          "min-w-0 truncate",
-          active
-            ? activityTextClass("active")
-            : "font-medium text-foreground opacity-70",
-        )}
+        className={cn("min-w-0 truncate", activityTextClass("active"))}
         title={row.description}
       >
         {row.description}
@@ -150,7 +138,7 @@ function BackgroundActivitySummary({
         <span
           className={cn(
             "shrink-0 whitespace-nowrap font-mono text-2xs",
-            active ? activityMetaClass("active") : "text-subtle-foreground",
+            activityMetaClass("active"),
           )}
           title={`Model: ${model}`}
         >
@@ -159,12 +147,9 @@ function BackgroundActivitySummary({
       ) : null}
       {showDuration ? (
         <span
-          className={cn(
-            "shrink-0",
-            active ? activityMetaClass("active") : "text-muted-foreground",
-          )}
+          className={cn("shrink-0 tabular-nums", activityMetaClass("active"))}
         >
-          <BackgroundActivityDuration startedAt={row.startedAt} />
+          <LiveDurationText startedAt={row.startedAt} />
         </span>
       ) : null}
     </span>
@@ -185,6 +170,7 @@ export function ThreadBackgroundCommandsCard({
   const isCompactViewport = useIsCompactViewport();
   const cardRef = useRef<HTMLElement>(null!);
   const [isCompactCard, setIsCompactCard] = useState<boolean | null>(null);
+  const focus = useDisclosureFocusHandoff(isExpanded, onToggle);
   useResizeObserver({
     ref: cardRef,
     box: "border-box",
@@ -228,10 +214,14 @@ export function ThreadBackgroundCommandsCard({
                 ? compactLabel
                 : backgroundActivityAriaLabel(primary, groupLabel)
             }
-            onClick={onToggle}
+            ref={focus.triggerRef}
+            onClick={focus.onTriggerClick}
             className={activityRowClass(
               "active",
-              "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80",
+              cn(
+                PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
+                PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+              ),
             )}
           >
             <Icon
@@ -240,30 +230,18 @@ export function ThreadBackgroundCommandsCard({
               aria-hidden="true"
             />
             {useCompactSummary ? (
-              <span className="min-w-0 flex-1 truncate text-left font-medium">
-                {compactLabel}
-              </span>
+              <>
+                <span className="min-w-0 flex-1 truncate text-left font-medium">
+                  {compactLabel}
+                </span>
+                <PromptStackHoverChevron isExpanded={isExpanded} />
+              </>
             ) : (
               <>
-                <BackgroundActivitySummary
-                  row={primary}
-                  showDuration={false}
-                  active
-                />
-                <span className={activityMetaClass("active", "shrink-0")}>
-                  +{others.length} more
-                </span>
+                <BackgroundActivitySummary row={primary} showDuration={false} />
+                <PromptStackCountSlot count={others.length} />
               </>
             )}
-            <Icon
-              name="ChevronDown"
-              className={cn(
-                activityIconClass("active"),
-                "size-3.5 shrink-0 transition-transform duration-200",
-                isExpanded && "rotate-180",
-              )}
-              aria-hidden="true"
-            />
           </button>
         ) : (
           <div
@@ -278,16 +256,19 @@ export function ThreadBackgroundCommandsCard({
               className={activityIconClass("active", "size-3.5 shrink-0")}
               aria-hidden="true"
             />
-            <BackgroundActivitySummary row={primary} showDuration active />
+            <BackgroundActivitySummary row={primary} showDuration />
           </div>
         )}
       </div>
       {canExpand ? (
-        <AnimatedBody
+        <AnimatedDisclosureBody
           id={BODY_ID}
           labelledBy={TOGGLE_ID}
           isExpanded={isExpanded}
           collapsedBorder="none"
+          collapseLabel={`Collapse ${groupLabel.toLowerCase()}`}
+          collapseRef={focus.collapseRef}
+          onCollapse={focus.onCollapseClick}
         >
           <div className="flex flex-col gap-0.5 py-1">
             {expandedRows.map((row) => {
@@ -301,16 +282,18 @@ export function ThreadBackgroundCommandsCard({
                     useCompactSummary ? "items-start" : "items-center",
                   )}
                 >
-                  <Icon
-                    name={display.icon}
-                    className="size-3.5 shrink-0 text-muted-foreground/60"
-                    aria-hidden="true"
-                  />
+                  <span className="flex h-[1lh] shrink-0 items-center">
+                    <Icon
+                      name={display.icon}
+                      className="size-3.5 text-muted-foreground/60"
+                      aria-hidden="true"
+                    />
+                  </span>
                   <span
                     className={cn(
                       "min-w-0 flex-1 text-muted-foreground",
                       useCompactSummary
-                        ? "whitespace-normal [overflow-wrap:anywhere]"
+                        ? "line-clamp-2 break-all"
                         : "truncate",
                     )}
                     title={row.description}
@@ -325,16 +308,16 @@ export function ThreadBackgroundCommandsCard({
                       {model}
                     </span>
                   ) : null}
-                  <span className="shrink-0 whitespace-nowrap text-subtle-foreground">
+                  <span className="shrink-0 whitespace-nowrap tabular-nums text-subtle-foreground">
                     {isExpanded ? (
-                      <BackgroundActivityDuration startedAt={row.startedAt} />
+                      <LiveDurationText startedAt={row.startedAt} />
                     ) : null}
                   </span>
                 </div>
               );
             })}
           </div>
-        </AnimatedBody>
+        </AnimatedDisclosureBody>
       ) : null}
     </PromptStackCard>
   );

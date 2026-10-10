@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import {
-  marketplaceEntryV2Schema as domainMarketplaceEntryV2Schema,
+  MARKETPLACE_OVERVIEW_MAX_CHARS,
+  marketplaceEntryV2Schema,
   pluginCatalogCategory,
   pluginMarketplaceCategorySchema,
   pluginMarketplaceCollectionSchema,
@@ -8,14 +9,16 @@ import {
   type PluginMarketplaceCollection,
 } from "@bb/domain";
 import {
-  CURATED_PLUGIN_MARKETPLACE_NAME,
   pluginMarketplaceNameSchema,
   ROOT_PLUGIN_SOURCE_SELECTION,
   type PluginSourceSelection,
 } from "@bb/server-contract";
 import semver from "semver";
 import { z } from "zod";
-import { formatIssues } from "../plugins/collection-manifest.js";
+import {
+  formatIssues,
+  parseJsonDocument,
+} from "../plugins/collection-manifest.js";
 import {
   gitRangeSourceSpec,
   gitSemverTagName,
@@ -36,14 +39,9 @@ export const CURATED_MARKETPLACE_V1_URL =
 export const CURATED_MARKETPLACE_V2_URL =
   "https://getbb.app/marketplace/v2/marketplace.json";
 
-export const CURATED_MARKETPLACE_NAME = CURATED_PLUGIN_MARKETPLACE_NAME;
-
 export const BUILTIN_PUBLISHER_LABEL = "BB Official";
 
-const MARKETPLACE_MAX_ENTRIES = 256;
-
 const NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/u;
-const manifestNameSchema = pluginMarketplaceNameSchema;
 const TAG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}$/u;
 const ICON_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9]*$/u;
@@ -238,34 +236,26 @@ const marketplaceEntryV1Schema = z
   })
   .strict();
 
-const marketplaceEntryV2Schema = domainMarketplaceEntryV2Schema;
-
 const marketplaceManifestV1Schema = z
   .object({
     $schema: z.literal(MARKETPLACE_V1_SCHEMA_URL).optional(),
     schemaVersion: z.literal(1),
-    name: manifestNameSchema,
+    name: pluginMarketplaceNameSchema,
     displayName: z.string().min(1),
     description: z.string().min(1).optional(),
-    plugins: z
-      .array(marketplaceEntryV1Schema)
-      .max(
-        MARKETPLACE_MAX_ENTRIES,
-        `a marketplace may list at most ${MARKETPLACE_MAX_ENTRIES} plugins`,
-      )
-      .superRefine((entries, ctx) => {
-        const seen = new Set<string>();
-        entries.forEach((entry, index) => {
-          if (seen.has(entry.id)) {
-            ctx.addIssue({
-              code: "custom",
-              path: [index, "id"],
-              message: `duplicate plugin id "${entry.id}"`,
-            });
-          }
-          seen.add(entry.id);
-        });
-      }),
+    plugins: z.array(marketplaceEntryV1Schema).superRefine((entries, ctx) => {
+      const seen = new Set<string>();
+      entries.forEach((entry, index) => {
+        if (seen.has(entry.id)) {
+          ctx.addIssue({
+            code: "custom",
+            path: [index, "id"],
+            message: `duplicate plugin id "${entry.id}"`,
+          });
+        }
+        seen.add(entry.id);
+      });
+    }),
   })
   .strict();
 
@@ -277,12 +267,7 @@ const marketplaceManifestV2Schema = z.object({
   description: z.string().min(1).optional(),
   categories: z.array(pluginMarketplaceCategorySchema).optional(),
   collections: z.array(pluginMarketplaceCollectionSchema).optional(),
-  plugins: z
-    .array(marketplaceEntryV2Schema)
-    .max(
-      MARKETPLACE_MAX_ENTRIES,
-      `a marketplace may list at most ${MARKETPLACE_MAX_ENTRIES} plugins`,
-    ),
+  plugins: z.array(marketplaceEntryV2Schema),
 });
 
 export type MarketplaceManifestV1 = z.infer<typeof marketplaceManifestV1Schema>;
@@ -490,6 +475,12 @@ export function marketplaceEntryCollections(
   ];
 }
 
+export function marketplaceCategories(
+  manifest: MarketplaceManifest,
+): PluginMarketplaceCategory[] {
+  return [...marketplaceManifestIndex(manifest).categories.values()];
+}
+
 export function marketplaceCollections(
   manifest: MarketplaceManifest,
 ): PluginMarketplaceCollection[] {
@@ -501,30 +492,31 @@ export function parseMarketplaceManifestJson(
   location: string,
   warn?: (message: string) => void,
 ): MarketplaceManifest {
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(
-      `invalid ${location}: not valid JSON (${error instanceof Error ? error.message : String(error)})`,
-    );
-  }
-  return parseMarketplaceManifest(json, location, warn);
+  return parseMarketplaceManifest(
+    parseJsonDocument(raw, location),
+    location,
+    warn,
+  );
 }
 
 export function parseBundledMarketplaceManifestJson(
   raw: string,
   location: string,
 ): MarketplaceManifestV2 {
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(
-      `invalid ${location}: not valid JSON (${error instanceof Error ? error.message : String(error)})`,
-    );
-  }
-  return parseBundledMarketplaceManifest(json, location);
+  return parseBundledMarketplaceManifest(
+    parseJsonDocument(raw, location),
+    location,
+  );
+}
+
+export function parseStoredMarketplaceManifest(
+  row: { name: string; manifestJson: string },
+  warn?: (message: string) => void,
+): MarketplaceManifest {
+  const location = `stored "${row.name}" marketplace catalog`;
+  return row.name === BUNDLED_MARKETPLACE_NAME
+    ? parseBundledMarketplaceManifestJson(row.manifestJson, location)
+    : parseMarketplaceManifestJson(row.manifestJson, location, warn);
 }
 
 export function entryIconName(entry: MarketplaceEntry): string | null {
@@ -558,6 +550,62 @@ export function entryScreenshotUrls(
   });
 }
 
+export function entryOverview(
+  entry: MarketplaceEntry,
+  warn?: (message: string) => void,
+): string | undefined {
+  if (!("overview" in entry) || entry.overview === undefined) return undefined;
+  const length = [...entry.overview.replace(/\n$/u, "")].length;
+  if (length > MARKETPLACE_OVERVIEW_MAX_CHARS) {
+    warn?.(
+      `marketplace entry "${entry.id}" overview text was skipped because it has ${length} characters; the maximum is ${MARKETPLACE_OVERVIEW_MAX_CHARS}`,
+    );
+    return undefined;
+  }
+  return entry.overview;
+}
+
+function legacyMarketplaceCategory(tags: readonly string[]): string {
+  const first = tags[0];
+  return first === undefined
+    ? "Other"
+    : first
+        .split("-")
+        .filter((word) => word.length > 0)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(" ");
+}
+
+export function catalogEntryMetadata(args: {
+  manifest: MarketplaceManifest;
+  entry: MarketplaceEntry;
+  base: MarketplaceIconBase;
+  warn?: (message: string) => void;
+}): {
+  categoryId?: string;
+  category?: string;
+  screenshots: string[];
+  publishedAt?: string;
+  updatedAt?: string;
+} {
+  const { manifest, entry } = args;
+  const category = marketplaceEntryCategory(manifest, entry);
+  return {
+    ...(manifest.schemaVersion === 1
+      ? { category: legacyMarketplaceCategory(entry.tags ?? []) }
+      : category === undefined
+        ? {}
+        : { categoryId: category.id, category: category.displayName }),
+    screenshots: entryScreenshotUrls(entry, args.base, args.warn),
+    ...("publishedAt" in entry && typeof entry.publishedAt === "string"
+      ? { publishedAt: entry.publishedAt }
+      : {}),
+    ...("updatedAt" in entry && typeof entry.updatedAt === "string"
+      ? { updatedAt: entry.updatedAt }
+      : {}),
+  };
+}
+
 export function entryIconTinted(contentType: string): boolean {
   return contentType === "image/svg+xml";
 }
@@ -565,6 +613,15 @@ export function entryIconTinted(contentType: string): boolean {
 export type MarketplaceIconBase =
   | { kind: "url"; manifestUrl: string }
   | { kind: "dir"; root: string };
+
+export function marketplaceRowIconBase(row: {
+  sourceKind: string;
+  manifestUrl: string;
+}): MarketplaceIconBase {
+  return row.sourceKind === "https"
+    ? { kind: "url", manifestUrl: row.manifestUrl }
+    : { kind: "dir", root: row.manifestUrl };
+}
 
 export type MarketplaceIconLocation =
   | { kind: "remote"; url: string }
@@ -601,13 +658,12 @@ export function resolveEntryIcon(
 }
 
 export function entryRepositoryUrl(entry: MarketplaceEntry): string | null {
-  if (isBundledMarketplaceEntry(entry)) return null;
+  if ("bundled" in entry.source) return null;
   if ("npm" in entry.source) {
     return entry.source.npm.registry === undefined
       ? `https://www.npmjs.com/package/${entry.source.npm.package}`
       : null;
   }
-  if (!("git" in entry.source)) return null;
   const git = entry.source.git;
   const repository = git.url.replace(/\.git$/u, "");
   if (git.subdir === undefined) return repository;
@@ -618,7 +674,7 @@ export function entryRepositoryUrl(entry: MarketplaceEntry): string | null {
 }
 
 export function entrySourceDisplay(entry: MarketplaceEntry): string {
-  if (isBundledMarketplaceEntry(entry)) {
+  if ("bundled" in entry.source) {
     return `builtin:${entry.source.bundled.plugin}`;
   }
   if ("npm" in entry.source) {
@@ -628,9 +684,6 @@ export function entrySourceDisplay(entry: MarketplaceEntry): string {
         ? ""
         : ` (registry ${entry.source.npm.registry})`;
     return `npm:${entry.source.npm.package}${spec.length === 0 ? "" : `@${spec}`}${registry}`;
-  }
-  if (!("git" in entry.source)) {
-    return `builtin:${entry.source.bundled.plugin}`;
   }
   const git = entry.source.git;
   const subdir = git.subdir === undefined ? "" : `#${git.subdir}`;
@@ -648,7 +701,7 @@ interface ResolvedEntrySource {
 export function resolvedEntrySource(
   entry: MarketplaceEntry,
 ): ResolvedEntrySource {
-  if (isBundledMarketplaceEntry(entry)) {
+  if ("bundled" in entry.source) {
     return {
       source: `builtin:${entry.source.bundled.plugin}`,
       selection: ROOT_PLUGIN_SOURCE_SELECTION,
@@ -662,12 +715,6 @@ export function resolvedEntrySource(
       ...(entry.source.npm.registry === undefined
         ? {}
         : { npmRegistry: entry.source.npm.registry }),
-    };
-  }
-  if (!("git" in entry.source)) {
-    return {
-      source: `builtin:${entry.source.bundled.plugin}`,
-      selection: ROOT_PLUGIN_SOURCE_SELECTION,
     };
   }
   const git = entry.source.git;

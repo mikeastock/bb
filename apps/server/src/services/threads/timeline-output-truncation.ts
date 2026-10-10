@@ -8,12 +8,8 @@ function truncationSuffix(dropped: number): string {
   return `\n…[${dropped.toLocaleString("en-US")}${TRUNCATION_SUFFIX_TAIL}`;
 }
 
-function isAlreadyTruncated(value: string): boolean {
-  return value.endsWith(TRUNCATION_SUFFIX_TAIL);
-}
-
 function truncateString(value: string, max: number): string {
-  if (value.length <= max || isAlreadyTruncated(value)) {
+  if (value.length <= max || value.endsWith(TRUNCATION_SUFFIX_TAIL)) {
     return value;
   }
   return `${value.slice(0, max)}${truncationSuffix(value.length - max)}`;
@@ -61,7 +57,8 @@ function truncateRow(row: TimelineRow, max: number): TimelineRow {
     }
     case "delegation": {
       const output = truncateString(row.output, max);
-      const childRows = truncateRows(row.childRows, max);
+      const childRows =
+        row.childRows === null ? null : truncateRows(row.childRows, max);
       if (output === row.output && childRows === row.childRows) {
         return row;
       }
@@ -88,6 +85,22 @@ export function truncateTimelineResponseOutputs(
   response: ThreadTimelineResponse,
   max: number = DEFAULT_MAX_INLINE_OUTPUT_CHARS,
 ): ThreadTimelineResponse {
-  const rows = truncateRows(response.rows, max);
-  return rows === response.rows ? response : { ...response, rows };
+  return mapTimelineResponseRows(response, (rows) => truncateRows(rows, max));
+}
+
+export function mapTimelineResponseRows(
+  response: ThreadTimelineResponse,
+  map: (rows: TimelineRow[]) => TimelineRow[],
+): ThreadTimelineResponse {
+  const rows = map(response.rows);
+  const updates = response.timelinePage.olderRowUpdates;
+  const olderRowUpdates = updates && map(updates);
+  if (rows === response.rows && olderRowUpdates === updates) {
+    return response;
+  }
+  return {
+    ...response,
+    rows,
+    timelinePage: { ...response.timelinePage, olderRowUpdates },
+  };
 }

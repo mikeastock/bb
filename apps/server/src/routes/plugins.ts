@@ -1,9 +1,18 @@
+import type { PluginUpdateJobs } from "../services/plugins/plugin-update-jobs.js";
 import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import type { Context, Hono } from "hono";
+import type { createNodeWebSocket } from "@hono/node-ws";
+import type { WSContext, WSMessageReceive, WSEvents } from "hono/ws";
+import type {
+  ExperimentalPluginWebSocket,
+  ExperimentalPluginWebSocketHandlers,
+  PluginCliExecutionResult,
+} from "@get-bb/plugin-sdk";
 import type { ServerRuntimeConfig } from "../types.js";
+import { ApiError } from "../errors.js";
 import {
   browserRequestProblem,
   type BrowserRequestProblem,
@@ -12,17 +21,32 @@ import type {
   PluginService,
   PluginWireLookup,
 } from "../services/plugins/plugin-service.js";
-import type { PluginMentionTrigger } from "../services/plugins/plugin-api.js";
+import type {
+  PluginMentionTrigger,
+  PluginWebSocketRouteRecord,
+} from "../services/plugins/plugin-api.js";
 import { PluginSettingsValidationError } from "../services/plugins/plugin-settings.js";
+import { PLUGIN_RPC_CALLER_HEADER } from "../services/plugins/plugin-rpc-caller.js";
+import type { PluginInstallJobs } from "../services/plugins/plugin-install-jobs.js";
+import {
+  prefersRespondAsync,
+  respondWithInstallJob,
+} from "./plugin-install-jobs.js";
 import {
   createAppAssetCompressionCache,
   type AppAssetCompressionCache,
 } from "../services/plugins/app-asset-compression-cache.js";
 import { rankAcceptedAssetEncodings } from "../asset-content-encoding.js";
-import { pluginImageResponse } from "./plugin-image-response.js";
+import {
+  hashedAssetCacheControl,
+  pluginImageResponse,
+} from "./plugin-image-response.js";
 import {
   pluginApplyUpdateRequestSchema,
+  pluginCachePruneRequestSchema,
+  pluginRpcDiscoveryQuerySchema,
   pluginInstallRequestSchema,
+  pluginSafeModeRequestSchema,
   pluginSettingsUpdateRequestSchema,
   pluginTokenRequestSchema,
   pluginUpdateCheckRequestSchema,
@@ -34,6 +58,66 @@ interface PluginRoutesDeps {
 }
 
 type WireAuthProblem = BrowserRequestProblem | { status: 401; error: string };
+type UpgradeWebSocket = ReturnType<
+  typeof createNodeWebSocket
+>["upgradeWebSocket"];
+
+const PLUGIN_CLI_KEEPALIVE_MS = 10_000;
+const PLUGIN_CLI_KEEPALIVE_BYTES = new TextEncoder().encode("\n");
+
+export async function pluginCliResponse(
+  result: Promise<PluginCliExecutionResult>,
+  keepaliveMs: number,
+): Promise<Response> {
+  const settled = result.then(
+    (value) => value,
+    (error: unknown): PluginCliExecutionResult => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+    }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const early = await Promise.race([
+    settled,
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), keepaliveMs);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (early !== null) {
+    return Response.json(early);
+  }
+  let interval: ReturnType<typeof setInterval> | undefined;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(PLUGIN_CLI_KEEPALIVE_BYTES);
+      interval = setInterval(() => {
+        controller.enqueue(PLUGIN_CLI_KEEPALIVE_BYTES);
+      }, keepaliveMs);
+      void settled.then((value) => {
+        clearInterval(interval);
+        if (cancelled) return;
+        controller.enqueue(
+          new TextEncoder().encode(`${JSON.stringify(value)}\n`),
+        );
+        controller.close();
+      });
+    },
+    cancel() {
+      cancelled = true;
+      clearInterval(interval);
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      "x-accel-buffering": "no",
+    },
+  });
+}
 
 const compressBrotli = promisify(brotliCompress);
 const compressGzip = promisify(gzip);
@@ -158,6 +242,14 @@ async function tokenAuthProblem(
   return null;
 }
 
+function pluginHttpSubPath(context: Context, id: string): string {
+  const prefix = `/api/v1/plugins/${id}/http`;
+  const requestPath = context.req.path;
+  return requestPath.startsWith(prefix)
+    ? requestPath.slice(prefix.length) || "/"
+    : "/";
+}
+
 function notRunningError(
   id: string,
   lookup: Extract<PluginWireLookup<unknown>, { outcome: "not-running" }>,
@@ -166,14 +258,204 @@ function notRunningError(
   return `plugin "${id}" is not running (status: ${lookup.status}${detail})`;
 }
 
+function pluginWebSocket(socket: WSContext): ExperimentalPluginWebSocket {
+  return {
+    send(data) {
+      if (typeof data === "string") {
+        socket.send(data);
+        return;
+      }
+      const copy = new Uint8Array(data.byteLength);
+      copy.set(data);
+      socket.send(copy.buffer);
+    },
+    close(code, reason) {
+      socket.close(code, reason);
+    },
+    get readyState() {
+      return socket.readyState;
+    },
+  };
+}
+
+async function pluginWebSocketMessage(
+  data: WSMessageReceive,
+): Promise<string | Uint8Array> {
+  if (typeof data === "string") return data;
+  if (data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
+  return new Uint8Array(data);
+}
+
+function pluginWebSocketError(event: Event): Error {
+  if ("error" in event && event.error instanceof Error) return event.error;
+  return new Error("WebSocket transport error");
+}
+
+function pluginWebSocketEvents(args: {
+  handlers: ExperimentalPluginWebSocketHandlers;
+  id: string;
+  plugins: PluginService;
+  route: PluginWebSocketRouteRecord;
+}): WSEvents {
+  const exposedSockets = new WeakMap<WSContext, ExperimentalPluginWebSocket>();
+  const eventQueues = new WeakMap<WSContext, Promise<void>>();
+  const expose = (socket: WSContext): ExperimentalPluginWebSocket => {
+    const existing = exposedSockets.get(socket);
+    if (existing !== undefined) return existing;
+    const created = pluginWebSocket(socket);
+    exposedSockets.set(socket, created);
+    return created;
+  };
+  const invoke = (
+    socket: WSContext,
+    event: "open" | "message" | "close" | "error",
+    run: () => void | Promise<void>,
+  ): void => {
+    const previous = eventQueues.get(socket) ?? Promise.resolve();
+    const current = args.plugins.invokeWebSocketEvent(
+      args.id,
+      args.route,
+      event,
+      async () => {
+        await previous;
+        await run();
+      },
+    );
+    eventQueues.set(socket, current);
+    void current.finally(() => {
+      if (eventQueues.get(socket) === current) eventQueues.delete(socket);
+    });
+  };
+  return {
+    onOpen(_event, socket) {
+      const exposed = expose(socket);
+      if (!args.route.active) {
+        exposed.close(1012, "Plugin reloaded or disabled");
+        return;
+      }
+      args.route.sockets.add(exposed);
+      if (args.handlers.onOpen !== undefined) {
+        invoke(socket, "open", () => args.handlers.onOpen?.(exposed));
+      }
+    },
+    onMessage(event, socket) {
+      const exposed = expose(socket);
+      if (
+        !args.route.active ||
+        !args.route.sockets.has(exposed) ||
+        args.handlers.onMessage === undefined
+      ) {
+        return;
+      }
+      invoke(socket, "message", async () =>
+        args.handlers.onMessage?.(
+          exposed,
+          await pluginWebSocketMessage(event.data),
+        ),
+      );
+    },
+    onClose(event, socket) {
+      const exposed = expose(socket);
+      if (!args.route.sockets.delete(exposed)) return;
+      if (args.handlers.onClose !== undefined) {
+        invoke(socket, "close", () =>
+          args.handlers.onClose?.(exposed, {
+            code: event.code,
+            reason: event.reason,
+          }),
+        );
+      }
+    },
+    onError(event, socket) {
+      if (args.handlers.onError === undefined) return;
+      const exposed = expose(socket);
+      invoke(socket, "error", () =>
+        args.handlers.onError?.(exposed, pluginWebSocketError(event)),
+      );
+    },
+  };
+}
+
 export function registerPluginRoutes(
   app: Hono,
   deps: PluginRoutesDeps,
   plugins: PluginService,
+  installJobs: PluginInstallJobs,
+  updateJobs: PluginUpdateJobs,
+  upgradeWebSocket?: UpgradeWebSocket,
 ): void {
   const appAssetCompressionCache = createAppAssetCompressionCache(
     MAX_CACHED_APP_ASSETS,
   );
+  const upgradePluginWebSocket = upgradeWebSocket?.(async (context) => {
+    const id = context.req.param("id");
+    const subPath = pluginHttpSubPath(context, id);
+    const lookup = plugins.getWebSocketRoute(id, subPath);
+    if (lookup.outcome === "unknown-plugin") {
+      throw new ApiError(404, "unknown_plugin", `unknown plugin "${id}"`);
+    }
+    if (lookup.outcome === "not-running") {
+      throw new ApiError(
+        503,
+        "plugin_not_running",
+        notRunningError(id, lookup),
+      );
+    }
+    if (lookup.outcome === "not-found") {
+      throw new ApiError(
+        404,
+        "unknown_plugin_websocket",
+        `plugin "${id}" has no websocket route for "${subPath}"`,
+      );
+    }
+    const auth = lookup.value.auth;
+    const problem =
+      auth === "local"
+        ? localAuthProblem(context, deps)
+        : auth === "token"
+          ? await tokenAuthProblem(context, plugins, id)
+          : null;
+    if (problem) {
+      throw new ApiError(
+        problem.status,
+        "plugin_websocket_unauthorized",
+        problem.error,
+      );
+    }
+    const fresh = plugins.getWebSocketRoute(id, subPath);
+    if (fresh.outcome !== "found" || fresh.value.auth !== auth) {
+      throw new ApiError(
+        503,
+        "plugin_reloaded",
+        `plugin "${id}" reloaded during the request — retry`,
+      );
+    }
+    const result = await plugins.invokeWebSocketRoute(id, fresh.value, {
+      request: context.req.raw,
+      url: new URL(context.req.url),
+      headers: context.req.raw.headers,
+    });
+    if (!result.ok) {
+      throw new ApiError(
+        500,
+        "plugin_websocket_failed",
+        `plugin websocket failed: ${result.error}`,
+      );
+    }
+    return pluginWebSocketEvents({
+      handlers: result.handlers,
+      id,
+      plugins,
+      route: fresh.value,
+    });
+  });
+
+  app.get("/plugins/rpc", (context) => {
+    const query = pluginRpcDiscoveryQuerySchema.safeParse(context.req.query());
+    if (!query.success)
+      return context.json({ error: "Invalid RPC discovery query" }, 400);
+    return context.json(plugins.discoverRpc(query.data));
+  });
 
   app.get("/plugins", (context) => context.json({ plugins: plugins.list() }));
 
@@ -245,18 +527,51 @@ export function registerPluginRoutes(
     if (typeof body?.threadId === "string") ctx.threadId = body.threadId;
     if (typeof body?.projectId === "string") ctx.projectId = body.projectId;
     ctx.signal = context.req.raw.signal;
-    const result = await plugins.runCliCommand(
-      context.req.param("id"),
-      argv,
-      ctx,
+    return pluginCliResponse(
+      plugins.runCliCommand(context.req.param("id"), argv, ctx),
+      PLUGIN_CLI_KEEPALIVE_MS,
     );
-    return context.json(result);
   });
 
   const APP_ASSET_CONTENT_TYPES = {
     "app.js": { kind: "js", contentType: "text/javascript; charset=utf-8" },
     "app.css": { kind: "css", contentType: "text/css; charset=utf-8" },
   } as const;
+
+  app.get("/plugin-app-assets/:hash/:file", async (context) => {
+    const file = context.req.param("file");
+    const spec =
+      file === "app.js" || file === "app.css"
+        ? APP_ASSET_CONTENT_TYPES[file]
+        : undefined;
+    if (!spec) {
+      return context.json({ ok: false, error: "unknown plugin asset" }, 404);
+    }
+    const hash = context.req.param("hash");
+    if (!/^[a-f0-9]{16}$/u.test(hash)) {
+      return context.json({ ok: false, error: "unknown plugin asset" }, 404);
+    }
+    const asset = plugins.getAppAssetByHash(hash, spec.kind);
+    if (!asset) {
+      return context.json(
+        { ok: false, error: "plugin has no loadable frontend bundle" },
+        404,
+      );
+    }
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(asset.path);
+    } catch {
+      return context.json({ ok: false, error: "bundle file missing" }, 404);
+    }
+    return appAssetResponse(context, bytes, {
+      assetKey: `${hash}:${spec.kind}`,
+      cache: appAssetCompressionCache,
+      contentType: spec.contentType,
+      cacheControl: "public, max-age=31536000, immutable",
+      contentHash: asset.hash,
+    });
+  });
 
   app.get("/plugins/:id/assets/icons/:file", (context) => {
     const file = context.req.param("file");
@@ -271,9 +586,7 @@ export function registerPluginRoutes(
     return pluginImageResponse(
       context,
       asset,
-      context.req.query("h") === asset.hash
-        ? "public, max-age=31536000, immutable"
-        : "no-store",
+      hashedAssetCacheControl(context.req.query("h"), asset.hash),
     );
   });
 
@@ -290,9 +603,7 @@ export function registerPluginRoutes(
       return pluginImageResponse(
         context,
         asset,
-        context.req.query("h") === asset.hash
-          ? "public, max-age=31536000, immutable"
-          : "no-store",
+        hashedAssetCacheControl(context.req.query("h"), asset.hash),
       );
     }
     const spec =
@@ -315,10 +626,10 @@ export function registerPluginRoutes(
     } catch {
       return context.json({ ok: false, error: "bundle file missing" }, 404);
     }
-    const cacheControl =
-      context.req.query("h") === asset.hash
-        ? "public, max-age=31536000, immutable"
-        : "no-store";
+    const cacheControl = hashedAssetCacheControl(
+      context.req.query("h"),
+      asset.hash,
+    );
     return appAssetResponse(context, bytes, {
       assetKey: `${context.req.param("id")}:${spec.kind}`,
       cache: appAssetCompressionCache,
@@ -368,22 +679,44 @@ export function registerPluginRoutes(
     }
   });
 
+  app.post("/plugins/cache/prune", async (context) => {
+    const json: unknown = await context.req.json().catch(() => null);
+    const body = pluginCachePruneRequestSchema.safeParse(json);
+    if (!body.success) {
+      return context.json({ error: 'expected { "dryRun"?: boolean }' }, 400);
+    }
+    return context.json(await plugins.pruneCache({ dryRun: body.data.dryRun }));
+  });
+
   app.post("/plugins/:id/update", async (context) => {
     const json: unknown = await context.req.json().catch(() => null);
     const body = pluginApplyUpdateRequestSchema.safeParse(json);
     if (!body.success) {
       return context.json({ error: "expected an empty JSON object" }, 400);
     }
-    try {
-      const outcome = await plugins.applyUpdate(context.req.param("id"));
-      if (!outcome.ok) return context.json({ error: outcome.error }, 422);
-      return context.json(outcome.result);
-    } catch (error) {
-      return context.json(
-        { error: error instanceof Error ? error.message : String(error) },
-        422,
-      );
-    }
+    const pluginId = context.req.param("id");
+    const job = updateJobs.start({
+      pluginId,
+      displayName: plugins.getDisplayName(pluginId),
+      run: async () => {
+        const outcome = await plugins.applyUpdate(pluginId);
+        if (!outcome.ok) throw new Error(outcome.error);
+        return outcome.result;
+      },
+    });
+    if (prefersRespondAsync(context)) return context.json({ job }, 202);
+    const settled = (await updateJobs.settled(job.id)) ?? job;
+    return settled.state === "completed"
+      ? context.json(settled.result)
+      : context.json(
+          {
+            error:
+              settled.state === "failed"
+                ? settled.error
+                : "update did not complete",
+          },
+          422,
+        );
   });
 
   app.post("/plugins/install", async (context) => {
@@ -403,21 +736,16 @@ export function registerPluginRoutes(
         422,
       );
     }
-    try {
-      const plugin = await plugins.install(
-        parsed.data.source,
-        parsed.data.selection,
-      );
-      return context.json({ ok: true, plugin });
-    } catch (error) {
-      return context.json(
-        {
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        422,
-      );
-    }
+    const { source, selection } = parsed.data;
+    const job = installJobs.start({
+      target: { kind: "source", source, selection },
+      displayName: source,
+      run: () => plugins.install(source, selection),
+    });
+    return respondWithInstallJob(context, installJobs, job, (error) => ({
+      ok: false,
+      error,
+    }));
   });
 
   app.get("/plugins/:id/source", async (context) => {
@@ -433,6 +761,22 @@ export function registerPluginRoutes(
     const outcome = await plugins.reload(id);
     if (!outcome.ok) return context.json(outcome, 422);
     return context.json(outcome);
+  });
+
+  app.get("/plugins/safe-mode", (context) =>
+    context.json({ enabled: plugins.getSafeMode() }),
+  );
+
+  app.put("/plugins/safe-mode", async (context) => {
+    const json: unknown = await context.req.json().catch(() => null);
+    const body = pluginSafeModeRequestSchema.safeParse(json);
+    if (!body.success) {
+      return context.json(
+        { ok: false, error: "expected { enabled: boolean }" },
+        400,
+      );
+    }
+    return context.json(await plugins.setSafeMode(body.data.enabled));
   });
 
   app.post("/plugins/:id/enable", async (context) => {
@@ -528,13 +872,17 @@ export function registerPluginRoutes(
     return context.json({ ok: true, token });
   });
 
+  if (upgradePluginWebSocket !== undefined) {
+    app.get("/plugins/:id/http/*", (context, next) =>
+      context.req.header("upgrade")?.toLowerCase() === "websocket"
+        ? upgradePluginWebSocket(context, next)
+        : next(),
+    );
+  }
+
   app.all("/plugins/:id/http/*", async (context) => {
     const id = context.req.param("id");
-    const prefix = `/api/v1/plugins/${id}/http`;
-    const requestPath = context.req.path;
-    const subPath = requestPath.startsWith(prefix)
-      ? requestPath.slice(prefix.length) || "/"
-      : "/";
+    const subPath = pluginHttpSubPath(context, id);
     const lookup = plugins.getHttpRoute(id, context.req.method, subPath);
     if (lookup.outcome === "unknown-plugin") {
       return context.json({ ok: false, error: `unknown plugin "${id}"` }, 404);
@@ -580,9 +928,22 @@ export function registerPluginRoutes(
   app.post("/plugins/:id/rpc/:method", async (context) => {
     const id = context.req.param("id");
     const method = context.req.param("method");
+    context.header("Cache-Control", "no-store");
     const problem = localAuthProblem(context, deps);
     if (problem) {
       return context.json({ ok: false, error: problem.error }, problem.status);
+    }
+    const callerResolution = plugins.resolveRpcCaller(
+      context.req.header(PLUGIN_RPC_CALLER_HEADER),
+    );
+    if (!callerResolution.ok) {
+      return context.json(
+        {
+          ok: false,
+          error: `the ${PLUGIN_RPC_CALLER_HEADER} token isn't a running plugin's caller token`,
+        },
+        403,
+      );
     }
     const rawBody = await context.req.text();
     let input: unknown;
@@ -629,6 +990,7 @@ export function registerPluginRoutes(
       method,
       lookup.value,
       input,
+      callerResolution.caller,
     );
     if (!outcome.ok) {
       return context.json(

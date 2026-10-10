@@ -1,6 +1,6 @@
 ---
 name: tasks
-description: Use when asked to work on or track a task in the Tasks plugin, when the prompt mentions a task key such as ABC-12, or when work needs task comments, attachments, delegation tracking, or status updates.
+description: "Work on or manage records in BB Tasks, including task keys such as ABC-12."
 ---
 
 # Tasks
@@ -8,21 +8,8 @@ description: Use when asked to work on or track a task in the Tasks plugin, when
 Use the `bb tasks` CLI to understand the assigned task, keep its record useful,
 and report the outcome where the work is tracked.
 
-Delegation presets are user-defined; Tasks ships with none. Before dispatching
-work, use `bb tasks preset list` and create a preset if the required one does
-not already exist. Dispatch requires an existing preset.
-
-Create or update the same execution selection exposed in the Tasks UI with
-`--provider`, `--model`, `--reasoning`, and optional
-`--service-tier default|fast|none`:
-
-```sh
-bb tasks preset create --name "Codex high" --provider codex \
-  --model gpt-5.6-sol --reasoning high --service-tier fast \
-  --permission auto
-```
-
-`preset update` accepts the same flags; `--service-tier none` clears a tier.
+For task dispatch and execution presets, read
+[references/delegation.md](references/delegation.md).
 
 ## Work a task
 
@@ -75,7 +62,8 @@ bb tasks preset create --name "Codex high" --provider codex \
    Read `references/attachments.md` for comment attachments, initial files,
    removal rules, and machine selection.
 
-5. When the work is ready for review, update the task:
+5. Set the status to match the completion criteria. Use `done` when they are
+   met, or `in_review` when required review remains:
 
    ```sh
    bb tasks update ABC-12 --status in_review
@@ -85,6 +73,10 @@ bb tasks preset create --name "Codex high" --provider codex \
    either a task key or ID for the parent. Promote a subtask to the top level
    with `bb tasks update ABC-12 --no-parent`; the two parent flags cannot be
    combined.
+
+   Move a task and its sub-tasks to another tracker project with
+   `bb tasks move ABC-12 --project XYZ`. The task gets a new key in that
+   project; the old key keeps resolving, so use the new key from then on.
 
    If the work cannot proceed, leave the status accurate and comment with the
    specific blocker, what you tried, and what would unblock it. Do not mark a
@@ -120,6 +112,21 @@ while the card loads and when the key no longer resolves. The rendered card
 shows the live status, title, and priority, opens the task in the thread
 side panel, and links to the full Tasks app. Emit one directive per line;
 each renders its own card.
+
+## CLI conventions
+
+- `bb tasks --help` lists every command, and `bb tasks <command> --help` prints
+  that command's arguments, accepted values, and limits. Both exit 0.
+- `--project` takes a tracker project prefix or id such as `ABC`, never a bb
+  project id (`proj_...`). `bb tasks project list` shows both columns.
+- `bb tasks status` reports the plugin's name and version. A task's workflow
+  status is `bb tasks list --status <status>` and
+  `bb tasks update ABC-12 --status <status>`.
+- Repeatable options (`--label`, `--status`, `--priority`, `--add-label`,
+  `--remove-label`) accept a repeated flag or one comma-separated list.
+- Unknown options and stray arguments are errors, never ignored, and every
+  missing required value is reported in one error. A failing command run with
+  `--json` prints `{"ok":false,"error":{"code","message","hint"?}}` on stdout.
 
 ## Invariants
 

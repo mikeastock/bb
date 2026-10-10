@@ -71,8 +71,10 @@ bb.providers.register({
     { id: "low", label: "Low" },
     { id: "high", label: "High" },
   ],
-  serviceTiers: undefined,       // optional; open list, model/list is precise
+  serviceTiers: undefined,       // optional; open list of { id, label, description? },
+                                 // "default" is the standard tier; model/list is precise
   composerActions: ["plan"],     // "plan" | "goal"
+  completedTurnDisplay: "flat",  // "collapse" (default) | "flat"; the user's per-provider setting wins
   extensionKinds: {},            // "<name>": { item?: Schema, state?: Schema }
   models: { fallback: [], scope: "host" }, // cold-cache placeholder; scope is
                                  // "host" | "workspace" (default): how far one
@@ -85,6 +87,21 @@ bb.providers.register({
 })
 // => { dispose(): void }
 ```
+
+Each `model/list` entry may carry `supportedServiceTiers: [{ id, label?,
+description? }]`, the tiers that model accepts besides `default`. bb offers
+only the ids the declaration also lists, preferring the entry's label and
+description; an empty array hides the tier picker for that model, and an entry
+without the field accepts every declared tier. The server rejects an explicit
+tier the declaration does not list and passes the chosen id to the bridge as
+`serviceTier`.
+
+bb keeps each machine's last successful `model/list` answer per
+`models.scope` across daemon reconnects and server restarts, serves it
+immediately, and refreshes it in the background once it is 10 minutes old. A
+stored answer is discarded when the bridge fingerprint changes (plugin bundle
+digest, bridge options, env passthrough). A list that depends on login state,
+CLI version, or environment values is corrected only by the next refresh.
 
 Still experimental on the declaration (see api_to_audit.md):
 `experimental_visibility` (`"installed"` hides the row until the bridge's
@@ -123,6 +140,12 @@ Rules:
   register conservatively while the host is offline, re-register on connect).
 - Picker order and the default provider are user settings; the initial default
   is plugin install order. First-party plugins install first at bootstrap.
+- `completedTurnDisplay` is the provider's default for finished turns in the
+  thread timeline. `"collapse"` folds a finished turn's work into one "Worked
+  for" row beside the final answer; `"flat"` keeps every row visible, as while
+  the turn ran. The user overrides it per provider in Settings → Providers or
+  with `bb settings completed-turns`, and the server applies the result to the
+  timeline, turn details, conversation outline, and `bb thread log`.
 - Third-party ACP agents (for example Amp) register the same way, with a
   bridge built from the published ACP kit.
 
@@ -173,9 +196,19 @@ declares `skills.configure`),
 Execution options ride every command and carry no provider-named field:
 
 ```ts
-{ model, serviceTier?, reasoningLevel, promptMode?, instructions,
-  providerOptions: JsonValue } & PermissionPolicy
+{ model, serviceTier?, reasoningLevel, promptMode?, sessionOptions?,
+  instructions, providerOptions: JsonValue } & PermissionPolicy
 ```
+
+`reasoningLevel` is an open id: one of the standard ladder entries (`none`,
+`low`, `medium`, `high`, `xhigh`, `ultracode`, `max`, `ultra`) or any id the
+bridge listed for the model in `model/list`
+(`supportedReasoningEfforts[].reasoningEffort`, with an optional `label` for
+the picker). A bridge that receives an id it does not know omits it rather
+than failing the turn. `sessionOptions` is `{ [optionId]: string | boolean }`,
+the user's pending choices among the options the bridge published as
+`bb/session-options`; it is present only while a choice differs from the
+published value.
 
 **Bridge → runtime**: `thread/delta` (one streaming dialect, one usage
 dialect), `provider/recovery`, `session/replaced`, plus the request channels
@@ -219,6 +252,14 @@ glyph.
 **Thread state** — core: `usage`, `contextWindow`, `rateLimits`,
 `modelFallback`, `contextCleared`. Extension: `"<pluginId>/<name>"`, latest
 snapshot wins per kind, same schema and emitter rules as extension items.
+Two state kinds are bb's own and open to every provider: `bb/provider-commands`
+(the provider's live slash commands for the thread) and `bb/session-options`
+(its per-session settings other than the model and reasoning level). A user
+picks a value in the model picker (the `mode` option sits in the composer
+footer) or with
+`bb thread options --set`; the server holds the choice, sends it as
+`sessionOptions` with the next turn, and drops it once the bridge publishes
+that value.
 
 **Delegation** — one kind replaces three encodings and `thread/openWork`:
 
@@ -394,18 +435,13 @@ trust, identical to every other plugin.
 
 ## 7. AI services
 
-bb's helper inference (thread titles, commit messages) and voice transcription
-are plugin-served too. A plugin registers
-`bb.experimental_aiServices.register({ id, displayName, kinds })` and
-implements `experimental_aiServicesHostContract`
-(`@get-bb/plugin-sdk/ai-services`: `ai.inference.complete`,
-`ai.voice.transcribe`, each carrying `serviceId`) in its `bb.host` entry. The
-user chooses with `BB_INFERENCE` / `BB_TRANSCRIPTION` = `<serviceId>/<model>`;
-core calls the registered plugin on the primary host and applies its own
-retry/fallback policy to the `{ ok: false, code }` results. The codex plugin
-serves `codex` from the codex CLI's own credentials; there is no daemon-bundled
-client. Ids the server serves itself (`openai` transcription, the builtin
-inference providers) are reserved: they route server-direct before the
-registry and `register` refuses them; a cross-plugin id collision fails the
-later plugin's load at the `register` call. See `docs/api_to_audit.md` for the
-audit items.
+bb's helper tasks (thread titles, commit messages, voice transcripts) are
+plugin-served too. A plugin registers
+`bb.experimental_aiServices.register({ id, displayName, complete, transcribe, status })`
+from its server entry: `complete(prompt) → Promise<string>` and
+`transcribe(audio) → Promise<string>`, each with an abort signal. The user picks
+a service per task in Settings → AI services; Automatic tries bb cloud first,
+then all other compatible registered services by plugin id and service id in
+lexicographic order, including third-party plugins. The codex
+plugin serves `codex` by calling its own `bb.host` entry for the Codex CLI
+login on the primary machine. See `docs/api_to_audit.md` for the audit items.

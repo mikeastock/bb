@@ -221,6 +221,9 @@ interface NodeSurface {
 }
 
 type ExpectedBbSdkKey =
+  | "experimental_desktopBrowsers"
+  | "experimental_promptHistory"
+  | "experimental_server"
   | "environments"
   | "files"
   | "guide"
@@ -240,8 +243,12 @@ type ExpectedBbSdkKey =
 type ExpectedRealtimeKey = "subscribe";
 
 type ExpectedEnvironmentsKey =
+  | "experimental_cleanup"
   | "archiveThreads"
   | "commit"
+  | "delete"
+  | "list"
+  | "listProviders"
   | "diff"
   | "diffBranches"
   | "diffFile"
@@ -253,7 +260,6 @@ type ExpectedEnvironmentsKey =
   | "mergePullRequest"
   | "paths"
   | "pullRequest"
-  | "squashMerge"
   | "status"
   | "update";
 
@@ -271,20 +277,36 @@ type ExpectedGuideKey = "render";
 
 type ExpectedHostsKey =
   | "cloneDefaultPath"
+  | "experimental_create"
+  | "experimental_getEnrollmentCommand"
+  | "experimental_reconnect"
   | "createJoinCode"
   | "delete"
+  | "experimental_deleteOldServerCopy"
   | "directory"
+  | "experimental_discoverRepos"
   | "get"
   | "installProviderCli"
   | "list"
+  | "experimental_listProviders"
   | "pathsExist"
   | "pickFolder"
   | "providerCliStatus"
+  | "experimental_resume"
+  | "experimental_retryCleanup"
   | "retryUpdate"
+  | "experimental_suspend"
+  | "experimental_reconcile"
   | "update";
 
 type ExpectedPluginsKey =
+  | "experimental_discoverRpc"
+  | "experimental_getSafeMode"
+  | "experimental_setSafeMode"
+  | "experimental_pruneCache"
   | "applyUpdate"
+  | "experimental_startUpdate"
+  | "experimental_updateJobs"
   | "callRpc"
   | "catalog"
   | "checkUpdates"
@@ -293,19 +315,34 @@ type ExpectedPluginsKey =
   | "getSettings"
   | "getSource"
   | "install"
+  | "installJobs"
   | "list"
   | "listUpdateResults"
   | "marketplaces"
   | "reload"
   | "remove"
+  | "startInstall"
   | "token"
   | "updateSettings";
 
-type ExpectedPluginCatalogKey = "install" | "installPlan" | "search" | "status";
+type ExpectedPluginCatalogKey =
+  | "install"
+  | "installPlan"
+  | "search"
+  | "startInstall"
+  | "status";
 
 type ExpectedPluginMarketplacesKey = "add" | "list" | "refresh" | "remove";
 
+type ExpectedPluginInstallJobsKey = "cancel" | "get" | "list";
+
+type ExpectedExperimentalPromptHistoryKey = "list";
+
 type ExpectedProjectsKey =
+  | "machineEnvironment"
+  | "replaceMachineEnvironment"
+  | "setMachineEnvironmentVariable"
+  | "deleteMachineEnvironmentVariable"
   | "attachments"
   | "branches"
   | "commands"
@@ -326,18 +363,31 @@ type ExpectedProjectsKey =
 type ExpectedProjectSourcesKey = "add" | "delete" | "update";
 type ExpectedProjectAttachmentsKey = "copy" | "read" | "upload";
 
-type ExpectedProvidersKey = "list" | "models";
+type ExpectedProvidersKey = "catalog" | "list" | "models" | "setEnabled";
 
 type ExpectedStatusKey = "get";
 
 type ExpectedSystemKey =
+  | "acknowledgeAppUpdate"
+  | "mobileAppDownloads"
+  | "mobileAppReleases"
+  | "appUpdate"
+  | "applyAppUpdate"
+  | "setMachineEnvironmentVariable"
+  | "deleteMachineEnvironmentVariable"
+  | "machineEnvironment"
+  | "replaceMachineEnvironment"
+  | "aiServices"
   | "attention"
   | "cliSkillsStatus"
   | "config"
   | "executionOptions"
   | "installCliSkills"
   | "reloadConfig"
+  | "setAiServiceSelection"
+  | "testAiService"
   | "transcribeVoice"
+  | "uiPreferences"
   | "updateExperiments"
   | "updateGeneralSettings"
   | "updateKeyboardSettings"
@@ -345,15 +395,24 @@ type ExpectedSystemKey =
   | "usageLimits"
   | "version";
 
-type ExpectedThemeKey = "catalog" | "get" | "set";
+type ExpectedSystemUiPreferencesKey = "list" | "reset" | "set";
+
+type ExpectedThemeKey = "catalog" | "get" | "resolve" | "set";
 
 type ExpectedThreadSectionsKey = "create" | "delete" | "list" | "update";
 
 type ExpectedThreadsKey =
+  | "experimental_listAncestors"
+  | "experimental_listDescendants"
+  | "experimental_listPluginMetadata"
+  | "getPluginMetadata"
+  | "updatePluginMetadata"
+  | "context"
   | "archive"
   | "archiveAll"
   | "cancelPlan"
   | "childSummary"
+  | "clearContext"
   | "clearGoal"
   | "compact"
   | "conversationOutline"
@@ -369,6 +428,7 @@ type ExpectedThreadsKey =
   | "listRunning"
   | "markRead"
   | "markUnread"
+  | "message"
   | "open"
   | "output"
   | "paneAction"
@@ -378,6 +438,7 @@ type ExpectedThreadsKey =
   | "queuedMessages"
   | "reorderPinned"
   | "resolveMentions"
+  | "restoreEnvironment"
   | "retry"
   | "search"
   | "send"
@@ -410,6 +471,8 @@ type ExpectedThreadInteractionsKey =
 type ExpectedThreadQueuedMessagesKey =
   | "create"
   | "delete"
+  | "experimental_holdForEdit"
+  | "experimental_releaseEditHold"
   | "list"
   | "reorder"
   | "send"
@@ -520,6 +583,9 @@ describe("SDK public type entrypoints", () => {
       keyof RootBbSdk["plugins"]["marketplaces"]
     >().toEqualTypeOf<ExpectedPluginMarketplacesKey>();
     expectTypeOf<
+      keyof RootBbSdk["plugins"]["installJobs"]
+    >().toEqualTypeOf<ExpectedPluginInstallJobsKey>();
+    expectTypeOf<
       keyof RootBbSdk["projects"]
     >().toEqualTypeOf<ExpectedProjectsKey>();
     expectTypeOf<
@@ -529,6 +595,9 @@ describe("SDK public type entrypoints", () => {
       keyof RootBbSdk["projects"]["sources"]
     >().toEqualTypeOf<ExpectedProjectSourcesKey>();
     expectTypeOf<
+      keyof RootBbSdk["experimental_promptHistory"]
+    >().toEqualTypeOf<ExpectedExperimentalPromptHistoryKey>();
+    expectTypeOf<
       keyof RootBbSdk["providers"]
     >().toEqualTypeOf<ExpectedProvidersKey>();
     expectTypeOf<
@@ -537,6 +606,9 @@ describe("SDK public type entrypoints", () => {
     expectTypeOf<
       keyof RootBbSdk["system"]
     >().toEqualTypeOf<ExpectedSystemKey>();
+    expectTypeOf<
+      keyof RootBbSdk["system"]["uiPreferences"]
+    >().toEqualTypeOf<ExpectedSystemUiPreferencesKey>();
     expectTypeOf<
       keyof RootBbSdk["terminals"]
     >().toEqualTypeOf<ExpectedTerminalsKey>();

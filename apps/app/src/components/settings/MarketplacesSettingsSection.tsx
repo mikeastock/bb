@@ -9,7 +9,7 @@ import { appToast } from "@/components/ui/app-toast";
 import {
   ConfirmDeleteDialog,
   ConfirmDeleteDialogContent,
-} from "@/components/dialogs/ConfirmDeleteDialog";
+} from "@bb/shared-ui/confirm-delete-dialog";
 import { pluginAdminErrorMessage } from "@/lib/plugin-admin-error";
 import { invalidatePluginMarketplaces } from "@/hooks/cache-owners/plugin-cache-owner";
 import {
@@ -39,6 +39,7 @@ export function MarketplacesSettingsSection() {
   const invalidate = () => invalidatePluginMarketplaces({ queryClient });
 
   const add = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: (value: string) => addPluginMarketplace(fetch, value),
     onSuccess: (marketplace) => {
       setSource("");
@@ -55,6 +56,7 @@ export function MarketplacesSettingsSection() {
   });
 
   const refresh = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: (name: string) => refreshPluginMarketplaces(fetch, name),
     onSuccess: (results) => {
       invalidate();
@@ -75,6 +77,7 @@ export function MarketplacesSettingsSection() {
   });
 
   const remove = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: (name: string) => removePluginMarketplace(fetch, name),
     onSuccess: (result) => {
       setRemoving(null);
@@ -97,6 +100,7 @@ export function MarketplacesSettingsSection() {
     <SettingsSection
       title="Plugin marketplaces"
       description="bb reads plugin catalogs from these marketplaces. Adding one validates and caches its catalog; it never installs, updates, or runs plugin code."
+      bodyClassName="border-0 bg-transparent p-0"
     >
       <div className="space-y-1.5">
         <div className="flex items-start gap-2">
@@ -122,14 +126,14 @@ export function MarketplacesSettingsSection() {
         </p>
       </div>
 
-      <ul className="space-y-2 pt-1">
+      <ul className="space-y-2 pt-3">
         {marketplaces.map((marketplace) => (
           <li
             key={marketplace.name}
             className="flex items-start gap-3 rounded-md border border-border p-3"
           >
             <div className="min-w-0 flex-1 space-y-1">
-              <p className="flex items-center gap-2 text-sm text-foreground">
+              <div className="flex items-center gap-2 text-sm text-foreground">
                 {marketplace.displayName}
                 <span className="font-mono text-2xs text-subtle-foreground">
                   {marketplace.name}
@@ -139,7 +143,7 @@ export function MarketplacesSettingsSection() {
                     Official
                   </Badge>
                 ) : null}
-              </p>
+              </div>
               <p className="truncate font-mono text-2xs text-subtle-foreground">
                 {marketplace.source}
               </p>

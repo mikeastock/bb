@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createConnectServerSync,
   fetchConnectAccountServers,
-  selectTargetableConnectServers,
   type ConnectAccountServer,
 } from "../src/connect-server-sync.js";
 
@@ -124,20 +123,6 @@ describe("fetchConnectAccountServers", () => {
   });
 });
 
-describe("selectTargetableConnectServers", () => {
-  it("drops the self handle and keeps everything else, live or not", () => {
-    const servers = selectTargetableConnectServers({
-      selfHandle: "me",
-      servers: [
-        { handle: "me", name: "primary", live: true, url: "https://me.x" },
-        { handle: "laptop", name: "Laptop", live: true, url: "https://l.x" },
-        { handle: "phone", name: "Phone", live: false, url: "https://p.x" },
-      ],
-    });
-    expect(servers.map((server) => server.handle)).toEqual(["laptop", "phone"]);
-  });
-});
-
 describe("createConnectServerSync", () => {
   it("hands fresh servers to onServers and skips list trigger within the min interval", async () => {
     let now = 1_000_000;
@@ -172,9 +157,7 @@ describe("createConnectServerSync", () => {
       onUnauthorized: () => undefined,
       fetchImpl,
       now: () => now,
-      minIntervalMs: 60_000,
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -247,7 +230,6 @@ describe("createConnectServerSync", () => {
         logs.push(message);
       },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -289,6 +271,7 @@ describe("createConnectServerSync without a local server", () => {
             servers: [
               { handle: "me", name: "This Mac", live: true },
               { handle: "other", name: "Other", live: true },
+              { handle: "phone", name: "Phone", live: false },
             ],
           }),
         ),
@@ -304,7 +287,6 @@ describe("createConnectServerSync without a local server", () => {
       onSkipped: () => undefined,
       onUnauthorized: () => undefined,
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -320,6 +302,12 @@ describe("createConnectServerSync without a local server", () => {
         name: "Other",
         live: true,
         url: "https://other.getbb.app",
+      },
+      {
+        handle: "phone",
+        name: "Phone",
+        live: false,
+        url: "https://phone.getbb.app",
       },
     ]);
   });
@@ -339,7 +327,6 @@ describe("createConnectServerSync without a local server", () => {
         unauthorized += 1;
       },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -359,7 +346,6 @@ describe("createConnectServerSync without a local server", () => {
       },
       onUnauthorized: () => undefined,
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -383,7 +369,6 @@ describe("createConnectServerSync without a local server", () => {
         logs.push(message);
       },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();

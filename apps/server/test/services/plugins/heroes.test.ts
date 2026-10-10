@@ -1,15 +1,9 @@
 import { createHmac } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getLatestThreadSequence, getThread } from "@bb/db";
 import { turnScope } from "@bb/domain";
-import {
-  generatedSkillsRootPath,
-  pluginCommandsSkillDir,
-} from "../../../src/services/plugins/plugin-commands-skill.js";
-import { resolveInjectedSkillSources } from "../../../src/services/skills/injected-skills.js";
 import { applyLoggedThreadLifecycleEvent } from "../../../src/services/threads/lifecycle-outcome.js";
 import {
   seedEvent,
@@ -23,6 +17,7 @@ import {
   testLogger,
   type TestAppHarness,
 } from "../../helpers/test-app.js";
+import { installFakeGitWorktreeProvider } from "../../helpers/environment-provider.js";
 
 const BASE = "http://127.0.0.1:3334";
 
@@ -87,17 +82,6 @@ describe("hero plugin: agent-enrichment", () => {
     };
   }
 
-  it("bb docs search returns excerpts from the bundled docs via the CLI endpoint", async () => {
-    const result = await runDocs(["search", "conventional commits"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("conventions.md");
-    expect(result.stdout).toContain("conventional commits");
-
-    const last = await runDocs(["last"]);
-    expect(last.exitCode).toBe(0);
-    expect(last.stdout).toContain('"conventional commits"');
-  });
-
   it("the caseSensitive boolean setting changes search behavior without a reload", async () => {
     const insensitive = await runDocs(["search", "CONVENTIONAL COMMITS"]);
     expect(insensitive.stdout).toContain("conventions.md");
@@ -109,52 +93,12 @@ describe("hero plugin: agent-enrichment", () => {
     expect(sensitive.exitCode).toBe(0);
     expect(sensitive.stdout).toContain("No matches");
   });
-
-  it("its command reaches agents through the generated plugin-commands skill", async () => {
-    const skillFile = join(
-      pluginCommandsSkillDir(harness.config.dataDir),
-      "SKILL.md",
-    );
-    const content = await readFile(skillFile, "utf8");
-    expect(content).toContain("## bb docs —");
-    expect(content).toContain("bb docs search <query...>");
-
-    const sources = resolveInjectedSkillSources(testLogger, {
-      additionalSkillsRootPaths: [
-        generatedSkillsRootPath(harness.config.dataDir),
-      ],
-      builtinSkillsRootPath: join(harness.config.dataDir, "builtin-skills"),
-      dataDir: harness.config.dataDir,
-      skillTreeRegistry: harness.deps.skillTreeRegistry,
-    });
-    expect(
-      sources.find((source) => source.name === "plugin-commands"),
-    ).toMatchObject({ kind: "tree", entryPath: "SKILL.md" });
-  });
-
-  it("auto-imports its skills/ directory through the plugin skills tier", () => {
-    const pluginSkillRoots = harness.pluginService.listSkillRootContributions();
-    expect(pluginSkillRoots).toContainEqual(
-      expect.objectContaining({
-        rootPath: join(EXAMPLES_DIR, "agent-enrichment", "skills"),
-      }),
-    );
-    const sources = resolveInjectedSkillSources(testLogger, {
-      builtinSkillsRootPath: join(harness.config.dataDir, "builtin-skills"),
-      dataDir: harness.config.dataDir,
-      pluginSkillRoots,
-      skillTreeRegistry: harness.deps.skillTreeRegistry,
-    });
-    const skill = sources.find((source) => source.name === "repo-conventions");
-    expect(skill).toBeDefined();
-    expect(skill?.description).toContain("Conventions");
-    expect(skill).toMatchObject({ kind: "tree", entryPath: "SKILL.md" });
-  });
 });
 
 describe("hero plugin: slack-bot", () => {
   it("webhook → spawn → thread.idle → chat.postMessage, end to end", async () => {
     const server = await startTestServer({ appVersion: APP_VERSION });
+    installFakeGitWorktreeProvider();
     const realFetch = globalThis.fetch;
     const slackCalls: Array<{ url: string; body: Record<string, unknown> }> =
       [];

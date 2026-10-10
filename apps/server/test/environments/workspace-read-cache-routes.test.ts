@@ -1,3 +1,4 @@
+import { updateHost } from "@bb/db";
 import { describe, expect, it } from "vitest";
 import type { GitHostPullRequest, WorkspaceWorkingTree } from "@bb/domain";
 import type { HostDaemonOnlineRpcResult } from "@bb/host-daemon-contract";
@@ -53,6 +54,8 @@ function rawPullRequest(
     baseRefName: "main",
     headRefName: "bb/pr-cache",
     updatedAt: "2026-06-16T12:30:00Z",
+    autoMerge: false,
+    inMergeQueue: false,
     checks: [],
     reviewDecision: null,
     reviewRequestCount: 0,
@@ -75,7 +78,7 @@ function seedGitEnvironment(harness: TestAppHarness, suffix: string) {
     branchName: "bb/pr-cache",
     defaultBranch: "main",
     path: `/tmp/workspace-read-cache-${suffix}`,
-    workspaceProvisionType: "managed-worktree",
+    environmentProviderId: "git-worktree",
   });
   return { host, environment };
 }
@@ -330,3 +333,25 @@ describe("workspace read caches on the environment routes", () => {
     });
   });
 });
+
+it.each(["suspended", "suspending"] as const)(
+  "does not send passive status or PR RPCs to a %s machine",
+  async (phase) => {
+    await withTestHarness(async (h) => {
+      const { host, environment } = seedGitEnvironment(h, phase);
+      updateHost(h.db, h.hub, host.id, {
+        phase,
+        machineProviderId: "test-paused-provider",
+        suspendedAt: phase === "suspended" ? Date.now() : null,
+      });
+      for (const path of ["status", "pull-request"]) {
+        const response = await h.app.request(
+          `/api/v1/environments/${environment.id}/${path}`,
+        );
+        expect(response.status).not.toBe(404);
+        expect(listQueuedCommands(h, "workspace.status")).toHaveLength(0);
+        expect(listQueuedCommands(h, "workspace.pull_request")).toHaveLength(0);
+      }
+    });
+  },
+);

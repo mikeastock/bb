@@ -1,10 +1,10 @@
-import { z } from "zod";
 import {
   appendStoredThreadEventsInTransaction,
   createEventId,
   getActiveStoredTurnId,
   getLastStoredProviderThreadId,
   getLastStoredTurnRequestEvent,
+  getStoredProviderSession,
   getStoredTurnRequestEventForTurn,
   getThread,
   listStoredTurnStartedKeys,
@@ -19,11 +19,10 @@ import {
   getThreadEventScopeTurnId,
   isStandaloneBuiltinCompactCommand,
   parseStoredThreadEvent,
-  permissionModeSchema,
   systemErrorEventDataSchema,
   threadScope,
   turnRequestEventDataSchema,
-  type PermissionMode,
+  WORKSPACE_PROVISIONING_STEP_KEYS,
 } from "@bb/domain";
 import { randomBytes } from "node:crypto";
 import type {
@@ -49,6 +48,7 @@ import type {
 } from "@bb/domain";
 import { ApiError, TurnStartGuardError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
+import { parseStoredEventPayload } from "./thread-data.js";
 import type { DbNotifier, DbQueryConnection, DbTransaction } from "@bb/db";
 import type { AppendStoredThreadEventArgs as AppendThreadEventArgs } from "@bb/db";
 
@@ -70,22 +70,6 @@ interface ThreadEventTransactionDeps {
 export interface TurnRequestRetryMarker {
   requestId: ClientTurnRequestId;
   attempt: number;
-}
-
-/**
- * A recorded permission mode narrowed to one the system still offers, or null.
- *
- * Persisted turns are historical facts, so a `client/turn/requested` can carry
- * a mode that has since been retired. Anything replaying such a turn — a retry
- * re-submitting it, a hook reading what it ran with — needs the current
- * vocabulary, and null (meaning "resolve it as usual") is the only honest
- * answer for a mode that no longer exists.
- */
-export function currentPermissionMode(
-  recorded: TurnRequestEventData["execution"]["permissionMode"],
-): PermissionMode | null {
-  const parsed = permissionModeSchema.safeParse(recorded);
-  return parsed.success ? parsed.data : null;
 }
 
 interface ClientTurnRequestedEventArgs {
@@ -120,7 +104,7 @@ interface ClientTurnLifecycleEventArgs {
   requestMethod: "thread/start" | "turn/start";
   source: "spawn" | "tell";
   threadId: string;
-  type: "client/thread/start" | "client/turn/start";
+  type: "client/thread/start";
 }
 
 type ClientTurnEventArgs =
@@ -151,15 +135,13 @@ interface AppendSystemErrorEventArgs {
   detail?: string;
   environmentId?: string | null;
   message: string;
-  reconnectAttempt?: number;
-  reconnectTotal?: number;
   scope: ThreadEventScope;
   threadId: string;
 }
 
 interface AppendThreadProvisioningEventArgs {
   entries: ProvisioningTranscriptEntry[];
-  environmentId: string;
+  environmentId: string | null;
   provisioningId: string;
   status: SystemThreadProvisioningStatus;
   threadId: string;
@@ -167,6 +149,7 @@ interface AppendThreadProvisioningEventArgs {
 
 interface BuildCwdBranchEntriesArgs {
   branchName: string | null;
+  headSha: string | null;
   path: string;
 }
 
@@ -174,8 +157,6 @@ interface AppendThreadInterruptedEventArgs {
   reason: SystemThreadInterruptedReason;
   threadId: string;
 }
-
-const storedEventPayloadSchema = z.record(z.string(), z.unknown());
 
 const LEGACY_THREAD_START_TARGET = {
   kind: "thread-start",
@@ -192,59 +173,10 @@ interface TurnStartKey {
   turnId: string;
 }
 
-interface ReconnectProgress {
-  attempt: number;
-  total: number;
-}
-
 function legacyTurnRequestTargetForType(
   type: LegacyTurnRequestEventType,
 ): TurnRequestTarget {
   return LEGACY_TURN_REQUEST_TARGET_BY_TYPE[type];
-}
-
-function parseReconnectProgress(message: string): ReconnectProgress | null {
-  const match = message.trim().match(/^Reconnecting\.\.\.\s+(\d+)\/(\d+)$/);
-  if (!match) {
-    return null;
-  }
-
-  const attempt = Number.parseInt(match[1] ?? "", 10);
-  const total = Number.parseInt(match[2] ?? "", 10);
-  if (
-    !Number.isFinite(attempt) ||
-    !Number.isFinite(total) ||
-    attempt <= 0 ||
-    total <= 0 ||
-    attempt > total
-  ) {
-    return null;
-  }
-
-  return { attempt, total };
-}
-
-function resolveReconnectProgress(
-  args: Pick<
-    AppendSystemErrorEventArgs,
-    "code" | "message" | "reconnectAttempt" | "reconnectTotal"
-  >,
-): ReconnectProgress | null {
-  if (
-    args.reconnectAttempt !== undefined &&
-    args.reconnectTotal !== undefined
-  ) {
-    return {
-      attempt: args.reconnectAttempt,
-      total: args.reconnectTotal,
-    };
-  }
-
-  if (args.code !== "provider_reconnect") {
-    return null;
-  }
-
-  return parseReconnectProgress(args.message);
 }
 
 function buildClientTurnBaseEventData(
@@ -309,6 +241,7 @@ interface AppendThreadEventsTransactionResult {
 }
 
 interface BuildAppendThreadEventNotificationMetadataArgs {
+  sequence: number;
   readStateUpdate: ThreadReadStateUpdate | null;
   eventType: ThreadEventType;
 }
@@ -322,17 +255,23 @@ export function createClientTurnRequestId(): ClientTurnRequestId {
   });
 }
 
-function appendBuiltClientTurnRequestedEvent(
-  append: AppendClientTurnEvent,
+function buildClientTurnRequestedEventArgs(
   args: PreparedClientTurnRequestedEventArgs,
-): AppendedClientTurnRequest {
-  const sequence = append({
+): AppendThreadEventArgs<"client/turn/requested"> {
+  return {
     threadId: args.threadId,
     environmentId: args.environmentId,
     type: args.type,
     scope: threadScope(),
     data: buildClientTurnRequestedEventData(args, args.requestId),
-  });
+  };
+}
+
+function appendBuiltClientTurnRequestedEvent(
+  append: AppendClientTurnEvent,
+  args: PreparedClientTurnRequestedEventArgs,
+): AppendedClientTurnRequest {
+  const sequence = append(buildClientTurnRequestedEventArgs(args));
   return { requestId: args.requestId, sequence };
 }
 
@@ -342,7 +281,6 @@ function appendBuiltClientTurnEvent(
 ): number | AppendedClientTurnRequest {
   switch (args.type) {
     case "client/thread/start":
-    case "client/turn/start":
       return append({
         threadId: args.threadId,
         environmentId: args.environmentId,
@@ -431,11 +369,13 @@ function buildAppendThreadEventNotificationChanges(
 }
 
 function buildAppendThreadEventNotificationMetadata({
+  sequence,
   readStateUpdate,
   eventType,
 }: BuildAppendThreadEventNotificationMetadataArgs): ThreadChangeMetadata {
   const metadata: ThreadChangeMetadata = {
     eventTypes: [eventType],
+    timelineSequence: sequence,
   };
   if (readStateUpdate?.changed === true) {
     metadata.projectId = readStateUpdate.projectId;
@@ -536,6 +476,7 @@ export function appendThreadEvent(
     args.threadId,
     buildAppendThreadEventNotificationChanges(result.readStateUpdate),
     buildAppendThreadEventNotificationMetadata({
+      sequence: result.sequence,
       readStateUpdate: result.readStateUpdate,
       eventType: args.type,
     }),
@@ -585,10 +526,6 @@ export function appendClientTurnEventInTransaction(
 ): AppendedClientTurnRequest;
 export function appendClientTurnEventInTransaction(
   db: DbTransaction,
-  args: ClientTurnLifecycleEventArgs,
-): number;
-export function appendClientTurnEventInTransaction(
-  db: DbTransaction,
   args: ClientTurnEventArgs,
 ): number | AppendedClientTurnRequest {
   return appendBuiltClientTurnEvent(
@@ -601,14 +538,10 @@ export function appendPreparedClientTurnRequestedEventWithNotificationInTransact
   db: DbTransaction,
   args: PreparedClientTurnRequestedEventArgs,
 ): AppendedClientTurnRequestWithNotification {
-  const eventArgs: AppendThreadEventArgs = {
-    threadId: args.threadId,
-    environmentId: args.environmentId,
-    type: args.type,
-    scope: threadScope(),
-    data: buildClientTurnRequestedEventData(args, args.requestId),
-  };
-  const result = appendThreadEventInTransactionWithAttention(db, eventArgs);
+  const result = appendThreadEventInTransactionWithAttention(
+    db,
+    buildClientTurnRequestedEventArgs(args),
+  );
   return {
     requestId: args.requestId,
     sequence: result.sequence,
@@ -616,6 +549,7 @@ export function appendPreparedClientTurnRequestedEventWithNotificationInTransact
       result.readStateUpdate,
     ),
     notificationMetadata: buildAppendThreadEventNotificationMetadata({
+      sequence: result.sequence,
       readStateUpdate: result.readStateUpdate,
       eventType: args.type,
     }),
@@ -625,30 +559,12 @@ export function appendPreparedClientTurnRequestedEventWithNotificationInTransact
 export function parseStoredTurnRequestEvent(
   row: StoredTurnRequestEventRow,
 ): TurnRequestEventData {
-  let eventData: unknown;
-  try {
-    eventData = JSON.parse(row.data);
-  } catch {
-    throw new ApiError(
-      500,
-      "internal_error",
-      `Stored ${row.type} event #${row.sequence} for thread ${row.threadId} is not valid JSON`,
-    );
-  }
-
-  const parsedEventData = storedEventPayloadSchema.safeParse(eventData);
-  if (!parsedEventData.success) {
-    throw new ApiError(
-      500,
-      "internal_error",
-      `Stored ${row.type} event #${row.sequence} for thread ${row.threadId} is malformed`,
-    );
-  }
+  const payload = parseStoredEventPayload(row);
 
   let event;
   try {
     event = parseStoredThreadEvent({
-      data: parsedEventData.data,
+      data: payload,
       threadId: row.threadId,
       type: row.type,
       scope: threadScope(),
@@ -672,7 +588,7 @@ export function parseStoredTurnRequestEvent(
 
   if (row.type === "client/thread/start" || row.type === "client/turn/start") {
     const legacyTurnRequest = turnRequestEventDataSchema.safeParse({
-      ...parsedEventData.data,
+      ...payload,
       target: legacyTurnRequestTargetForType(row.type),
     });
     if (legacyTurnRequest.success) {
@@ -687,11 +603,10 @@ export function parseStoredTurnRequestEvent(
   );
 }
 
-export function appendThreadProvisioningEvent(
-  deps: Pick<AppDeps, "db" | "hub">,
+function buildThreadProvisioningEventArgs(
   args: AppendThreadProvisioningEventArgs,
-): number {
-  return appendThreadEvent(deps, {
+): AppendThreadEventArgs<"system/thread-provisioning"> {
+  return {
     threadId: args.threadId,
     environmentId: args.environmentId,
     type: "system/thread-provisioning",
@@ -702,25 +617,24 @@ export function appendThreadProvisioningEvent(
       environmentId: args.environmentId,
       entries: args.entries,
     },
-  });
+  };
+}
+
+export function appendThreadProvisioningEvent(
+  deps: Pick<AppDeps, "db" | "hub">,
+  args: AppendThreadProvisioningEventArgs,
+): number {
+  return appendThreadEvent(deps, buildThreadProvisioningEventArgs(args));
 }
 
 export function appendThreadProvisioningEventInTransaction(
   db: DbTransaction,
   args: AppendThreadProvisioningEventArgs,
 ): number {
-  return appendThreadEventInTransaction(db, {
-    threadId: args.threadId,
-    environmentId: args.environmentId,
-    type: "system/thread-provisioning",
-    scope: threadScope(),
-    data: {
-      provisioningId: args.provisioningId,
-      status: args.status,
-      environmentId: args.environmentId,
-      entries: args.entries,
-    },
-  });
+  return appendThreadEventInTransaction(
+    db,
+    buildThreadProvisioningEventArgs(args),
+  );
 }
 
 export function buildCwdBranchEntries(
@@ -730,69 +644,73 @@ export function buildCwdBranchEntries(
   const entries: ProvisioningTranscriptEntry[] = [
     {
       type: "step",
-      key: "workspace-path",
+      key: WORKSPACE_PROVISIONING_STEP_KEYS.workspacePath,
       text: `Using workspace: ${args.path}`,
       status: "completed",
       startedAt: now,
     },
   ];
   if (args.branchName) {
+    const sha = args.headSha;
     entries.push({
       type: "step",
-      key: "workspace-branch",
-      text: `Using branch: ${args.branchName}`,
+      key: WORKSPACE_PROVISIONING_STEP_KEYS.workspaceBranch,
+      text:
+        sha === null
+          ? `Using branch: ${args.branchName}`
+          : `Using branch: ${args.branchName} (${sha.slice(0, 7)})`,
       status: "completed",
       startedAt: now,
+      metadata:
+        sha === null
+          ? { branchName: args.branchName }
+          : { branchName: args.branchName, sha },
     });
   }
   return entries;
+}
+
+function buildSystemErrorEventArgs(
+  args: AppendSystemErrorEventArgs,
+): AppendThreadEventArgs<"system/error"> {
+  return {
+    threadId: args.threadId,
+    environmentId: args.environmentId ?? null,
+    type: "system/error",
+    scope: args.scope,
+    data: buildSystemErrorEventData(args),
+  };
 }
 
 export function appendSystemErrorEvent(
   deps: Pick<AppDeps, "db" | "hub">,
   args: AppendSystemErrorEventArgs,
 ): number {
-  return appendThreadEvent(deps, {
-    threadId: args.threadId,
-    environmentId: args.environmentId ?? null,
-    type: "system/error",
-    scope: args.scope,
-    data: buildSystemErrorEventData(args),
-  });
+  return appendThreadEvent(deps, buildSystemErrorEventArgs(args));
 }
 
 export function appendSystemErrorEventInTransaction(
   deps: ThreadEventTransactionDeps,
   args: AppendSystemErrorEventArgs,
 ): number {
-  const sequence = appendThreadEventInTransaction(deps.db, {
-    threadId: args.threadId,
-    environmentId: args.environmentId ?? null,
-    type: "system/error",
-    scope: args.scope,
-    data: buildSystemErrorEventData(args),
-  });
+  const sequence = appendThreadEventInTransaction(
+    deps.db,
+    buildSystemErrorEventArgs(args),
+  );
   deps.hub.notifyThread(args.threadId, ["events-appended"], {
+    timelineSequence: sequence,
     eventTypes: ["system/error"],
   });
   return sequence;
 }
 
 export function buildSystemErrorEventData(
-  args: Pick<
-    AppendSystemErrorEventArgs,
-    "code" | "detail" | "message" | "reconnectAttempt" | "reconnectTotal"
-  >,
+  args: Pick<AppendSystemErrorEventArgs, "code" | "detail" | "message">,
 ): SystemErrorEventData {
-  const reconnectProgress = resolveReconnectProgress(args);
   return systemErrorEventDataSchema.parse({
     code: args.code,
     message: args.message,
     ...(args.detail ? { detail: args.detail } : {}),
-    ...(reconnectProgress
-      ? { reconnectAttempt: reconnectProgress.attempt }
-      : {}),
-    ...(reconnectProgress ? { reconnectTotal: reconnectProgress.total } : {}),
   });
 }
 
@@ -856,25 +774,25 @@ function resolveParentThreadTitle(
   return thread.title ?? thread.titleFallback ?? null;
 }
 
-export function appendThreadOwnershipChangeEvent(
-  deps: Pick<AppDeps, "db" | "hub">,
+function buildThreadOwnershipChangeEventArgs(
+  db: DbQueryConnection,
   args: AppendThreadOwnershipChangeEventArgs,
-): number | null {
+): AppendThreadEventArgs<"system/operation"> | null {
   const action = resolveThreadOwnershipChangeAction(args);
   if (!action) {
     return null;
   }
 
   const previousParentThreadTitle = resolveParentThreadTitle(
-    deps.db,
+    db,
     args.previousParentThreadId,
   );
   const nextParentThreadTitle = resolveParentThreadTitle(
-    deps.db,
+    db,
     args.nextParentThreadId,
   );
 
-  return appendThreadEvent(deps, {
+  return {
     threadId: args.threadId,
     environmentId: args.environmentId ?? null,
     type: "system/operation",
@@ -892,47 +810,30 @@ export function appendThreadOwnershipChangeEvent(
         nextParentThreadTitle,
       },
     },
-  });
+  };
+}
+
+export function appendThreadOwnershipChangeEvent(
+  deps: Pick<AppDeps, "db" | "hub">,
+  args: AppendThreadOwnershipChangeEventArgs,
+): number | null {
+  const eventArgs = buildThreadOwnershipChangeEventArgs(deps.db, args);
+  return eventArgs === null ? null : appendThreadEvent(deps, eventArgs);
 }
 
 export function appendThreadOwnershipChangeEventInTransaction(
   deps: ThreadEventTransactionDeps,
   args: AppendThreadOwnershipChangeEventArgs,
 ): number | null {
-  const action = resolveThreadOwnershipChangeAction(args);
-  if (!action) {
+  const eventArgs = buildThreadOwnershipChangeEventArgs(deps.db, args);
+  if (eventArgs === null) {
     return null;
   }
 
-  const previousParentThreadTitle = resolveParentThreadTitle(
-    deps.db,
-    args.previousParentThreadId,
-  );
-  const nextParentThreadTitle = resolveParentThreadTitle(
-    deps.db,
-    args.nextParentThreadId,
-  );
-
-  const sequence = appendThreadEventInTransaction(deps.db, {
-    threadId: args.threadId,
-    environmentId: args.environmentId ?? null,
-    type: "system/operation",
-    scope: threadScope(),
-    data: {
-      operation: "ownership_change",
-      operationId: createEventId(),
-      status: "completed",
-      message: threadOwnershipChangeMessage(action),
-      metadata: {
-        action,
-        previousParentThreadId: args.previousParentThreadId,
-        previousParentThreadTitle,
-        nextParentThreadId: args.nextParentThreadId,
-        nextParentThreadTitle,
-      },
-    },
+  const sequence = appendThreadEventInTransaction(deps.db, eventArgs);
+  deps.hub.notifyThread(args.threadId, ["events-appended"], {
+    timelineSequence: sequence,
   });
-  deps.hub.notifyThread(args.threadId, ["events-appended"]);
   return sequence;
 }
 
@@ -976,18 +877,43 @@ export function getLastProviderThreadId(
   return getLastStoredProviderThreadId(deps.db, threadId);
 }
 
+export function requireDispatchableProviderThreadId(
+  deps: ThreadEventReadDeps,
+  threadId: string,
+): string | null {
+  const session = getStoredProviderSession(deps.db, threadId);
+  switch (session.kind) {
+    case "none":
+      return null;
+    case "owned":
+      return session.providerThreadId;
+    case "invalid":
+    case "ambiguous":
+    case "foreign":
+      throw new ApiError(
+        409,
+        "provider_session_unavailable",
+        session.kind === "invalid"
+          ? "This thread has a stored identity without a valid provider session, so bb will not replace it silently. Clear context (/clear or bb thread clear) for a new session; history is kept."
+          : session.kind === "ambiguous"
+            ? "Another thread claimed this thread's provider session in the same millisecond, so bb will not guess whose it is. Clear context (/clear or bb thread clear) for a new session; history is kept."
+            : "This thread's only provider session belongs to another thread, so bb will not resume it. Clear context (/clear or bb thread clear) for a new session; history is kept.",
+        {
+          details: {
+            reason: session.kind,
+            providerThreadId: session.providerThreadId,
+            claimantThreadIds: session.claimantThreadIds,
+          },
+        },
+      );
+  }
+}
+
 export function getLastExecutionOptions(
   deps: Pick<AppDeps, "db">,
   threadId: string,
 ): RecordedThreadExecutionOptions | null {
   const row = getLastStoredTurnRequestEvent(deps.db, threadId);
 
-  return row
-    ? parseStoredTurnRequestEvent({
-        data: row.data,
-        sequence: row.sequence,
-        threadId: row.threadId,
-        type: row.type,
-      }).execution
-    : null;
+  return row ? parseStoredTurnRequestEvent(row).execution : null;
 }

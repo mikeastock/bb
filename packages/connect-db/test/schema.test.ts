@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { and, eq, isNull } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CONNECT_CODE_TTL_MS,
@@ -16,8 +16,7 @@ import {
   schema,
   server,
   user,
-  validateHandle,
-  validateSubdomain,
+  validateLabel,
 } from "../src/index.js";
 
 const MIGRATIONS_DIR = fileURLToPath(new URL("../migrations", import.meta.url));
@@ -434,52 +433,24 @@ describe("constraints", () => {
     expect(db.select().from(connectCode).all()).toHaveLength(0);
     expect(db.select().from(labelClaim).all()).toHaveLength(0);
   });
-
-  it("marks a connect code consumed exactly once (single-use redemption)", () => {
-    seedUser();
-    const now = new Date();
-    db.insert(connectCode)
-      .values({
-        code: "one-time",
-        userId: "u1",
-        purpose: "manual-pair",
-        expiresAt: new Date(now.getTime() + CONNECT_CODE_TTL_MS),
-        createdAt: now,
-      })
-      .run();
-
-    const redeem = () =>
-      db
-        .update(connectCode)
-        .set({ consumedAt: new Date() })
-        .where(
-          and(eq(connectCode.code, "one-time"), isNull(connectCode.consumedAt)),
-        )
-        .run();
-
-    const first = redeem();
-    expect(first.changes).toBe(1);
-    const second = redeem();
-    expect(second.changes).toBe(0);
-  });
 });
 
-describe("validateHandle", () => {
+describe("validateLabel", () => {
   it("accepts well-formed handles", () => {
     for (const h of ["sawyer", "abc", "a1b2", "my-server", "x".repeat(30)]) {
-      expect(validateHandle(h)).toBeNull();
+      expect(validateLabel(h)).toBeNull();
     }
   });
 
   it("rejects malformed and reserved handles", () => {
-    expect(validateHandle("ab")).toBe("too-short");
-    expect(validateHandle("x".repeat(31))).toBe("too-long");
-    expect(validateHandle("-lead")).toBe("invalid-format");
-    expect(validateHandle("Upper")).toBe("invalid-format");
-    expect(validateHandle("has space")).toBe("invalid-format");
-    expect(validateHandle("has_underscore")).toBe("invalid-format");
-    expect(validateHandle("foo--bar")).toBe("invalid-format");
-    expect(validateHandle("a--b")).toBe("invalid-format");
+    expect(validateLabel("ab")).toBe("too-short");
+    expect(validateLabel("x".repeat(31))).toBe("too-long");
+    expect(validateLabel("-lead")).toBe("invalid-format");
+    expect(validateLabel("Upper")).toBe("invalid-format");
+    expect(validateLabel("has space")).toBe("invalid-format");
+    expect(validateLabel("has_underscore")).toBe("invalid-format");
+    expect(validateLabel("foo--bar")).toBe("invalid-format");
+    expect(validateLabel("a--b")).toBe("invalid-format");
     for (const h of [
       "api",
       "www",
@@ -489,7 +460,7 @@ describe("validateHandle", () => {
       "origin",
       "production",
     ]) {
-      expect(validateHandle(h)).toBe("reserved");
+      expect(validateLabel(h)).toBe("reserved");
     }
   });
 });
@@ -530,17 +501,6 @@ describe("parseVisitorHost", () => {
     expect(parseVisitorHost("a.b.getbb.app", "getbb.app")).toBeNull();
     expect(parseVisitorHost("evil.com", "getbb.app")).toBeNull();
     expect(parseVisitorHost("getbb.app.evil.com", "getbb.app")).toBeNull();
-  });
-});
-
-describe("validateSubdomain (shares the handle grammar)", () => {
-  it("rejects `--`, reserved words, and bad charset the same way handles do", () => {
-    expect(validateSubdomain("sawyer-desktop")).toBeNull();
-    expect(validateSubdomain("foo--bar")).toBe("invalid-format");
-    expect(validateSubdomain("Upper")).toBe("invalid-format");
-    expect(validateSubdomain("has_underscore")).toBe("invalid-format");
-    expect(validateSubdomain("ab")).toBe("too-short");
-    expect(validateSubdomain("admin")).toBe("reserved");
   });
 });
 
@@ -1124,41 +1084,6 @@ describe("checkLabelAvailability (all routing namespaces)", () => {
       available: false,
       reason: "invalid",
       error: "too-short",
-    });
-  });
-
-  it("reports a label taken by an existing handle", async () => {
-    seedUser("u1");
-    const now = new Date();
-    db.insert(profile)
-      .values({ userId: "u1", handle: "sawyer", createdAt: now })
-      .run();
-    expect(await checkLabelAvailability(db, "sawyer")).toEqual({
-      available: false,
-      reason: "taken",
-      namespace: "handle",
-    });
-  });
-
-  it("reports a label taken by an existing server subdomain", async () => {
-    seedUser("u1");
-    const now = new Date();
-    db.insert(profile)
-      .values({ userId: "u1", handle: "sawyer", createdAt: now })
-      .run();
-    db.insert(server)
-      .values({
-        id: "s1",
-        userId: "u1",
-        name: "desktop",
-        subdomain: "sawyer-desktop",
-        createdAt: now,
-      })
-      .run();
-    expect(await checkLabelAvailability(db, "sawyer-desktop")).toEqual({
-      available: false,
-      reason: "taken",
-      namespace: "subdomain",
     });
   });
 

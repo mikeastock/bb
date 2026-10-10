@@ -7,10 +7,8 @@ import type {
   SystemProviderStatesResponse,
 } from "@bb/server-contract";
 import type { ProviderInfo } from "@bb/domain";
-import type {
-  ProviderCliStatusResponse,
-  ProviderUsageResponse,
-} from "@bb/host-daemon-contract";
+import { makeProviderInfo } from "@bb/test-helpers/domain-fixtures";
+import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sdk } from "@/lib/sdk";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
@@ -21,10 +19,10 @@ import {
   systemProvidersQueryKey,
 } from "./query-keys";
 import {
+  prefetchSystemExecutionOptions,
   useHostProviderCliStatus,
   useSystemExecutionOptions,
   useSystemProviderInfo,
-  useSystemProviderUsageLimits,
   useSystemProviders,
   useSystemProviderStates,
 } from "./system-queries";
@@ -37,7 +35,6 @@ vi.mock("@/lib/sdk", () => ({
     system: {
       executionOptions: vi.fn(),
       providerStates: vi.fn(),
-      usageLimits: vi.fn(),
     },
   },
 }));
@@ -68,6 +65,7 @@ function providerStates(providerId: string): SystemProviderStatesResponse {
         canInstall: false,
         canUpdate: false,
         loginCommand: null,
+        localLoginCommand: null,
       },
     ],
   };
@@ -81,14 +79,10 @@ afterEach(() => {
 
 describe("useSystemProviderInfo", () => {
   it("uses capabilities already loaded by the composer while the provider roster loads", async () => {
-    const provider: ProviderInfo = {
+    const provider = makeProviderInfo({
       id: "codex",
-      pluginId: "provider-codex",
       displayName: "Codex",
       logoUrl: null,
-      available: true,
-      maintenance: { health: false, usage: false, installation: false },
-      composerActions: [],
       capabilities: {
         supportsThreadArchive: true,
         supportsThreadRename: true,
@@ -99,7 +93,7 @@ describe("useSystemProviderInfo", () => {
         modelCatalogScope: "workspace",
         permissionModes: ["accept-edits", "auto", "full"],
       },
-    };
+    });
     vi.mocked(sdk.providers.list).mockImplementation(
       () => new Promise(() => undefined),
     );
@@ -130,25 +124,15 @@ describe("useSystemProviderInfo", () => {
 
   it("loads routed provider capabilities without waiting for model discovery", async () => {
     const providers: ProviderInfo[] = [
-      {
+      makeProviderInfo({
         id: "codex",
-        pluginId: "provider-codex",
         displayName: "Codex",
         logoUrl: null,
-        available: true,
-        maintenance: { health: false, usage: false, installation: false },
-        composerActions: [],
         capabilities: {
-          supportsThreadArchive: true,
-          supportsThreadRename: true,
           supportsServiceTier: true,
-          supportsNativeUserQuestion: false,
-          supportsFork: true,
           supportsSessionRewind: true,
-          modelCatalogScope: "workspace",
-          permissionModes: ["accept-edits", "auto", "full"],
         },
-      },
+      }),
     ];
     vi.mocked(sdk.providers.list).mockResolvedValue(providers);
     vi.mocked(sdk.system.executionOptions).mockImplementation(
@@ -177,19 +161,6 @@ describe("useSystemProviderInfo", () => {
 });
 
 describe("useSystemProviders", () => {
-  it("routes provider metadata through the selected host", async () => {
-    vi.mocked(sdk.providers.list).mockResolvedValue(PROVIDERS);
-    const { wrapper } = createQueryClientTestHarness();
-
-    renderHook(() => useSystemProviders({ hostId: "host-a" }), { wrapper });
-
-    await waitFor(() => {
-      expect(sdk.providers.list).toHaveBeenCalledWith(
-        expect.objectContaining({ hostId: "host-a" }),
-      );
-    });
-  });
-
   it("requests a usage-only provider roster", async () => {
     vi.mocked(sdk.providers.list).mockResolvedValue(PROVIDERS);
     const { wrapper } = createQueryClientTestHarness();
@@ -209,25 +180,14 @@ describe("useSystemProviders", () => {
   });
 
   it("replays only usage-capable providers for a usage query", async () => {
-    const provider = (id: string, usage: boolean): ProviderInfo => ({
-      id,
-      pluginId: `provider-${id}`,
-      displayName: id,
-      logoUrl: null,
-      available: true,
-      maintenance: { health: true, usage, installation: false },
-      composerActions: [],
-      capabilities: {
-        supportsThreadArchive: false,
-        supportsThreadRename: false,
-        supportsServiceTier: false,
-        supportsNativeUserQuestion: false,
-        supportsFork: false,
-        supportsSessionRewind: false,
-        modelCatalogScope: "workspace",
-        permissionModes: ["full"],
-      },
-    });
+    const provider = (id: string, usage: boolean): ProviderInfo =>
+      makeProviderInfo({
+        id,
+        displayName: id,
+        logoUrl: null,
+        maintenance: { health: true, usage, installation: false },
+        capabilities: { permissionModes: ["full"] },
+      });
     const usageProvider = provider("usage-provider", true);
     const unsupportedProvider = provider("unsupported-provider", false);
     vi.mocked(sdk.providers.list).mockResolvedValueOnce([
@@ -235,10 +195,9 @@ describe("useSystemProviders", () => {
       unsupportedProvider,
     ]);
     const warm = createQueryClientTestHarness();
-    const initial = renderHook(
-      () => useSystemProviders({ hostId: "host-a" }),
-      { wrapper: warm.wrapper },
-    );
+    const initial = renderHook(() => useSystemProviders({ hostId: "host-a" }), {
+      wrapper: warm.wrapper,
+    });
     await waitFor(() => {
       expect(initial.result.current.data).toEqual([
         usageProvider,
@@ -262,61 +221,30 @@ describe("useSystemProviders", () => {
 });
 
 describe("useSystemExecutionOptions", () => {
-  it("waits for the first probe on a cold cache instead of replaying a vendored roster", () => {
-    vi.mocked(sdk.system.executionOptions).mockImplementation(
-      () => new Promise(() => undefined),
-    );
-    const { wrapper } = createQueryClientTestHarness();
-
-    const { result } = renderHook(
-      () => useSystemExecutionOptions({ providerId: "codex" }),
-      { wrapper },
-    );
-
-    expect(result.current.isPlaceholderData).toBe(false);
-    expect(result.current.data).toBeUndefined();
-  });
-
   it("keeps dynamic providers visible while another provider's models load", async () => {
     const providers: ProviderInfo[] = [
-      {
+      makeProviderInfo({
         id: "codex",
-        pluginId: "provider-codex",
         displayName: "Codex",
         logoUrl: null,
-        available: true,
         maintenance: { health: true, usage: true, installation: false },
-        composerActions: [],
         capabilities: {
-          supportsThreadArchive: true,
-          supportsThreadRename: true,
           supportsServiceTier: true,
-          supportsNativeUserQuestion: false,
-          supportsFork: true,
           supportsSessionRewind: true,
-          modelCatalogScope: "workspace",
-          permissionModes: ["accept-edits", "auto", "full"],
         },
-      },
-      {
+      }),
+      makeProviderInfo({
         id: "acp-opencode",
-        pluginId: "provider-acp-opencode",
         displayName: "OpenCode",
         logoUrl: null,
-        available: true,
         maintenance: { health: true, usage: true, installation: false },
-        composerActions: [],
         capabilities: {
           supportsThreadArchive: false,
           supportsThreadRename: false,
-          supportsServiceTier: false,
-          supportsNativeUserQuestion: false,
           supportsFork: false,
-          supportsSessionRewind: false,
-          modelCatalogScope: "workspace",
           permissionModes: ["full"],
         },
-      },
+      }),
     ];
     let resolveDynamicModels: (
       response: SystemExecutionOptionsResponse,
@@ -399,25 +327,23 @@ describe("useSystemExecutionOptions", () => {
     );
   });
 
-  const BUILT_IN_PROVIDERS: ProviderInfo[] = ["codex", "pi"].map((id) => ({
-    id,
-    pluginId: `provider-${id}`,
-    displayName: id,
-    logoUrl: null,
-    available: true,
-    maintenance: { health: true, usage: true, installation: false },
-    composerActions: [],
-    capabilities: {
-      supportsThreadArchive: false,
-      supportsThreadRename: false,
-      supportsServiceTier: false,
-      supportsNativeUserQuestion: false,
-      supportsFork: true,
-      supportsSessionRewind: true,
-      modelCatalogScope: "workspace",
-      permissionModes: ["accept-edits", "auto", "full"],
-    },
-  }));
+  const BUILT_IN_PROVIDERS: ProviderInfo[] = ["codex", "pi"].map((id) =>
+    makeProviderInfo({
+      id,
+      logoUrl: null,
+      maintenance: { health: true, usage: true, installation: false },
+      capabilities: {
+        supportsThreadArchive: false,
+        supportsThreadRename: false,
+        supportsServiceTier: false,
+        supportsNativeUserQuestion: false,
+        supportsFork: true,
+        supportsSessionRewind: true,
+        modelCatalogScope: "workspace",
+        permissionModes: ["accept-edits", "auto", "full"],
+      },
+    }),
+  );
   const CODEX_MODEL: AvailableModel = {
     id: "gpt-5.6-sol",
     model: "gpt-5.6-sol",
@@ -466,16 +392,13 @@ describe("useSystemExecutionOptions", () => {
   });
 
   it("replays the host's provider list so a custom provider paints as itself", async () => {
-    const customProvider = {
+    const customProvider = makeProviderInfo({
       id: "acp:my-agent",
-      pluginId: "provider-acp:my-agent",
       displayName: "My agent",
       logoUrl: null,
       maintenance: { health: true, usage: true, installation: false },
       capabilities: CODEX_CATALOG.providers[0]!.capabilities,
-      composerActions: [],
-      available: true,
-    };
+    });
     const customCatalog: SystemExecutionOptionsResponse = {
       ...CODEX_CATALOG,
       providers: [...CODEX_CATALOG.providers, customProvider],
@@ -544,7 +467,7 @@ describe("useSystemExecutionOptions", () => {
   it("does not preload a catalog that came from a failed probe", async () => {
     vi.mocked(sdk.system.executionOptions).mockResolvedValue({
       ...CODEX_CATALOG,
-      modelLoadError: { providerId: "codex", code: "failed" },
+      modelLoadError: { providerId: "codex", code: "failed", detail: null },
     });
     const first = createQueryClientTestHarness();
     const warm = renderHook(
@@ -567,6 +490,64 @@ describe("useSystemExecutionOptions", () => {
     expect(result.current.isPlaceholderData).toBe(true);
     expect(result.current.data?.models).toEqual([]);
   });
+
+  it.each([
+    ["failed", true, true, "codex", "codex"],
+    ["failed", false, false, "codex", "codex"],
+    ["timeout", true, true, "codex", "codex"],
+    ["auth_required", false, true, "codex", "codex"],
+    ["missing_executable", false, true, "codex", "codex"],
+    ["provider_unavailable", false, true, "codex", "codex"],
+    ["failed", true, true, undefined, "codex"],
+    ["failed", false, true, undefined, "claude-code"],
+  ] as const)(
+    "handles reconnect refresh: %s (retain catalog: %s)",
+    async (code, retainCatalog, hasCatalog, providerId, refreshProviderId) => {
+      const { queryClient, wrapper } = createQueryClientTestHarness();
+      const initialCatalog = {
+        ...CODEX_CATALOG,
+        models: hasCatalog ? [CODEX_MODEL] : [],
+      };
+      vi.mocked(sdk.system.executionOptions).mockResolvedValue(initialCatalog);
+      const { result } = renderHook(
+        () =>
+          useSystemExecutionOptions({ hostId: "host-a", providerId }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.data).toEqual(initialCatalog));
+      const loadedAt = result.current.dataUpdatedAt;
+      const modelLoadError = { providerId: refreshProviderId, code, detail: null };
+      vi.mocked(sdk.system.executionOptions).mockResolvedValue({
+        ...CODEX_CATALOG,
+        providers: [makeProviderInfo({ id: refreshProviderId })],
+        models: [],
+        modelLoadError,
+      });
+      await act(() =>
+        queryClient.invalidateQueries({
+          queryKey: systemExecutionOptionsQueryKey({
+            environmentId: null,
+            hostId: "host-a",
+            providerId: providerId ?? null,
+          }),
+        }),
+      );
+      await waitFor(() => {
+        expect(sdk.system.executionOptions).toHaveBeenCalledTimes(2);
+        expect(result.current.isFetching).toBe(false);
+        expect(result.current.dataUpdatedAt).toBeGreaterThan(loadedAt);
+        expect(result.current.data?.modelLoadError).toEqual(
+          retainCatalog ? null : modelLoadError,
+        );
+      });
+      expect(result.current.data?.models).toEqual(
+        retainCatalog ? [CODEX_MODEL] : [],
+      );
+      vi.mocked(sdk.system.executionOptions).mockResolvedValue(CODEX_CATALOG);
+      await act(() => result.current.refetch());
+      await waitFor(() => expect(result.current.data).toEqual(CODEX_CATALOG));
+    },
+  );
 
   it("does not replay a catalog across environments", async () => {
     vi.mocked(sdk.system.executionOptions).mockResolvedValue(CODEX_CATALOG);
@@ -634,6 +615,34 @@ describe("useSystemExecutionOptions", () => {
     expect(result.current[0]!.data?.models).toEqual([]);
     expect(result.current[1]!.isPlaceholderData).toBe(false);
     expect(result.current[1]!.data).toBeUndefined();
+  });
+
+  it("prefetches sibling catalogs without touching remembered localStorage catalogs", async () => {
+    vi.mocked(sdk.system.executionOptions).mockImplementation(async (args) => ({
+      ...CODEX_CATALOG,
+      models: [{ ...CODEX_MODEL, id: `${args?.providerId}-model` }],
+    }));
+    const { queryClient } = createQueryClientTestHarness();
+
+    prefetchSystemExecutionOptions(queryClient, {
+      routing: { hostId: "host-a" },
+      providerIds: ["codex", "pi"],
+    });
+
+    await waitFor(() => {
+      for (const providerId of ["codex", "pi"]) {
+        expect(
+          queryClient.getQueryData<SystemExecutionOptionsResponse>(
+            systemExecutionOptionsQueryKey({
+              environmentId: null,
+              hostId: "host-a",
+              providerId,
+            }),
+          )?.models[0]?.id,
+        ).toBe(`${providerId}-model`);
+      }
+    });
+    expect(window.localStorage.length).toBe(0);
   });
 
   it("retries one transient failure before surfacing model selector errors", async () => {
@@ -757,61 +766,6 @@ describe("useSystemProviderStates", () => {
         hostId: undefined,
         signal: expect.any(AbortSignal),
       });
-    });
-  });
-});
-
-describe("useSystemProviderUsageLimits", () => {
-  it("publishes each provider as soon as its request settles", async () => {
-    let resolveCodex: (value: ProviderUsageResponse) => void = () => {};
-    let resolveClaude: (value: ProviderUsageResponse) => void = () => {};
-    vi.mocked(sdk.system.usageLimits).mockImplementation((args) => {
-      if (args?.providerId === "codex") {
-        return new Promise((resolve) => {
-          resolveCodex = resolve;
-        });
-      }
-      return new Promise((resolve) => {
-        resolveClaude = resolve;
-      });
-    });
-    const { wrapper } = createQueryClientTestHarness();
-    const { result } = renderHook(
-      () =>
-        useSystemProviderUsageLimits({
-          hostId: "host-1",
-          providerIds: ["codex", "claude-code"],
-        }),
-      { wrapper },
-    );
-
-    await waitFor(() => {
-      expect(sdk.system.usageLimits).toHaveBeenCalledTimes(2);
-    });
-    expect(result.current.providerStates).toEqual({
-      codex: { isError: false, isLoading: true },
-      "claude-code": { isError: false, isLoading: true },
-    });
-
-    await act(async () => {
-      resolveCodex({ codex: { status: "unauthenticated" } });
-    });
-    await waitFor(() => {
-      expect(result.current.usage.codex).toEqual({
-        status: "unauthenticated",
-      });
-    });
-    expect(result.current.usage["claude-code"]).toBeUndefined();
-    expect(result.current.providerStates).toEqual({
-      codex: { isError: false, isLoading: false },
-      "claude-code": { isError: false, isLoading: true },
-    });
-
-    await act(async () => {
-      resolveClaude({ "claude-code": { status: "unauthenticated" } });
-    });
-    await waitFor(() => {
-      expect(result.current.isLoading).toBe(false);
     });
   });
 });

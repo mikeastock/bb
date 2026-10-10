@@ -9,6 +9,7 @@ import { z } from "zod";
 
 export const CLAUDE_USER_QUESTION_TOOL_NAME = "AskUserQuestion";
 export const CLAUDE_EXIT_PLAN_MODE_TOOL_NAME = "ExitPlanMode";
+export const CLAUDE_BASH_TOOL_NAME = "Bash";
 
 export const claudeExitPlanModeInputSchema = z.object({
   plan: z.string().min(1),
@@ -25,7 +26,6 @@ export const claudePermissionModeSchema = z.enum([
   "auto",
   "bypassPermissions",
   "plan",
-  "dontAsk",
 ]);
 export type ClaudePermissionMode = z.infer<typeof claudePermissionModeSchema>;
 
@@ -46,6 +46,9 @@ const claudePermissionRuleValueSchema = z.object({
   toolName: z.string(),
   ruleContent: z.string().optional(),
 });
+export type ClaudePermissionRule = z.infer<
+  typeof claudePermissionRuleValueSchema
+>;
 
 const claudePermissionUpdateSchema = z.discriminatedUnion("type", [
   z.object({
@@ -90,24 +93,6 @@ export type ClaudeSuggestedPermissionUpdate = z.infer<
   typeof claudeSuggestedPermissionUpdateSchema
 >;
 
-const claudeNetworkPermissionsInputSchema = z.object({
-  enabled: z.boolean().nullable(),
-});
-
-const claudeFileSystemPermissionsInputSchema = z.object({
-  read: z.array(z.string()),
-  write: z.array(z.string()),
-});
-
-const claudeRequestedPermissionProfileInputSchema = z
-  .object({
-    network: claudeNetworkPermissionsInputSchema.nullable().optional(),
-    fileSystem: claudeFileSystemPermissionsInputSchema.nullable().optional(),
-  })
-  .transform((value): PendingInteractionGrantablePermissionProfile => ({
-    network: value.network ?? null,
-    fileSystem: value.fileSystem ?? null,
-  }));
 interface ClaudePermissionRequestProfileArgs {
   blockedPath: string | undefined;
   suggestions: ClaudeSuggestedPermissionUpdate[] | undefined;
@@ -127,7 +112,7 @@ const CLAUDE_FILE_PERMISSION_KIND_BY_TOOL_NAME = new Map<
   ["Edit", "write"],
   ["Write", "write"],
   ["NotebookEdit", "write"],
-  ["Bash", "read_write"],
+  [CLAUDE_BASH_TOOL_NAME, "read_write"],
 ]);
 
 const CLAUDE_SANDBOX_NETWORK_TOOL_NAME = "SandboxNetworkAccess";
@@ -148,6 +133,14 @@ export function isClaudeConcreteFileChangeToolName(toolName: string): boolean {
   return getClaudeFilePermissionKind(toolName) === "write";
 }
 
+export function getSuggestedRules(
+  suggestions: ClaudeSuggestedPermissionUpdate[] | undefined,
+): ClaudePermissionRule[] {
+  return (suggestions ?? []).flatMap((suggestion) =>
+    suggestion.type === "addRules" ? suggestion.rules : [],
+  );
+}
+
 function getSuggestedDirectories(
   suggestions: ClaudeSuggestedPermissionUpdate[] | undefined,
 ): string[] {
@@ -159,9 +152,7 @@ function getSuggestedDirectories(
 export function toPendingInteractionPermissionProfile(
   args: ClaudePermissionRequestProfileArgs,
 ): PendingInteractionGrantablePermissionProfile {
-  const hasRuleSuggestion = (args.suggestions ?? []).some(
-    (suggestion) => suggestion.type === "addRules",
-  );
+  const hasRuleSuggestion = getSuggestedRules(args.suggestions).length > 0;
   const directories = [
     ...getSuggestedDirectories(args.suggestions),
     ...(args.blockedPath === undefined ? [] : [args.blockedPath]),
@@ -194,7 +185,8 @@ export function toPendingInteractionPermissionProfile(
         })();
 
   const network =
-    CLAUDE_NETWORK_PERMISSION_TOOL_NAMES.has(args.toolName) || hasRuleSuggestion
+    CLAUDE_NETWORK_PERMISSION_TOOL_NAMES.has(args.toolName) ||
+    (hasRuleSuggestion && args.toolName !== CLAUDE_BASH_TOOL_NAME)
       ? { enabled: true }
       : null;
 
@@ -204,36 +196,17 @@ export function toPendingInteractionPermissionProfile(
   };
 }
 
-interface ShouldRequestClaudePermissionApprovalArgs {
-  blockedPath: string | undefined;
-  decisionReason: string | undefined;
-  suggestions: ClaudeSuggestedPermissionUpdate[] | undefined;
+export interface ClaudePermissionRequestApprovalParams {
+  threadId: string;
+  providerThreadId: string;
+  turnId: string | null;
+  itemId: string;
   toolName: string;
+  input: Record<string, unknown>;
+  reason: string | null;
+  permissions: PendingInteractionGrantablePermissionProfile;
+  suggestedRules: ClaudePermissionRule[];
 }
-
-export function shouldRequestClaudePermissionApproval(
-  args: ShouldRequestClaudePermissionApprovalArgs,
-): boolean {
-  return (
-    args.blockedPath !== undefined ||
-    args.decisionReason !== undefined ||
-    (args.suggestions?.length ?? 0) > 0
-  );
-}
-
-export const claudePermissionRequestApprovalParamsSchema = z.object({
-  threadId: z.string(),
-  providerThreadId: z.string(),
-  turnId: z.string().min(1).nullable(),
-  itemId: z.string(),
-  toolName: z.string(),
-  input: z.record(z.string(), z.unknown()),
-  reason: z.string().nullable(),
-  permissions: claudeRequestedPermissionProfileInputSchema,
-});
-export type ClaudePermissionRequestApprovalParams = z.infer<
-  typeof claudePermissionRequestApprovalParamsSchema
->;
 
 const claudeUserQuestionOptionSchema = z.object({
   label: z.string().min(1),
@@ -278,16 +251,13 @@ export type ClaudeUserQuestionInput = z.infer<
   typeof claudeUserQuestionInputSchema
 >;
 
-export const claudeUserQuestionRequestParamsSchema = z.object({
-  threadId: z.string(),
-  providerThreadId: z.string(),
-  turnId: z.string().min(1).nullable(),
-  itemId: z.string(),
-  questions: claudeUserQuestionListSchema,
-});
-export type ClaudeUserQuestionRequestParams = z.infer<
-  typeof claudeUserQuestionRequestParamsSchema
->;
+export interface ClaudeUserQuestionRequestParams {
+  threadId: string;
+  providerThreadId: string;
+  turnId: string | null;
+  itemId: string;
+  questions: ClaudeUserQuestion[];
+}
 
 const claudeUserQuestionAnnotationSchema = z.object({
   preview: z.string().optional(),
@@ -348,7 +318,7 @@ export type ClaudeInteractiveResponse = z.infer<
 
 interface BuildClaudePermissionUpdatesArgs {
   permissions: PendingInteractionGrantedPermissionProfile;
-  toolName: string | null | undefined;
+  rules: ClaudePermissionRule[];
 }
 
 export function buildClaudeSessionPermissionUpdates(
@@ -369,10 +339,10 @@ export function buildClaudeSessionPermissionUpdates(
     });
   }
 
-  if (args.toolName && args.permissions.network?.enabled === true) {
+  if (args.rules.length > 0) {
     updates.push({
       type: "addRules",
-      rules: [{ toolName: args.toolName }],
+      rules: args.rules,
       behavior: "allow",
       destination: "session",
     });

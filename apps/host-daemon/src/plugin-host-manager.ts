@@ -1,3 +1,4 @@
+import { operationEnvironment } from "./operation-environment.js";
 import { fork, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -18,6 +19,7 @@ import {
 } from "@bb/process-utils";
 import type { HostDaemonLogger } from "./logger.js";
 import { ensureCachedPluginHostArtifact } from "./plugin-host-artifact-cache.js";
+import { runInSerialLane } from "./serial-lane.js";
 
 type PluginHostCallCommand = Extract<
   HostDaemonOnlineRpcCommand,
@@ -49,8 +51,7 @@ interface WorkerState {
   readyAtMs: number | null;
   child: ChildProcess;
   closed: Promise<void>;
-  dataDir: string;
-  tempDir: string;
+  cleanup: Promise<void>;
   pending: Map<string, PendingCall>;
   ready: Promise<void>;
   resolveReady: () => void;
@@ -296,6 +297,10 @@ export class PluginHostManager {
             callId: command.callId,
             method: command.method,
             input: command.input,
+            envVars: operationEnvironment(
+              command.contributedEnv,
+              this.options.shellEnv?.() ?? {},
+            ),
           })
         ) {
           worker.pending.delete(command.callId);
@@ -473,14 +478,15 @@ export class PluginHostManager {
       throw error;
     }
     const closed = new Promise<void>((resolve) => child.once("close", resolve));
-    void closed
-      .then(() => rm(tempDir, { recursive: true, force: true }))
-      .catch((error) => {
-        this.options.logger.warn(
-          { pluginId: command.pluginId, err: error },
-          "Failed to remove host plugin temporary directory",
-        );
-      });
+    const cleanup = closed.then(() =>
+      rm(tempDir, { recursive: true, force: true }),
+    );
+    void cleanup.catch((error) => {
+      this.options.logger.warn(
+        { pluginId: command.pluginId, err: error },
+        "Failed to remove host plugin temporary directory",
+      );
+    });
     let resolveReady!: () => void;
     let rejectReady!: (error: Error) => void;
     const ready = new Promise<void>((resolve, reject) => {
@@ -495,8 +501,7 @@ export class PluginHostManager {
       readyAtMs: null,
       child,
       closed,
-      dataDir,
-      tempDir,
+      cleanup,
       pending: new Map(),
       ready,
       resolveReady,
@@ -543,7 +548,11 @@ export class PluginHostManager {
     if (child.stderr !== null) {
       observeBoundedStderr(child.stderr, (line) => {
         this.options.logger.warn(
-          { pluginId: worker.pluginId, origin: "host", stderr: line },
+          {
+            pluginId: worker.pluginId,
+            origin: "host",
+            stderr: line,
+          },
           "Host plugin stderr",
         );
       });
@@ -961,7 +970,7 @@ export class PluginHostManager {
   }
 
   private async stopWorker(worker: WorkerState, reason: string): Promise<void> {
-    if (worker.disposing) return worker.closed;
+    if (worker.disposing) return worker.cleanup;
     worker.disposing = true;
     this.cancelWorkerIdleTimer(worker);
     if (this.workers.get(worker.pluginId) === worker) {
@@ -993,7 +1002,7 @@ export class PluginHostManager {
       "Host plugin worker stopped",
     );
     this.rejectPendingCalls(worker, reason);
-    await rm(worker.tempDir, { recursive: true, force: true });
+    await worker.cleanup;
   }
 
   private cancelWorkerIdleTimer(worker: WorkerState): void {
@@ -1134,20 +1143,7 @@ export class PluginHostManager {
     pluginId: string,
     work: () => Promise<T>,
   ): Promise<T> {
-    const previous =
-      this.workerMutationTails.get(pluginId) ?? Promise.resolve();
-    const next = previous.then(work, work);
-    const tail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.workerMutationTails.set(pluginId, tail);
-    void tail.then(() => {
-      if (this.workerMutationTails.get(pluginId) === tail) {
-        this.workerMutationTails.delete(pluginId);
-      }
-    });
-    return next;
+    return runInSerialLane(this.workerMutationTails, pluginId, work);
   }
 
   private retireGeneration(pluginId: string, generation: string): void {

@@ -10,7 +10,7 @@ import * as PopoverPrimitive from "@radix-ui/react-popover";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { preventOverlayTriggerSelection } from "@bb/shared-ui/overlay-trigger";
 import { usePortalScopeProps } from "@/lib/portal-scope";
-import { PluginIcon, pluginIconName } from "@/components/plugin/PluginIcon";
+import { PluginItemIcon, pluginIconName } from "@/components/plugin/PluginIcon";
 import type { MessageProseSelection } from "./SelectableMessageProse.js";
 import type { ThreadTimelinePluginMessageAction } from "./types.js";
 
@@ -86,7 +86,7 @@ function ActionButton({
             aria-hidden="true"
           />
         ) : (
-          <PluginIcon
+          <PluginItemIcon
             pluginId={action.plugin.pluginId}
             icon={action.plugin.icon}
             className="size-3.5 text-muted-foreground"
@@ -174,7 +174,6 @@ export function TimelineSelectionMenu({
         if (!next) onDismiss();
       }}
     >
-      {}
       <PopoverPrimitive.Anchor virtualRef={virtualAnchorRef} />
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content

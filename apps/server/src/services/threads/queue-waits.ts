@@ -14,16 +14,40 @@ import type {
   QueuedMessageSystemNotice,
   QueuedMessageWaitingOn,
   ResolvedThreadExecutionOptions,
+  StartedOnBehalfOf,
   Thread,
+  ThreadCreateOrigin,
   ThreadQueuedMessage,
 } from "@bb/domain";
+import { ApiError } from "../../errors.js";
 import {
   emitPluginMessageDispatched,
   emitPluginMessageQueued,
 } from "../plugins/plugin-thread-events.js";
 import { toThreadQueuedMessage } from "./thread-queued-messages.js";
+import { assertThreadHostAcceptsWork } from "./thread-host-admission.js";
 
 type QueueWaitDeps = { db: DbQueryConnection; hub: DbNotifier };
+
+export const QUEUED_MESSAGE_CLAIM_LOST_CODE = "queued_message_claim_lost";
+export const QUEUED_MESSAGE_AUTO_SEND_PAUSED_CODE =
+  "queued_message_auto_send_paused";
+
+export function createQueuedMessageClaimLostError(): ApiError {
+  return new ApiError(
+    409,
+    QUEUED_MESSAGE_CLAIM_LOST_CODE,
+    "Queued message claim expired before it could be sent",
+  );
+}
+
+export function createQueuedMessageAutoSendPausedError(): ApiError {
+  return new ApiError(
+    409,
+    QUEUED_MESSAGE_AUTO_SEND_PAUSED_CODE,
+    "Queued message auto-send was paused by a manual stop",
+  );
+}
 
 /**
  * A settling row, for the plugin event its transition raises.
@@ -41,6 +65,13 @@ export interface QueuedDispatchMessage {
   input: PromptInput[];
   execution: ResolvedThreadExecutionOptions;
   senderThreadId: string | null;
+  /**
+   * The provenance of the dispatch being queued, written onto the row so the
+   * drain re-decides on what the first attempt saw rather than on null.
+   */
+  origin: ThreadCreateOrigin | null;
+  originPluginId: string | null;
+  requestedBy: StartedOnBehalfOf | null;
   payload: QueuedMessagePayload;
   /** Non-null only when core is queueing one of its own system notices. */
   systemNotice: QueuedMessageSystemNotice | null;
@@ -88,11 +119,15 @@ export function recordQueuedMessageWait(
 
   if (leadClaim === undefined) {
     row = deps.db.transaction(
-      (tx) =>
-        createQueuedThreadMessageInTransaction(tx, {
+      (tx) => {
+        assertThreadHostAcceptsWork(tx, args.thread);
+        return createQueuedThreadMessageInTransaction(tx, {
           threadId: args.thread.id,
           content: args.message.input,
           senderThreadId: args.message.senderThreadId,
+          origin: args.message.origin,
+          originPluginId: args.message.originPluginId,
+          requestedBy: args.message.requestedBy,
           model: args.message.execution.model,
           reasoningLevel: args.message.execution.reasoningLevel,
           permissionMode: args.message.execution.permissionMode,
@@ -101,7 +136,8 @@ export function recordQueuedMessageWait(
           sendAt: args.sendAt,
           payload: args.message.payload,
           systemNotice: args.message.systemNotice,
-        }),
+        });
+      },
       { behavior: "immediate" },
     );
   } else {

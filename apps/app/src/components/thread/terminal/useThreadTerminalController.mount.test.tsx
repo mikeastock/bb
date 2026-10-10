@@ -6,31 +6,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { sdk } from "@/lib/sdk";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
 import {
-  shouldMountTerminalViewForPanel,
   useThreadTerminalController,
   type ThreadTerminalControllerArgs,
 } from "./useThreadTerminalController";
+import { makeTerminalSession } from "@/test/fixtures/terminal-sessions";
 
 vi.mock("@/lib/sdk", () => ({
   sdk: { terminals: { list: vi.fn() } },
 }));
 
-const session: TerminalSession = {
+const session: TerminalSession = makeTerminalSession({
   id: "term_1",
   threadId: "thr_1",
   environmentId: "env_1",
   hostId: "host_1",
-  title: "Terminal",
-  initialCwd: "/workspace",
-  cols: 100,
-  rows: 30,
-  status: "running",
-  exitCode: null,
-  closeReason: null,
   createdAt: 1,
   updatedAt: 1,
-  lastUserInputAt: null,
-};
+});
 
 interface PanelVisibility {
   isPanelOpen: boolean;
@@ -41,50 +33,16 @@ function controllerArgs(
   visibility: PanelVisibility,
 ): ThreadTerminalControllerArgs {
   return {
-    canCreateTerminal: true,
     isPanelOpen: visibility.isPanelOpen,
     isPanelPersistedOpen: visibility.isPanelPersistedOpen,
-    syncThreadId: null,
     target: { kind: "thread", threadId: "thr_1" },
+    terminalId: session.id,
   };
 }
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-});
-
-describe("shouldMountTerminalViewForPanel", () => {
-  it("mounts only for an open panel or a hidden panel this client already opened", () => {
-    expect(
-      shouldMountTerminalViewForPanel({
-        hasPanelOpened: false,
-        isPanelOpen: true,
-        isPanelPersistedOpen: true,
-      }),
-    ).toBe(true);
-    expect(
-      shouldMountTerminalViewForPanel({
-        hasPanelOpened: false,
-        isPanelOpen: false,
-        isPanelPersistedOpen: true,
-      }),
-    ).toBe(false);
-    expect(
-      shouldMountTerminalViewForPanel({
-        hasPanelOpened: true,
-        isPanelOpen: false,
-        isPanelPersistedOpen: true,
-      }),
-    ).toBe(true);
-    expect(
-      shouldMountTerminalViewForPanel({
-        hasPanelOpened: true,
-        isPanelOpen: false,
-        isPanelPersistedOpen: false,
-      }),
-    ).toBe(false);
-  });
 });
 
 describe("useThreadTerminalController terminal view mounting", () => {
@@ -101,6 +59,20 @@ describe("useThreadTerminalController terminal view mounting", () => {
 
     expect(result.current.shouldMountTerminalView).toBe(false);
     expect(sdk.terminals.list).not.toHaveBeenCalled();
+  });
+
+  it("mounts the view for an open panel that is not persisted open", () => {
+    vi.mocked(sdk.terminals.list).mockResolvedValue({ sessions: [session] });
+    const { wrapper } = createQueryClientTestHarness();
+    const { result } = renderHook(
+      () =>
+        useThreadTerminalController(
+          controllerArgs({ isPanelOpen: true, isPanelPersistedOpen: false }),
+        ),
+      { wrapper },
+    );
+
+    expect(result.current.shouldMountTerminalView).toBe(true);
   });
 
   it("keeps the view mounted across a compact close and unmounts once persisted state closes", async () => {
@@ -131,5 +103,26 @@ describe("useThreadTerminalController terminal view mounting", () => {
     expect(result.current.shouldMountTerminalView).toBe(false);
     rerender({ isPanelOpen: true, isPanelPersistedOpen: true });
     expect(result.current.shouldMountTerminalView).toBe(true);
+  });
+
+  it("never shows a sibling terminal in place of its own missing terminal", async () => {
+    const sibling = makeTerminalSession({
+      id: "term_sibling",
+      threadId: "thr_1",
+    });
+    vi.mocked(sdk.terminals.list).mockResolvedValue({ sessions: [sibling] });
+    const { wrapper } = createQueryClientTestHarness();
+    const { result } = renderHook(
+      () =>
+        useThreadTerminalController(
+          controllerArgs({ isPanelOpen: true, isPanelPersistedOpen: true }),
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => {
+      expect(sdk.terminals.list).toHaveBeenCalled();
+    });
+    expect(result.current.activeSession).toBeNull();
   });
 });

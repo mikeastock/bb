@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { loadHostDaemonStartConfig } from "@bb/config/host-daemon";
-import type { HostType } from "@bb/domain";
 import {
   createHostWatcher,
   createSubprocessParcelWatcherBackend,
@@ -22,6 +21,7 @@ import { resolveHostDaemonLocalApiConfig } from "./local-api-config.js";
 import {
   createUserShellPathResolver,
   prepareRuntimeShellEnv,
+  resolvePowerShellExecutionPolicyDefault,
   resolveBbExecutablePathInDirectory,
   resolveLocalBbExecutablePath,
 } from "./runtime-shell-env.js";
@@ -34,13 +34,11 @@ import {
 interface StartHostDaemonOptions {
   enrollKey?: string;
   hostId?: string;
-  hostName?: string;
   bbExecutableDirectory?: string;
   bridgeBundleDir?: string;
-  hostType?: HostType;
-  machineCredential?: string;
-  connectMachineId?: string;
+  serverHeaders?: Record<string, string>;
   autoUpdate?: boolean;
+  supervised?: boolean;
 }
 
 export async function startHostDaemon(
@@ -78,7 +76,6 @@ export async function startHostDaemon(
     const identity = await loadHostIdentity({
       dataDir,
       providedHostId: options.hostId,
-      providedHostName: options.hostName,
     });
     const instanceId = randomUUID();
     const serverUrl = resolveServerUrl({
@@ -86,18 +83,6 @@ export async function startHostDaemon(
     });
     if (!serverUrl) {
       throw new Error("Host daemon server URL is required");
-    }
-
-    const hostType =
-      persistedAuth?.hostType ?? options.hostType ?? "persistent";
-    if (
-      persistedAuth &&
-      options.hostType &&
-      persistedAuth.hostType !== options.hostType
-    ) {
-      throw new Error(
-        `Configured host type ${options.hostType} does not match persisted auth state ${persistedAuth.hostType}`,
-      );
     }
 
     if (persistedAuth && persistedAuth.hostId !== identity.hostId) {
@@ -112,10 +97,8 @@ export async function startHostDaemon(
         await enrollDaemonHost({
           hostId: identity.hostId,
           hostName: identity.hostName,
-          hostType,
-          connectMachineId: options.connectMachineId,
           serverUrl,
-          machineCredential: options.machineCredential,
+          serverHeaders: options.serverHeaders,
           token:
             options.enrollKey ??
             (() => {
@@ -131,7 +114,6 @@ export async function startHostDaemon(
       await writeHostAuthState(dataDir, {
         hostId: identity.hostId,
         hostKey,
-        hostType,
       });
     }
 
@@ -147,12 +129,11 @@ export async function startHostDaemon(
       component: "host-daemon",
       base: { serverUrl },
       dataDir,
-      transportMode: "worker",
     });
     lockDiagnosticsLogger = logger;
-    if (options.machineCredential !== undefined) {
+    if (options.serverHeaders !== undefined) {
       machineAuthProxy = await startMachineAuthProxy({
-        machineCredential: options.machineCredential,
+        serverHeaders: options.serverHeaders,
         serverUrl,
       });
     }
@@ -177,6 +158,8 @@ export async function startHostDaemon(
         bbExecutablePath,
         hostDaemonPort: localApiConfig.port,
         inheritedPath: (await resolveUserShellPath()) ?? process.env.PATH,
+        powershellExecutionPolicy:
+          await resolvePowerShellExecutionPolicyDefault(),
         serverUrl: machineAuthProxy?.serverUrl ?? serverUrl,
       });
     const runtimeShellEnv = await resolveRuntimeShellEnv();
@@ -185,11 +168,10 @@ export async function startHostDaemon(
       dataDir,
       serverUrl,
       hostKey,
-      machineCredential: options.machineCredential,
-      connectMachineId: options.connectMachineId,
+      serverHeaders: options.serverHeaders,
       autoUpdate: options.autoUpdate,
+      supervised: options.supervised,
       bridgeBundleDir: options.bridgeBundleDir,
-      hostType,
       hostId: identity.hostId,
       hostName: identity.hostName,
       instanceId,
@@ -206,14 +188,13 @@ export async function startHostDaemon(
       resolveRuntimeShellEnv,
       hostWatcher,
       closeMachineAuthProxy: machineAuthProxy?.close,
-      forceExit: (code) => process.exit(code),
+      exitProcess: (code) => process.exit(code),
     });
     const startedApp = app;
     handleDaemonLockLost = () => {
       void startedApp.daemon
-        .shutdown("daemon-lock-lost")
-        .catch(() => undefined)
-        .finally(() => process.exit(1));
+        .shutdown("daemon-lock-lost", 1)
+        .catch(() => process.exit(1));
     };
     await app.daemon.start();
     return app.daemon;

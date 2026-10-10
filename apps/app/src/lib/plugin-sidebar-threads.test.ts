@@ -1,49 +1,49 @@
 import type { ThreadListEntry } from "@bb/domain";
 import { describe, expect, it } from "vitest";
 import { toPluginSidebarThread } from "./plugin-sidebar-threads";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 
 function makeThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntry {
-  return {
+  return makeThreadListEntry({
     id: "thr_1",
     projectId: "proj_1",
-    environmentId: null,
-    providerId: "codex",
     title: "A thread",
     titleFallback: "A thread",
-    sectionId: null,
-    status: "idle",
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    archivedAt: null,
-    pinnedAt: null,
-    pinSortKey: null,
-    deletedAt: null,
     lastReadAt: 10,
     latestAttentionAt: 5,
     createdAt: 1,
     updatedAt: 2,
-    activity: {
-      activeWorkflowCount: 0,
-      activeBackgroundAgentCount: 0,
-      activeBackgroundCommandCount: 0,
-      activePlanModeCount: 0,
-      activeGoalCount: 0,
-    },
-    hasPendingInteraction: false,
-    environmentHostId: null,
-    environmentName: null,
-    environmentBranchName: null,
-    queuedWork: "none",
-    environmentWorkspaceDisplayKind: "other",
-    runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
     ...overrides,
-  };
+  });
 }
 
 describe("toPluginSidebarThread", () => {
+  it("resolves the display title through the same rules bb's row uses", () => {
+    expect(toPluginSidebarThread(makeThread()).displayTitle).toBe("A thread");
+    expect(
+      toPluginSidebarThread(makeThread({ title: null, titleFallback: "Fallback" }))
+        .displayTitle,
+    ).toBe("Fallback");
+    expect(
+      toPluginSidebarThread(
+        makeThread({ id: "thr_abcdefghij", title: null, titleFallback: null }),
+      ).displayTitle,
+    ).toBe("Thread thr_abcd");
+
+    const resources = {
+      sectionNamesById: new Map([["sec_slop", "Slop Cop"]]),
+      projectNamesById: new Map([["proj_1", "bb"]]),
+      threadById: new Map(),
+    };
+    expect(
+      toPluginSidebarThread(
+        makeThread({ title: "Review @section:sec_slop in @project:proj_1" }),
+        new Map(),
+        resources,
+      ).displayTitle,
+    ).toBe("Review Slop Cop in bb");
+  });
+
   it("maps activity counts onto the plugin-facing names", () => {
     const mapped = toPluginSidebarThread(
       makeThread({
@@ -72,7 +72,6 @@ describe("toPluginSidebarThread", () => {
           hasPendingInteraction: true,
           runtime: {
             displayStatus: "active",
-            hostReconnectGraceExpiresAt: null,
           },
         }),
       ).indicator,
@@ -83,7 +82,6 @@ describe("toPluginSidebarThread", () => {
         makeThread({
           runtime: {
             displayStatus: "active",
-            hostReconnectGraceExpiresAt: null,
           },
         }),
       ).indicator,
@@ -144,22 +142,76 @@ describe("toPluginSidebarThread", () => {
     const mapped = toPluginSidebarThread(
       makeThread({
         pinnedAt: 12,
+        pinSortKey: "a0",
         archivedAt: 13,
         environmentId: "env_1",
         environmentName: "Worktree",
         environmentBranchName: "bb/feature",
-        queuedWork: "none",
+        environmentPath: "/repos/bb/.worktrees/feature",
+        environmentIsWorktree: true,
+        environmentProviderId: "git-worktree",
         environmentWorkspaceDisplayKind: "managed-worktree",
+        queuedWork: "none",
       }),
     );
     expect(mapped.isPinned).toBe(true);
+    expect(mapped.pinnedAt).toBe(12);
+    expect(mapped.pinSortKey).toBe("a0");
     expect(mapped.isArchived).toBe(true);
+    expect(mapped.archivedAt).toBe(13);
+    expect(mapped.href).toBe("/projects/proj_1/threads/thr_1");
     expect(mapped.environment).toEqual({
       id: "env_1",
       name: "Worktree",
       branchName: "bb/feature",
+      path: "/repos/bb/.worktrees/feature",
+      isWorktree: true,
+      providerId: "git-worktree",
       workspaceDisplayKind: "managed-worktree",
     });
+  });
+
+  it("carries status, runtime status, and lineage the list sorts and groups by", () => {
+    const mapped = toPluginSidebarThread(
+      makeThread({
+        status: "active",
+        runtime: {
+          displayStatus: "waiting-for-host",
+        },
+        lifecycleOwnerThreadId: "thr_owner",
+        sourceThreadId: "thr_source",
+        originKind: "fork",
+      }),
+    );
+    expect(mapped.status).toBe("active");
+    expect(mapped.runtimeStatus).toBe("waiting-for-host");
+    expect(mapped.lifecycleOwnerThreadId).toBe("thr_owner");
+    expect(mapped.sourceThreadId).toBe("thr_source");
+  });
+
+  it("exposes hidden threads with a flag instead of dropping them", () => {
+    expect(toPluginSidebarThread(makeThread()).isHidden).toBe(false);
+    expect(
+      toPluginSidebarThread(makeThread({ visibility: "hidden" })).isHidden,
+    ).toBe(true);
+  });
+
+  it("reports queued work as its own indicators", () => {
+    const failed = toPluginSidebarThread(makeThread({ queuedWork: "failed" }));
+    expect(failed.queuedWork).toBe("failed");
+    expect(failed.indicator).toBe("queued-failed");
+    expect(failed.indicatorLabel).toBe("Queued message failed to send");
+
+    const waiting = toPluginSidebarThread(
+      makeThread({ queuedWork: "waiting" }),
+    );
+    expect(waiting.queuedWork).toBe("waiting");
+    expect(waiting.indicator).toBe("queued-waiting");
+
+    const unreadAndFailed = toPluginSidebarThread(
+      makeThread({ queuedWork: "failed", lastReadAt: 1, latestAttentionAt: 9 }),
+    );
+    expect(unreadAndFailed.indicator).toBe("queued-failed");
   });
 
   it("reports no environment when the thread has none", () => {

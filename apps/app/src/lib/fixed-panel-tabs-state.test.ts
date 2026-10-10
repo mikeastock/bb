@@ -4,6 +4,7 @@ import {
   EMPTY_FIXED_PANEL_TABS_STATE,
   areFixedPanelTabsEquivalent,
   buildFixedPanelTabId,
+  createAttachmentFilePreviewFixedPanelTab,
   createBrowserFixedPanelTab,
   createEmptyFixedPanelTabsState,
   createHostFilePreviewFixedPanelTab,
@@ -39,6 +40,38 @@ function makeInitialState(): FixedPanelTabsState {
 }
 
 describe("fixed-panel-tabs-state", () => {
+  it("preserves native browser identities and detects a reconnected desktop generation", () => {
+    const tab = {
+      ...createBrowserFixedPanelTab({
+        environmentId: null,
+        url: "https://example.com",
+      }),
+      id: "browser:native-generated-id:none",
+      desktopTarget: {
+        hostId: "host-1",
+        instanceId: "instance-1",
+        generation: "generation-1",
+      },
+    };
+    const state = createEmptyFixedPanelTabsState({
+      lastUsedAt: NOW,
+      secondary: { activeTabId: tab.id, isOpen: true, tabs: [tab] },
+    });
+    const parsed = parseFixedPanelTabsState({
+      initialValue: makeInitialState(),
+      now: NOW,
+      storedValue: JSON.stringify(state),
+    });
+    expect(parsed.secondary.tabs).toEqual([tab]);
+    expect(parsed.secondary.activeTabId).toBe(tab.id);
+    expect(
+      areFixedPanelTabsEquivalent(tab, {
+        ...tab,
+        desktopTarget: { ...tab.desktopTarget, generation: "generation-2" },
+      }),
+    ).toBe(false);
+  });
+
   it("parses current secondary tab state", () => {
     const now = 1_000;
     const workspaceTab = createWorkspaceFilePreviewFixedPanelTab({
@@ -262,6 +295,28 @@ describe("workspace file preview fixed panel tabs", () => {
 
     expect(parsed.secondary.activeTabId).toBe(projectTab.id);
     expect(parsed.secondary.tabs).toEqual([projectTab]);
+  });
+
+  it("round-trips an attachment preview through storage and the thread-tabs contract", () => {
+    const tab = createAttachmentFilePreviewFixedPanelTab({
+      name: "Pasted text.txt",
+      path: "Pasted-text-1791431248908-krajcq.txt",
+      projectId: "proj_app",
+    });
+    const state = createEmptyFixedPanelTabsState({
+      secondary: { activeTabId: tab.id, isOpen: true, tabs: [tab] },
+      lastUsedAt: NOW,
+    });
+
+    const parsed = parseFixedPanelTabsState({
+      initialValue: EMPTY_FIXED_PANEL_TABS_STATE,
+      now: NOW,
+      storedValue: serializeFixedPanelTabsState({ state }),
+    });
+
+    expect(parsed.secondary.activeTabId).toBe(tab.id);
+    expect(parsed.secondary.tabs).toEqual([tab]);
+    expect(threadTabsSchema.parse([tab])).toEqual([tab]);
   });
 
   it("does not collide project-source preview tabs for the same path in different projects", () => {

@@ -15,6 +15,17 @@ What lives here:
 - `src/delta-translation.ts` — pi's session events become bb's thread deltas.
 - `src/bridge/provider-maintenance.ts` — the install gate (`pi --version`
   ≥ 0.84.0) and the npm install/update actions.
+- `src/bridge/extension-ui.ts` — pi extension dialogs reach the user:
+  `ctx.ui.select/confirm/input/editor` inside a pi extension arrive as pi RPC
+  `extension_ui_request` lines, the bridge forwards each dialog as a
+  `provider-pi/extension-ui` interaction request, and the plugin's pending
+  interaction renderer (`app.tsx`) shows it and returns the answer to pi.
+  Fire-and-forget requests (`notify`, `setStatus`, `setWidget`, `setTitle`,
+  `set_editor_text`) are accepted and dropped. A dialog left pending when the
+  session closes is answered cancelled. Requests that fail validation are
+  answered cancelled, never forwarded. Select answers must match an offered
+  option. Helper sessions without a dialog handler automatically cancel dialogs
+  so extensions cannot block helper startup waiting for user input.
 
 ## Skills
 
@@ -53,3 +64,25 @@ version probe) at a pi executable other than the `pi` on `PATH` — a pinned
 install in a temporary prefix, say. The plugin declares them as environment
 passthrough, so a value set on the host daemon's environment reaches the
 bridge process; bb strips every other inherited `BB_*` variable.
+
+## Tests
+
+The bridge tests drive `src/bridge/fake-pi-rpc.mjs`, a scripted
+`pi --mode rpc` that loads the real bb extension the way pi does and speaks
+pi's framing (LF-delimited JSON, raw U+2028 and U+2029). Its prompts script a
+turn: `/tool <name> <json>` runs an extension tool, `/hold` keeps the run open
+until `abort` or a steer, `/fail-run` ends it with an assistant error, `/ui
+<json>` opens an extension dialog, and `/die` exits mid-run. `FAKE_PI_*`
+environment variables select the rest: the reported version (`crash` for a
+broken install), logs of spawns, commands, prompts, and tools, and the faults
+the lifecycle and steering tests inject.
+
+`bridge.bun-runtime.test.ts` runs the same fake under Bun when it is
+installed: pi ships as a Bun standalone binary, and Bun's `node:net` could not
+attach a read handle to a borrowed stdio fd, which silently dropped every
+dynamic tool result.
+
+The recorded-conformance replay of bb's committed pi recordings
+(`packages/provider-bridge-protocol/recordings/pi`) runs in
+`@bb/provider-parity` (`pi-recorded-conformance.test.ts`), because the
+recordings live outside the plugin.

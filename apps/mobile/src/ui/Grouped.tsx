@@ -14,7 +14,7 @@ import { Text } from "./Text";
 
 const IS_IOS = process.env.EXPO_OS === "ios";
 
-export const GROUPED_CARD_RADIUS = 10;
+export const GROUPED_CARD_RADIUS = IS_IOS ? 10 : 16;
 export const GROUPED_ROW_PADDING_X = 16;
 const GROUPED_ROW_GAP = 12;
 export const ICON_BADGE_SIZE = 29;
@@ -23,44 +23,24 @@ export interface IconBadgeProps {
   icon: IconName;
   symbol?: SFSymbol;
   color: string;
-  size?: number;
-  glyphColor?: string;
-  accessibilityLabel?: string;
 }
 
-export function IconBadge({
-  icon,
-  symbol,
-  color,
-  size = ICON_BADGE_SIZE,
-  glyphColor = "#ffffff",
-  accessibilityLabel,
-}: IconBadgeProps) {
-  const scale = size / ICON_BADGE_SIZE;
+export function IconBadge({ icon, symbol, color }: IconBadgeProps) {
   return (
     <View
       style={{
-        width: size,
-        height: size,
-        borderRadius: Math.round(7 * scale),
+        width: ICON_BADGE_SIZE,
+        height: ICON_BADGE_SIZE,
+        borderRadius: 7,
         borderCurve: "continuous",
         backgroundColor: color,
         alignItems: "center",
         justifyContent: "center",
       }}
-      accessibilityElementsHidden={accessibilityLabel === undefined}
-      importantForAccessibility={
-        accessibilityLabel === undefined ? "no-hide-descendants" : "auto"
-      }
-      accessibilityLabel={accessibilityLabel}
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
     >
-      <Icon
-        name={icon}
-        symbol={symbol}
-        size={Math.round(18 * scale)}
-        color={glyphColor}
-        accessibilityLabel={accessibilityLabel}
-      />
+      <Icon name={icon} symbol={symbol} size={18} color="#ffffff" />
     </View>
   );
 }
@@ -69,7 +49,6 @@ export interface GroupedRowProps {
   title: string;
   subtitle?: string;
   value?: string;
-  valueTone?: "default" | "warning" | "destructive";
   leading?: IconName | ReactNode;
   leadingTone?: "foreground" | "primary";
   badge?: { icon: IconName; symbol?: SFSymbol; color: string };
@@ -78,19 +57,16 @@ export interface GroupedRowProps {
   onLongPress?: () => void;
   destructive?: boolean;
   disabled?: boolean;
-  selectable?: boolean;
+  selected?: boolean;
   titleLines?: number;
-  className?: string;
   testID?: string;
   accessibilityLabel?: string;
-  accessibilityHint?: string;
 }
 
 export function GroupedRow({
   title,
   subtitle,
   value,
-  valueTone = "default",
   leading,
   leadingTone = "foreground",
   badge,
@@ -99,22 +75,14 @@ export function GroupedRow({
   onLongPress,
   destructive = false,
   disabled = false,
-  selectable = false,
+  selected = trailing === "checkmark" ? true : undefined,
   titleLines = 1,
-  className,
   testID,
   accessibilityLabel,
-  accessibilityHint,
 }: GroupedRowProps) {
   const { tokens } = useTheme();
   const interactive = Boolean(onPress || onLongPress);
   const titleColor = destructive ? tokens.destructiveText : tokens.foreground;
-  const valueColor =
-    valueTone === "warning"
-      ? tokens.warningText
-      : valueTone === "destructive"
-        ? tokens.destructiveText
-        : tokens.mutedForeground;
   const leadingColor = destructive
     ? tokens.destructiveText
     : leadingTone === "primary"
@@ -136,35 +104,32 @@ export function GroupedRow({
       trailing
     );
   const layoutClassName = cn(
-    "min-h-[44px] flex-row items-center gap-3 px-4 py-2.5",
+    "min-h-[44px] flex-row items-center gap-3 px-4 py-3",
     disabled && "opacity-50",
-    className,
   );
   const content = (
     <>
       {leadingNode}
       <View className="min-w-0 flex-1">
         <Text
-          variant="bodyLarge"
+          variant={IS_IOS ? "bodyLarge" : "body"}
           numberOfLines={titleLines}
-          selectable={selectable}
           style={{ color: titleColor }}
         >
           {title}
         </Text>
         {subtitle ? (
-          <Text variant="caption" numberOfLines={3} selectable={selectable}>
+          <Text variant="caption" numberOfLines={IS_IOS ? 3 : 1}>
             {subtitle}
           </Text>
         ) : null}
       </View>
       {value ? (
         <Text
-          variant="bodyLarge"
+          variant={IS_IOS ? "bodyLarge" : "body"}
           numberOfLines={1}
-          selectable={selectable}
           className="max-w-[55%] shrink"
-          style={{ color: valueColor }}
+          style={{ color: tokens.mutedForeground }}
         >
           {value}
         </Text>
@@ -185,10 +150,9 @@ export function GroupedRow({
       accessibilityLabel={
         accessibilityLabel ?? (value ? `${title}: ${value}` : undefined)
       }
-      accessibilityHint={accessibilityHint}
       accessibilityState={{
         disabled,
-        selected: trailing === "checkmark" ? true : undefined,
+        selected,
       }}
       disabled={disabled}
       onPress={onPress}
@@ -207,16 +171,10 @@ export function GroupedRow({
 export interface GroupedSectionProps {
   title?: string;
   footer?: string | ReactNode;
-  action?: ReactNode;
   children: ReactNode;
   separatorInset?: number | "text";
-  surface?: GroupedSurface;
-  description?: string;
-  className?: string;
   testID?: string;
 }
-
-export type GroupedSurface = "grouped" | "raised";
 
 function rowTextInset(child: ReactNode): number {
   if (!isValidElement<{ badge?: unknown; leading?: unknown }>(child)) {
@@ -234,45 +192,34 @@ function rowTextInset(child: ReactNode): number {
 export function GroupedSection({
   title,
   footer,
-  action,
   children,
   separatorInset = "text",
-  surface = "grouped",
-  description,
-  className,
   testID,
 }: GroupedSectionProps) {
-  const { tokens, mode } = useTheme();
-  const cardColor =
-    surface === "raised" && mode === "dark"
-      ? tokens.surfaceRaised
-      : tokens.surfaceGroupedCell;
+  const { tokens } = useTheme();
   const rows = Children.toArray(children);
   return (
-    <View className={cn("gap-2", className)} testID={testID}>
-      {title || action ? (
-        <View className="flex-row items-end justify-between gap-3 px-4">
-          {title ? (
-            <Text variant="sectionLabel" numberOfLines={1} className="shrink">
-              {title}
-            </Text>
-          ) : (
-            <View />
+    <View className="gap-2" testID={testID}>
+      {title ? (
+        <View
+          className={cn(
+            "flex-row items-end justify-between gap-3",
+            IS_IOS && "px-4",
           )}
-          {action}
+        >
+          <Text variant="sectionLabel" numberOfLines={1} className="shrink">
+            {title}
+          </Text>
         </View>
-      ) : null}
-      {description ? (
-        <Text variant="caption" className="px-4">
-          {description}
-        </Text>
       ) : null}
       <View
         className="overflow-hidden"
         style={{
           borderRadius: GROUPED_CARD_RADIUS,
+          borderWidth: IS_IOS ? 0 : 1,
+          borderColor: tokens.border,
           borderCurve: "continuous",
-          backgroundColor: cardColor,
+          backgroundColor: tokens.surfaceGroupedCell,
         }}
       >
         {rows.map((row, index) => (
@@ -290,11 +237,15 @@ export function GroupedSection({
       </View>
       {footer ? (
         typeof footer === "string" ? (
-          <Text variant="footnote" tone="muted" className="px-4">
+          <Text
+            variant="footnote"
+            tone="muted"
+            className={IS_IOS ? "px-4" : undefined}
+          >
             {footer}
           </Text>
         ) : (
-          <View className="px-4">{footer}</View>
+          <View className={IS_IOS ? "px-4" : undefined}>{footer}</View>
         )
       ) : null}
     </View>

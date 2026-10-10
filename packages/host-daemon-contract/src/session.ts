@@ -1,9 +1,12 @@
-import type { Hono } from "hono";
-import { hc } from "hono/client";
+import { hostDaemonContributedEnvEntrySchema } from "./commands.js";
+import { desktopBrowserChangedSchema } from "./desktop-browser.js";
+import {
+  serverMovedMessageSchema,
+  serverMoveProgressMessageSchema,
+} from "./server-move.js";
 import {
   discoveredWorkspacePropertiesSchema,
   ENVIRONMENT_CHANGE_KINDS,
-  hostTypeSchema,
   jsonValueSchema,
   pendingInteractionCreateSchema,
   pendingInteractionStatusSchema,
@@ -93,20 +96,21 @@ const hostDaemonPluginHostGenerationSchema = z
   })
   .strict();
 
-export const hostDaemonSessionOpenRequestSchema = z.object({
-  hostId: z.string().min(1),
-  instanceId: z.string().min(1),
-  hostName: z.string().min(1),
-  hostType: hostTypeSchema,
-  connectMachineId: z.string().min(1).optional(),
-  hasMachineCredential: z.boolean(),
-  platform: hostPlatformSchema,
-  dataDir: z.string().min(1),
-  localApiPort: z.number().int().min(1).max(65_535).nullable().default(null),
-  protocolVersion: z.number().int().positive(),
-  activeThreads: z.array(hostDaemonActiveThreadSchema),
-  loadedEnvironments: z.array(hostDaemonLoadedEnvironmentSchema).default([]),
-});
+export const hostDaemonSessionOpenRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    instanceId: z.string().min(1),
+    hostName: z.string().min(1),
+    hasMachineCredential: z.boolean(),
+    platform: hostPlatformSchema,
+    dataDir: z.string().min(1),
+    localApiPort: z.number().int().min(1).max(65_535).nullable().default(null),
+    protocolVersion: z.number().int().positive(),
+    activeThreads: z.array(hostDaemonActiveThreadSchema),
+    undeliveredEventThreadIds: z.array(z.string().min(1)).default([]),
+    loadedEnvironments: z.array(hostDaemonLoadedEnvironmentSchema).default([]),
+  })
+  .strict();
 export type HostDaemonSessionOpenRequest = z.output<
   typeof hostDaemonSessionOpenRequestSchema
 >;
@@ -115,8 +119,6 @@ export const hostDaemonEnrollRequestSchema = z
   .object({
     hostId: z.string().min(1),
     hostName: z.string().min(1),
-    hostType: hostTypeSchema,
-    connectMachineId: z.string().min(1).optional(),
   })
   .strict();
 export type HostDaemonEnrollRequest = z.infer<
@@ -151,9 +153,17 @@ export type HostDaemonEnrollKeyResponse = z.infer<
   typeof hostDaemonEnrollKeyResponseSchema
 >;
 
+const machineEnvironmentSchema = z
+  .object({
+    revision: z.number().int().nonnegative(),
+    entries: z.array(hostDaemonContributedEnvEntrySchema),
+  })
+  .strict();
+
 export const hostDaemonSessionOpenResponseSchema = z
   .object({
     sessionId: z.string().min(1),
+    machineEnvironment: machineEnvironmentSchema,
     heartbeatIntervalMs: z.number().int().positive(),
     leaseTimeoutMs: z.number().int().positive(),
     watchSet: hostDaemonWatchSetSchema.default({
@@ -393,6 +403,17 @@ function commandRpcResponseSuccessSchemaFor<
 const hostDaemonOnlineRpcResponseSuccessSchema = z.discriminatedUnion(
   "commandType",
   [
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.list_instances"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.list_tabs"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.create_tab"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.reveal_tab"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.close_tab"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.capture_tab"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.acquire_control"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.open_connection"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.release_control"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.list_import_sources"),
+    onlineRpcResponseSuccessSchemaFor("desktop.browser.import_cookies"),
     onlineRpcResponseSuccessSchemaFor("host.list_files"),
     onlineRpcResponseSuccessSchemaFor("host.list_paths"),
     onlineRpcResponseSuccessSchemaFor("host.mkdir"),
@@ -403,20 +424,23 @@ const hostDaemonOnlineRpcResponseSuccessSchema = z.discriminatedUnion(
     onlineRpcResponseSuccessSchemaFor("project.inspect"),
     onlineRpcResponseSuccessSchemaFor("project.clone_default_path"),
     onlineRpcResponseSuccessSchemaFor("host.pick_folder"),
+    onlineRpcResponseSuccessSchemaFor("environment.hook.run"),
+    onlineRpcResponseSuccessSchemaFor("environment.hook.cancel"),
     onlineRpcResponseSuccessSchemaFor("plugin.host.call"),
     onlineRpcResponseSuccessSchemaFor("plugin.host.cancel"),
     onlineRpcResponseSuccessSchemaFor("plugin.host.dispose"),
     onlineRpcResponseSuccessSchemaFor("connect-tunnel.ensure-identity"),
     onlineRpcResponseSuccessSchemaFor("host.list_commands"),
+    onlineRpcResponseSuccessSchemaFor("host.read_workspace_agent_context"),
     onlineRpcResponseSuccessSchemaFor("host.list_skills"),
     onlineRpcResponseSuccessSchemaFor("host.delete_skill"),
     onlineRpcResponseSuccessSchemaFor("host.write_skill"),
     onlineRpcResponseSuccessSchemaFor("host.install_global_skills"),
     onlineRpcResponseSuccessSchemaFor("host.global_skills_status"),
-    onlineRpcResponseSuccessSchemaFor("host.file_metadata"),
     onlineRpcResponseSuccessSchemaFor("host.list_branch_options"),
     onlineRpcResponseSuccessSchemaFor("host.inspect_git_source"),
     onlineRpcResponseSuccessSchemaFor("host.read_file"),
+    onlineRpcResponseSuccessSchemaFor("host.read_file_chunk"),
     onlineRpcResponseSuccessSchemaFor("host.read_file_relative"),
     onlineRpcResponseSuccessSchemaFor("host.write_file"),
     onlineRpcResponseSuccessSchemaFor("provider.list_models"),
@@ -424,28 +448,34 @@ const hostDaemonOnlineRpcResponseSuccessSchema = z.discriminatedUnion(
     onlineRpcResponseSuccessSchemaFor("provider.installation.status"),
     onlineRpcResponseSuccessSchemaFor("provider.installation.run"),
     onlineRpcResponseSuccessSchemaFor("provider.usage"),
+    onlineRpcResponseSuccessSchemaFor("host.discover_repos"),
     onlineRpcResponseSuccessSchemaFor("workspace.status"),
     onlineRpcResponseSuccessSchemaFor("workspace.diff"),
     onlineRpcResponseSuccessSchemaFor("workspace.diffFiles"),
     onlineRpcResponseSuccessSchemaFor("workspace.diffPatch"),
     onlineRpcResponseSuccessSchemaFor("workspace.pull_request"),
+    onlineRpcResponseSuccessSchemaFor("server_move.inspect"),
+    onlineRpcResponseSuccessSchemaFor("server_move.probe"),
+    onlineRpcResponseSuccessSchemaFor("server_move.prepare"),
+    onlineRpcResponseSuccessSchemaFor("server_move.activate"),
+    onlineRpcResponseSuccessSchemaFor("server_move.abort"),
+    onlineRpcResponseSuccessSchemaFor("server_move.delete_old_copy"),
     commandRpcResponseSuccessSchemaFor("thread.rewind.discard"),
     commandRpcResponseSuccessSchemaFor("thread.rewind.prepare"),
     commandRpcResponseSuccessSchemaFor("thread.start"),
     commandRpcResponseSuccessSchemaFor("turn.submit"),
     commandRpcResponseSuccessSchemaFor("thread.stop"),
+    commandRpcResponseSuccessSchemaFor("thread.storage.delete"),
     commandRpcResponseSuccessSchemaFor("thread.goal.clear"),
     commandRpcResponseSuccessSchemaFor("thread.plan.cancel"),
     commandRpcResponseSuccessSchemaFor("thread.rename"),
     commandRpcResponseSuccessSchemaFor("thread.archive"),
     commandRpcResponseSuccessSchemaFor("thread.unarchive"),
     commandRpcResponseSuccessSchemaFor("interactive.resolve"),
-    commandRpcResponseSuccessSchemaFor("environment.provision"),
+    commandRpcResponseSuccessSchemaFor("environment.attach"),
     commandRpcResponseSuccessSchemaFor("project.clone"),
-    commandRpcResponseSuccessSchemaFor("environment.provision.cancel"),
-    commandRpcResponseSuccessSchemaFor("environment.destroy"),
+    commandRpcResponseSuccessSchemaFor("environment.attach.cancel"),
     commandRpcResponseSuccessSchemaFor("workspace.commit"),
-    commandRpcResponseSuccessSchemaFor("workspace.squash_merge"),
     commandRpcResponseSuccessSchemaFor("workspace.pull_request_action"),
   ],
 );
@@ -499,6 +529,7 @@ const hostDaemonTerminalOpenTargetSchema = z.discriminatedUnion("kind", [
 const hostDaemonTerminalOpenMessageSchema = z
   .object({
     type: z.literal("terminal.open"),
+    contributedEnv: z.array(hostDaemonContributedEnvEntrySchema).default([]),
     requestId: terminalRequestIdSchema,
     terminalId: terminalIdSchema,
     threadId: z.string().min(1).optional(),
@@ -516,6 +547,12 @@ const hostDaemonTerminalOpenMessageSchema = z
           .object({
             mode: z.literal("command"),
             command: z.string().min(1),
+          })
+          .strict(),
+        z
+          .object({
+            mode: z.literal("argv"),
+            argv: z.array(z.string().max(10_000)).min(1).max(256),
           })
           .strict(),
       ])
@@ -562,7 +599,35 @@ const hostDaemonTerminalCloseMessageSchema = z
   })
   .strict();
 
+const hostDaemonTerminalFlowControlMessageSchema = z
+  .object({
+    type: z.literal("terminal.flow-control"),
+    terminalId: terminalIdSchema,
+    enabled: z.boolean(),
+  })
+  .strict();
+
+const hostDaemonTerminalAckMessageSchema = z
+  .object({
+    type: z.literal("terminal.ack"),
+    terminalId: terminalIdSchema,
+    nextSeq: z.number().int().nonnegative(),
+  })
+  .strict();
+
 export const hostDaemonServerWsMessageSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("machine-environment.replace"),
+      environment: machineEnvironmentSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("machine.shutdown"),
+    })
+    .strict(),
+  serverMovedMessageSchema,
   z
     .object({
       type: z.literal("session-close"),
@@ -582,6 +647,8 @@ export const hostDaemonServerWsMessageSchema = z.discriminatedUnion("type", [
   hostDaemonTerminalInputMessageSchema,
   hostDaemonTerminalResizeMessageSchema,
   hostDaemonTerminalCloseMessageSchema,
+  hostDaemonTerminalFlowControlMessageSchema,
+  hostDaemonTerminalAckMessageSchema,
 ]);
 export type HostDaemonServerWsMessage = z.infer<
   typeof hostDaemonServerWsMessageSchema
@@ -590,6 +657,12 @@ export type HostDaemonServerWsMessage = z.infer<
 const hostDaemonHeartbeatMessageSchema = z
   .object({
     type: z.literal("heartbeat"),
+  })
+  .strict();
+
+const hostDaemonMachineShutdownAckMessageSchema = z
+  .object({
+    type: z.literal("machine.shutdown-ack"),
   })
   .strict();
 
@@ -621,6 +694,24 @@ const pluginHostWorkerExitedMessageSchema = z
     generation: z.string().min(1),
   })
   .strict();
+
+export const environmentHookProgressMessageSchema = z
+  .object({
+    type: z.literal("environment.hook.progress"),
+    operationId: z.string().min(1),
+    entry: z
+      .object({
+        type: z.enum(["step", "output"]),
+        text: z.string(),
+        status: z.enum(["started", "completed", "failed"]).nullable(),
+      })
+      .strict(),
+  })
+  .strict();
+
+export type EnvironmentHookProgressMessage = z.infer<
+  typeof environmentHookProgressMessageSchema
+>;
 
 const pluginHostSignalMessageSchema = z
   .object({
@@ -684,12 +775,16 @@ const hostDaemonTerminalErrorMessageSchema = z
   .strict();
 
 export const hostDaemonDaemonWsMessageSchema = z.union([
+  desktopBrowserChangedSchema,
+  hostDaemonMachineShutdownAckMessageSchema,
   hostDaemonHeartbeatMessageSchema,
   hostDaemonEnvironmentChangeMessageSchema,
   hostDaemonEnvironmentMetadataChangeMessageSchema,
   hostDaemonConnectTunnelIdentityMessageSchema,
   pluginHostWorkerExitedMessageSchema,
   pluginHostSignalMessageSchema,
+  environmentHookProgressMessageSchema,
+  serverMoveProgressMessageSchema,
   hostDaemonTerminalOpenedMessageSchema,
   hostDaemonTerminalOutputMessageSchema,
   hostDaemonTerminalReplayMessageSchema,
@@ -793,9 +888,6 @@ export type HostDaemonInternalSchema = {
   "/plugins/:pluginId/host/:digest": {
     $get: Endpoint<Record<never, never>, Uint8Array, 200, "binary">;
   };
-  "/provider-bridges/:sha256": {
-    $get: Endpoint<Record<never, never>, Uint8Array, 200, "binary">;
-  };
   "/hosts/enroll-key": {
     $post: Endpoint<
       { json: HostDaemonEnrollKeyRequest },
@@ -851,8 +943,6 @@ export type HostDaemonInternalSchema = {
   };
 };
 
-type HostDaemonInternalRoutes = Hono<{}, HostDaemonInternalSchema, "/">;
-
 function parseProtocolHeader(protocolHeader: string | undefined): string[] {
   if (!protocolHeader) {
     return [];
@@ -880,16 +970,4 @@ export function hasHostDaemonWebSocketProtocol(
   return parseProtocolHeader(protocolHeader).includes(
     HOST_DAEMON_WEBSOCKET_PROTOCOL,
   );
-}
-
-export function createHostDaemonClient(baseUrl: string, hostKey: string) {
-  const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
-  const internalBaseUrl = normalizedBaseUrl.endsWith("/internal")
-    ? normalizedBaseUrl
-    : `${normalizedBaseUrl}/internal`;
-  return hc<HostDaemonInternalRoutes>(internalBaseUrl, {
-    headers: {
-      authorization: `Bearer ${hostKey}`,
-    },
-  });
 }

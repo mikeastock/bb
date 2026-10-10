@@ -1,10 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { atom, getDefaultStore, useSetAtom } from "jotai";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   defaultFaviconColor,
   faviconColorPreferenceSchema,
-  type AppThemeSelection,
   type FaviconColor,
   type FaviconColorPreference,
 } from "@bb/domain";
@@ -13,13 +11,9 @@ import {
   getMediaQuerySnapshot,
   subscribeMediaQuery,
 } from "@bb/shared-ui/hooks/use-media-query";
-import { invalidateSystemConfig } from "@/hooks/cache-owners/system-cache-effects";
 import { useSystemConfig } from "@/hooks/queries/system-queries";
-import { sdk } from "@/lib/sdk";
 
 export const FAVICON_COLOR_STORAGE_KEY = "bb.faviconColor";
-export const FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY =
-  "bb.faviconColor.serverSynced";
 
 const FAVICON_BADGES = ["none", "unread"] as const;
 type FaviconBadge = (typeof FAVICON_BADGES)[number];
@@ -56,22 +50,6 @@ function cacheFaviconColor(color: FaviconColorPreference): void {
   } catch {}
 }
 
-function hasServerSyncedFaviconColor(): boolean {
-  try {
-    return (
-      localStorage.getItem(FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY) === "true"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function markServerSyncedFaviconColor(): void {
-  try {
-    localStorage.setItem(FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY, "true");
-  } catch {}
-}
-
 const faviconColorAtom = atom<FaviconColorPreference>(readCachedFaviconColor());
 const faviconBadgeAtom = atom<FaviconBadge>("none");
 
@@ -82,39 +60,12 @@ function setActiveFaviconColor(color: FaviconColorPreference): void {
 
 export function useFaviconColorSync(): void {
   const { data } = useSystemConfig();
-  const appearance = data?.appearance;
-  const queryClient = useQueryClient();
-  const { mutate: updateAppearance } = useMutation({
-    meta: {
-      errorMessage: "Failed to update appearance.",
-    },
-    mutationFn: (selection: AppThemeSelection) => sdk.theme.set(selection),
-    onSuccess: () => {
-      invalidateSystemConfig({ queryClient });
-    },
-  });
-  const legacyMigrationRequestedRef = useRef(false);
+  const faviconColor = data?.appearance.faviconColor;
 
   useEffect(() => {
-    if (!appearance) return;
-    const legacy = readCachedFaviconColor();
-    const needsMigration =
-      !hasServerSyncedFaviconColor() &&
-      !legacyMigrationRequestedRef.current &&
-      legacy !== defaultFaviconColor &&
-      appearance.faviconColor === defaultFaviconColor;
-    if (needsMigration) {
-      legacyMigrationRequestedRef.current = true;
-      setActiveFaviconColor(legacy);
-      updateAppearance(
-        { themeId: appearance.themeId, faviconColor: legacy },
-        { onSuccess: markServerSyncedFaviconColor },
-      );
-      return;
-    }
-    markServerSyncedFaviconColor();
-    setActiveFaviconColor(appearance.faviconColor);
-  }, [appearance, updateAppearance]);
+    if (faviconColor === undefined) return;
+    setActiveFaviconColor(faviconColor);
+  }, [faviconColor]);
 }
 
 export function useFaviconBadge(badge: FaviconBadge): void {
@@ -223,10 +174,6 @@ function loadBaseImage(src: string): Promise<HTMLImageElement> {
 
 const STANDALONE_DISPLAY_MODE_QUERY = "(display-mode: standalone)";
 
-function isStandaloneDisplayMode(): boolean {
-  return getMediaQuerySnapshot(STANDALONE_DISPLAY_MODE_QUERY);
-}
-
 async function createFaviconHref({
   badge,
   baseHref,
@@ -286,7 +233,7 @@ let applyToken = 0;
 
 async function applyFaviconState(state: FaviconRenderState): Promise<void> {
   const token = ++applyToken;
-  if (isStandaloneDisplayMode()) return;
+  if (getMediaQuerySnapshot(STANDALONE_DISPLAY_MODE_QUERY)) return;
   const suffix = getFaviconVariantSuffix();
   const links = await Promise.all(
     FAVICON_SIZES.map(async (size): Promise<RenderedFaviconLink> => {

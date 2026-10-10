@@ -1,5 +1,11 @@
+import { PluginUpdateJobsHost } from "./components/plugin/PluginUpdateJobsHost";
+import { LazyThreadDetailView } from "./views/thread-detail/LazyThreadDetailView";
+import { LazyRootComposeView } from "./views/LazyRootComposeView";
+import { useRouteState } from "./hooks/useRouteState";
 import { lazy, Suspense, useEffect } from "react";
+import { parseMessageLink } from "@bb/client-core";
 import {
+  matchPath,
   Navigate,
   Route,
   Routes,
@@ -13,7 +19,9 @@ import { RouteNavigationProvider } from "./components/ui/app-route-anchor";
 import { RouteNavigationIndicator } from "./components/ui/route-navigation-indicator";
 import { AppNavigationUrlHost } from "./lib/url-open-routing";
 import { NativeShellReporter } from "./lib/native-shell";
+import { UiPreferencesSync } from "@/lib/ui-preferences/UiPreferencesSync";
 import { AppFileExternalNavigationHost } from "./components/plugin/AppFileExternalNavigationHost";
+import { pluginDetailKeyFromRoute } from "./components/plugin/plugin-detail-key";
 import { useAppTheme } from "./hooks/useAppTheme";
 import { useFaviconColorSync } from "./lib/favicon-color-preference";
 import { useDesktopThemeSync } from "./hooks/useDesktopThemeSync";
@@ -25,7 +33,6 @@ import {
   AUTH_CALLBACK_ROUTE_PATH,
   LEGACY_AUTOMATION_DETAIL_ROUTE_PATH,
   LEGACY_AUTOMATIONS_ROUTE_PATH,
-  LEGACY_SKILLS_ROUTE_PATH,
   LEGACY_TOOLS_AUTOMATION_BROWSE_ROUTE_PATH,
   LEGACY_TOOLS_AUTOMATION_DETAIL_ROUTE_PATH,
   LEGACY_TOOLS_AUTOMATION_EDIT_ROUTE_PATH,
@@ -35,38 +42,69 @@ import {
   LEGACY_TOOLS_SPLAT_ROUTE_PATH,
   PROJECT_ARCHIVED_ROUTE_PATH,
   PROJECTLESS_ARCHIVED_ROUTE_PATH,
-  PROJECT_SETTINGS_ROUTE_PATH,
+  LEGACY_PROJECT_SETTINGS_ROUTE_PATH,
+  PLUGIN_DETAIL_ROUTE_PATH,
+  PLUGINS_ROUTE_PATH,
+  REGISTRY_SKILL_DETAIL_ROUTE_PATH,
+  REGISTRY_SKILLS_ROUTE_PATH,
   SETTINGS_PLUGIN_ROUTE_PATH,
   SETTINGS_PLUGINS_ROUTE_PATH,
   SETTINGS_MACHINE_ROUTE_PATH,
+  SETTINGS_PROJECT_ROUTE_PATH,
   SETTINGS_ROUTE_PATH,
   SETTINGS_SECTION_ROUTE_PATH,
+  SKILL_DETAIL_ROUTE_PATH,
   SKILLS_ROUTE_PATH,
   TOOLS_PLUGIN_BROWSE_ROUTE_PATH,
+  TOOLS_PLUGIN_DETAIL_ROUTE_PATH,
   TOOLS_PLUGINS_ROUTE_PATH,
   TOOLS_REGISTRY_SKILL_DETAIL_ROUTE_PATH,
   TOOLS_REGISTRY_SKILLS_ROUTE_PATH,
   TOOLS_ROUTE_PATH,
+  APP_ROOT_ROUTE_PATH,
   TOOLS_SKILL_DETAIL_ROUTE_PATH,
+  TOOLS_SKILLS_ROUTE_PATH,
   getAutomationDetailRoutePath,
   getAutomationEditRoutePath,
   getAutomationsRoutePath,
+  getPluginConfigurationRoutePath,
   getSettingsRoutePath,
-  getSkillDetailRoutePath,
+  getSettingsProjectRoutePath,
 } from "./lib/route-paths";
 import { AppCommandProvider } from "./components/commands/AppCommandProvider";
+import { WindowFindHost } from "./components/layout/WindowFindHost";
+import { DesktopZoomIndicator } from "./components/layout/DesktopZoomIndicator";
 import { ProviderCliInstallLogDialogHost } from "./components/provider-cli/provider-cli-install";
-import { PluginSettingsCompatibilityRoute } from "./components/settings/PluginSettingsCompatibilityRoute";
+import { ServerMoveOverlay } from "./components/machines/ServerMoveOverlay";
+import { OnboardingGate } from "./components/onboarding/OnboardingGate";
+import { AppUpdateHost } from "./components/app-update/AppUpdateHost";
+import { PluginInstallJobsHost } from "./components/plugin/PluginInstallJobsHost";
 import { RouteLoadingSkeleton } from "./components/ui/route-loading-skeleton";
+import { ThreadTimelineLoadingSkeleton } from "./components/thread/timeline/ThreadTimelineLoadingSkeleton";
+import {
+  startSplitPreloading,
+  trackCriticalLoad,
+  whenCriticalLoadsSettled,
+} from "./lib/split-prefetch";
 
 const SettingsView = lazy(() =>
   import("./views/SettingsView").then((m) => ({
     default: m.SettingsView,
   })),
 );
-const ToolsView = lazy(() =>
+const PluginsView = lazy(() =>
   import("./views/ToolsView").then((m) => ({
-    default: m.ToolsView,
+    default: m.PluginsView,
+  })),
+);
+const SkillsView = lazy(() =>
+  import("./views/ToolsView").then((m) => ({
+    default: m.SkillsView,
+  })),
+);
+const ProjectDetailSettingsView = lazy(() =>
+  import("./views/ProjectDetailSettingsView").then((m) => ({
+    default: m.ProjectDetailSettingsView,
   })),
 );
 const MachineSettingsView = lazy(() =>
@@ -74,16 +112,36 @@ const MachineSettingsView = lazy(() =>
     default: m.MachineSettingsView,
   })),
 );
-const ProjectSettingsView = lazy(() =>
-  import("./views/ProjectSettingsView").then((m) => ({
-    default: m.ProjectSettingsView,
-  })),
+const splitWorkspaceRouteModule = trackCriticalLoad(
+  import("./views/SplitWorkspaceRoute"),
 );
-const splitWorkspaceRouteModule = import("./views/SplitWorkspaceRoute");
 splitWorkspaceRouteModule.catch(() => {});
 const SplitWorkspaceRoute = lazy(() => splitWorkspaceRouteModule);
 
-export function LegacyAutomationDetailRedirect() {
+function NavigatePreservingLocation({ pathname }: { pathname: string }) {
+  const location = useLocation();
+  return (
+    <Navigate
+      to={{ pathname, search: location.search, hash: location.hash }}
+      replace
+    />
+  );
+}
+
+function LegacyProjectSettingsRedirect() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return (
+    <NavigatePreservingLocation
+      pathname={
+        projectId
+          ? getSettingsProjectRoutePath(projectId)
+          : getSettingsRoutePath("projects")
+      }
+    />
+  );
+}
+
+function LegacyAutomationDetailRedirect() {
   const location = useLocation();
   const { projectId, automationId } = useParams<{
     projectId?: string;
@@ -105,7 +163,7 @@ export function LegacyAutomationDetailRedirect() {
   );
 }
 
-export function LegacyAutomationCollectionRedirect() {
+function LegacyAutomationCollectionRedirect() {
   const location = useLocation();
   const browse =
     location.pathname.endsWith("/browse") ||
@@ -122,33 +180,53 @@ export function LegacyAutomationCollectionRedirect() {
   );
 }
 
-export function LegacySkillDetailRedirect() {
-  const { skillId } = useParams<{ skillId?: string }>();
+function normalizeLegacyPluginSuffix(suffix: string): string {
+  return matchPath("/browse", suffix) !== null ? "" : suffix;
+}
+
+export function LegacyPluginsPathRedirect() {
+  const location = useLocation();
+  const suffix = normalizeLegacyPluginSuffix(
+    location.pathname.slice(TOOLS_PLUGINS_ROUTE_PATH.length),
+  );
   return (
-    <Navigate
-      to={skillId ? getSkillDetailRoutePath({ skillId }) : SKILLS_ROUTE_PATH}
-      replace
-    />
+    <NavigatePreservingLocation pathname={`${PLUGINS_ROUTE_PATH}${suffix}`} />
   );
 }
 
-export function ExtensionsLandingRedirect() {
-  return <Navigate to={TOOLS_PLUGINS_ROUTE_PATH} replace />;
+function normalizeLegacySkillSuffix(suffix: string): string {
+  if (suffix === "/installed") return "/library";
+  if (suffix.startsWith("/installed/")) {
+    return `/library/${suffix.slice("/installed/".length)}`;
+  }
+  return suffix;
+}
+
+export function LegacySkillsPathRedirect() {
+  const location = useLocation();
+  const suffix = normalizeLegacySkillSuffix(
+    location.pathname.slice(TOOLS_SKILLS_ROUTE_PATH.length),
+  );
+  return (
+    <NavigatePreservingLocation pathname={`${SKILLS_ROUTE_PATH}${suffix}`} />
+  );
 }
 
 export function LegacyToolsPathRedirect() {
   const location = useLocation();
   const suffix = location.pathname.slice(LEGACY_TOOLS_PREFIX_ROUTE_PATH.length);
-  return (
-    <Navigate
-      to={{
-        pathname: `${TOOLS_ROUTE_PATH}${suffix}`,
-        search: location.search,
-        hash: location.hash,
-      }}
-      replace
-    />
-  );
+  const pathname = suffix.startsWith("/plugins")
+    ? `${PLUGINS_ROUTE_PATH}${normalizeLegacyPluginSuffix(
+        suffix.slice("/plugins".length),
+      )}`
+    : suffix.startsWith("/skills")
+      ? `${SKILLS_ROUTE_PATH}${normalizeLegacySkillSuffix(
+          suffix.slice("/skills".length),
+        )}`
+      : suffix === "" || suffix === "/"
+        ? PLUGINS_ROUTE_PATH
+        : `${TOOLS_ROUTE_PATH}${suffix}`;
+  return <NavigatePreservingLocation pathname={pathname} />;
 }
 
 function hashTargetId(hash: string): string | null {
@@ -166,6 +244,9 @@ export function HashNavigationScroll() {
   const location = useLocation();
 
   useEffect(() => {
+    if (parseMessageLink(`${location.pathname}${location.hash}`) !== null) {
+      return;
+    }
     const targetId = hashTargetId(location.hash);
     if (targetId === null) return;
 
@@ -198,16 +279,36 @@ export function HashNavigationScroll() {
     observer.observe(document.body, { childList: true, subtree: true });
     timeoutId = window.setTimeout(stopWaiting, HASH_NAVIGATION_WAIT_MS);
     return stopWaiting;
-  }, [location.hash, location.key]);
+  }, [location.hash, location.key, location.pathname]);
 
   return null;
 }
 
-function AppRoutes() {
+export function AppRoutes() {
+  const { isThreadView } = useRouteState();
+  const isRootComposeView = useLocation().pathname === APP_ROOT_ROUTE_PATH;
+  useEffect(() => {
+    if (isThreadView) void trackCriticalLoad(LazyThreadDetailView.preload());
+  }, [isThreadView]);
+  useEffect(() => {
+    if (isRootComposeView)
+      void trackCriticalLoad(LazyRootComposeView.preload());
+  }, [isRootComposeView]);
   return (
     <AppLayout>
       <Suspense fallback={null}>
         <Routes>
+          <Route
+            path="/settings/usage"
+            element={
+              <Navigate
+                to={getPluginConfigurationRoutePath({
+                  pluginId: "bb--provider-usage",
+                })}
+                replace
+              />
+            }
+          />
           <Route path={SETTINGS_ROUTE_PATH} element={<SettingsView />} />
           <Route
             path={SETTINGS_SECTION_ROUTE_PATH}
@@ -215,27 +316,20 @@ function AppRoutes() {
           />
           <Route
             path={SETTINGS_PLUGINS_ROUTE_PATH}
-            element={
-              <PluginSettingsCompatibilityRoute>
-                <SettingsView />
-              </PluginSettingsCompatibilityRoute>
-            }
+            element={<SettingsView />}
           />
-          <Route
-            path={SETTINGS_PLUGIN_ROUTE_PATH}
-            element={
-              <PluginSettingsCompatibilityRoute>
-                <SettingsView />
-              </PluginSettingsCompatibilityRoute>
-            }
-          />
+          <Route path={SETTINGS_PLUGIN_ROUTE_PATH} element={<SettingsView />} />
           <Route
             path={SETTINGS_MACHINE_ROUTE_PATH}
             element={<MachineSettingsView />}
           />
           <Route
-            path={PROJECT_SETTINGS_ROUTE_PATH}
-            element={<ProjectSettingsView />}
+            path={SETTINGS_PROJECT_ROUTE_PATH}
+            element={<ProjectDetailSettingsView />}
+          />
+          <Route
+            path={LEGACY_PROJECT_SETTINGS_ROUTE_PATH}
+            element={<LegacyProjectSettingsRedirect />}
           />
           <Route
             path={PROJECT_ARCHIVED_ROUTE_PATH}
@@ -271,7 +365,41 @@ function AppRoutes() {
           />
           <Route
             path={TOOLS_ROUTE_PATH}
-            element={<ExtensionsLandingRedirect />}
+            element={
+              <NavigatePreservingLocation pathname={PLUGINS_ROUTE_PATH} />
+            }
+          />
+          <Route
+            path={TOOLS_PLUGINS_ROUTE_PATH}
+            element={<LegacyPluginsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_PLUGIN_BROWSE_ROUTE_PATH}
+            element={<LegacyPluginsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_PLUGIN_DETAIL_ROUTE_PATH}
+            element={<LegacyPluginsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_SKILLS_ROUTE_PATH}
+            element={<LegacySkillsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_SKILL_DETAIL_ROUTE_PATH}
+            element={<LegacySkillsPathRedirect />}
+          />
+          <Route
+            path={LEGACY_TOOLS_SKILL_DETAIL_ROUTE_PATH}
+            element={<LegacySkillsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_REGISTRY_SKILLS_ROUTE_PATH}
+            element={<LegacySkillsPathRedirect />}
+          />
+          <Route
+            path={TOOLS_REGISTRY_SKILL_DETAIL_ROUTE_PATH}
+            element={<LegacySkillsPathRedirect />}
           />
           <Route
             path={LEGACY_TOOLS_PREFIX_ROUTE_PATH}
@@ -281,37 +409,24 @@ function AppRoutes() {
             path={LEGACY_TOOLS_SPLAT_ROUTE_PATH}
             element={<LegacyToolsPathRedirect />}
           />
-          <Route path={SKILLS_ROUTE_PATH} element={<ToolsView />} />
-          <Route path={TOOLS_SKILL_DETAIL_ROUTE_PATH} element={<ToolsView />} />
+          <Route path={SKILLS_ROUTE_PATH} element={<SkillsView />} />
+          <Route path={SKILL_DETAIL_ROUTE_PATH} element={<SkillsView />} />
+          <Route path={REGISTRY_SKILLS_ROUTE_PATH} element={<SkillsView />} />
           <Route
-            path={LEGACY_TOOLS_SKILL_DETAIL_ROUTE_PATH}
-            element={<LegacySkillDetailRedirect />}
+            path={REGISTRY_SKILL_DETAIL_ROUTE_PATH}
+            element={<SkillsView />}
           />
-          <Route
-            path={TOOLS_REGISTRY_SKILLS_ROUTE_PATH}
-            element={<ToolsView />}
-          />
-          <Route
-            path={TOOLS_REGISTRY_SKILL_DETAIL_ROUTE_PATH}
-            element={<ToolsView />}
-          />
-          <Route
-            path={`${TOOLS_PLUGINS_ROUTE_PATH}/*`}
-            element={<ToolsPluginsRoute />}
-          />
-          <Route
-            path={TOOLS_PLUGIN_BROWSE_ROUTE_PATH}
-            element={<ExtensionsLandingRedirect />}
-          />
-          <Route
-            path={LEGACY_SKILLS_ROUTE_PATH}
-            element={<Navigate to={SKILLS_ROUTE_PATH} replace />}
-          />
+          <Route path={PLUGINS_ROUTE_PATH} element={<PluginsRoute />} />
+          <Route path={PLUGIN_DETAIL_ROUTE_PATH} element={<PluginsRoute />} />
           <Route
             path="*"
             element={
               <Suspense
-                fallback={<RouteLoadingSkeleton isBoundedPane={false} />}
+                fallback={
+                  <RouteLoadingSkeleton isBoundedPane={false}>
+                    {isThreadView ? <ThreadTimelineLoadingSkeleton /> : null}
+                  </RouteLoadingSkeleton>
+                }
               >
                 <SplitWorkspaceRoute />
               </Suspense>
@@ -326,14 +441,24 @@ function AppRoutes() {
 
 function RouteContentPaintSignal() {
   useEffect(() => {
-    markRouteContentPainted();
+    void whenCriticalLoadsSettled().then(markRouteContentPainted);
+    startSplitPreloading();
   }, []);
   return null;
 }
 
-function ToolsPluginsRoute() {
-  const { "*": pluginId } = useParams<"*">();
-  return <ToolsView pluginId={pluginId || undefined} />;
+function PluginsRoute() {
+  const { pluginId } = useParams<{ pluginId?: string }>();
+  const { search } = useLocation();
+  return (
+    <PluginsView
+      detailKey={
+        pluginId === undefined
+          ? undefined
+          : pluginDetailKeyFromRoute(pluginId, search)
+      }
+    />
+  );
 }
 
 export function App() {
@@ -353,15 +478,28 @@ export function App() {
             <AppFileExternalNavigationHost>
               <HashNavigationScroll />
               <NativeShellReporter />
+              <UiPreferencesSync />
               <Routes>
                 <Route
                   path={AUTH_CALLBACK_ROUTE_PATH}
                   element={<AuthCallbackView />}
                 />
-                <Route path="*" element={<AppRoutes />} />
+                <Route
+                  path="*"
+                  element={
+                    <OnboardingGate>
+                      <AppRoutes />
+                    </OnboardingGate>
+                  }
+                />
               </Routes>
-              {}
+              <WindowFindHost />
+              <DesktopZoomIndicator />
               <ProviderCliInstallLogDialogHost />
+              <ServerMoveOverlay />
+              <AppUpdateHost />
+              <PluginInstallJobsHost />
+              <PluginUpdateJobsHost />
             </AppFileExternalNavigationHost>
           </AppNavigationUrlHost>
         </RouteNavigationProvider>

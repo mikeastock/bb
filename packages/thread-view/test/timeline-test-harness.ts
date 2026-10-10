@@ -1,4 +1,7 @@
+import { buildPendingSteerMessagesFromEvents } from "../src/build-thread-timeline.js";
+import { assertTimelineSourceOwnership } from "./timeline-source-ownership.js";
 import {
+  buildThreadEvent,
   encodeClientTurnRequestIdNumber,
   threadScope,
   turnScope,
@@ -6,6 +9,7 @@ import {
 import type {
   ApprovalPendingInteractionResolution,
   ClientTurnRequestId,
+  CompletedTurnDisplay,
   PromptInput,
   ProviderRawEvent,
   ProvisioningTranscriptEntry,
@@ -20,6 +24,8 @@ import type {
   ThreadTimelinePendingTodos,
   ThreadTurnInitiator,
   TurnRequestTarget,
+  SystemMessageKind,
+  SystemMessageSubject,
 } from "@bb/domain";
 import type { TimelineRow } from "@bb/server-contract";
 import type {
@@ -29,15 +35,16 @@ import type {
 } from "../src/event-projection-types.js";
 import {
   buildThreadTimelineFromEvents,
+  buildThreadTimelineTurnDetailsFromEvents,
   formatThreadTimelineText,
 } from "../src/index.js";
-import { decodeThreadEventRow } from "../src/event-decode.js";
 import { EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT } from "../src/accepted-client-request-context.js";
-import { flattenEventProjectionMessagesDeep } from "../src/event-projection-flatten.js";
+import { getProjectionEntryMessages } from "../src/event-projection-flatten.js";
 import { buildEventProjection } from "../src/build-event-projection.js";
 import type { ThreadEventWithMeta } from "../src/build-event-projection.js";
 
 export interface RenderTimelineFixtureArgs {
+  completedTurnDisplay?: CompletedTurnDisplay;
   events: ThreadEventRow[];
   includeNestedRows?: boolean;
   projectionOptions: Omit<BuildEventProjectionOptions, "threadName"> & {
@@ -80,7 +87,6 @@ interface DefaultTurnEventOptions extends EventFactoryRowOptions {
 }
 
 type ClientTurnRequestedArgs = EventFactoryRowOptions & {
-  /** Dispatch-gate provenance; omitted means no gate amended the turn. */
   execution?: ResolvedThreadExecutionOptions;
   initiator?: ThreadTurnInitiator;
   input?: PromptInput[];
@@ -89,6 +95,8 @@ type ClientTurnRequestedArgs = EventFactoryRowOptions & {
   requestMethod?: "thread/start" | "turn/start";
   senderThreadId?: string | null;
   source?: "spawn" | "tell";
+  systemMessageKind?: SystemMessageKind;
+  systemMessageSubject?: SystemMessageSubject | null;
   target?: TurnRequestTarget;
   text: string;
 };
@@ -122,11 +130,16 @@ interface ClientTurnRejectedArgs extends EventFactoryRowOptions {
 
 interface ReasoningCompletedArgs extends ProviderTurnEventOptions {
   itemId?: string;
+  summary?: string;
   text: string;
 }
 
 interface ReasoningDeltaArgs extends ProviderTurnEventOptions {
   delta: string;
+  itemId?: string;
+}
+
+interface ReasoningStartedArgs extends ProviderTurnEventOptions {
   itemId?: string;
 }
 
@@ -196,6 +209,7 @@ interface CommandCompletedArgs extends ProviderTurnEventOptions {
   cwd?: string;
   exitCode?: number;
   itemId?: string;
+  presentation?: ThreadEventItemPresentation;
   status?: "pending" | "completed" | "failed" | "interrupted";
 }
 
@@ -310,12 +324,6 @@ interface ProviderUnhandledArgs extends ProviderTurnEventOptions {
   rawType?: string;
 }
 
-interface WarningArgs extends EventFactoryRowOptions {
-  category?: ThreadEventWarningCategory;
-  details?: string;
-  summary?: string;
-}
-
 export interface TimelineEventFactory {
   assistantDelta(
     args: AssistantDeltaArgs,
@@ -377,6 +385,12 @@ export interface TimelineEventFactory {
   reasoningDelta(
     args: ReasoningDeltaArgs,
   ): ThreadEventRowOfType<"item/reasoning/textDelta">;
+  reasoningSummaryDelta(
+    args: ReasoningDeltaArgs,
+  ): ThreadEventRowOfType<"item/reasoning/summaryTextDelta">;
+  reasoningStarted(
+    args?: ReasoningStartedArgs,
+  ): ThreadEventRowOfType<"item/started">;
   systemError(args: SystemErrorArgs): ThreadEventRowOfType<"system/error">;
   systemOperation(
     args: SystemOperationArgs,
@@ -409,9 +423,6 @@ export interface TimelineEventFactory {
   searchCompleted(
     args: SearchEventArgs,
   ): ThreadEventRowOfType<"item/completed">;
-  planStepsStarted(
-    args: PlanStepsEventArgs,
-  ): ThreadEventRowOfType<"item/started">;
   planStepsCompleted(
     args: PlanStepsEventArgs,
   ): ThreadEventRowOfType<"item/completed">;
@@ -450,7 +461,52 @@ export interface TimelineEventFactory {
   webFetchStarted(
     args: WebFetchStartedArgs,
   ): ThreadEventRowOfType<"item/started">;
-  warning(args?: WarningArgs): ThreadEventRowOfType<"provider/warning">;
+}
+
+export function decodeThreadEventRow(row: ThreadEventRow): ThreadEventWithMeta {
+  return {
+    event: buildThreadEvent(row),
+    meta: {
+      id: row.id,
+      seq: row.seq,
+      createdAt: row.createdAt,
+    },
+  };
+}
+
+function flattenEventProjectionMessages(
+  projection: EventProjection,
+): EventProjectionMessage[] {
+  const messages: EventProjectionMessage[] = [];
+  for (const entry of projection.entries) {
+    messages.push(...getProjectionEntryMessages(entry));
+  }
+  return messages;
+}
+
+function flattenEventProjectionMessageListDeep(
+  rootMessages: readonly EventProjectionMessage[],
+): EventProjectionMessage[] {
+  const messages: EventProjectionMessage[] = [];
+  for (const message of rootMessages) {
+    messages.push(message);
+    if (message.kind === "delegation") {
+      messages.push(
+        ...flattenEventProjectionMessageListDeep(
+          flattenEventProjectionMessages(message.childProjection),
+        ),
+      );
+    }
+  }
+  return messages;
+}
+
+function flattenEventProjectionMessagesDeep(
+  projection: EventProjection,
+): EventProjectionMessage[] {
+  return flattenEventProjectionMessageListDeep(
+    flattenEventProjectionMessages(projection),
+  );
 }
 
 export function fromRows(rows: ThreadEventRow[]): ThreadEventWithMeta[] {
@@ -633,6 +689,12 @@ export function createTimelineEventFactory(
           source: args.source ?? "tell",
           initiator,
           senderThreadId,
+          ...(args.systemMessageKind !== undefined
+            ? { systemMessageKind: args.systemMessageKind }
+            : {}),
+          ...(args.systemMessageSubject !== undefined
+            ? { systemMessageSubject: args.systemMessageSubject }
+            : {}),
           input: args.input ?? [
             { type: "text", text: args.text, mentions: [] },
           ],
@@ -676,6 +738,7 @@ export function createTimelineEventFactory(
             exitCode: args.exitCode,
             status: args.status ?? "completed",
             approvalStatus: args.approvalStatus ?? null,
+            ...(args.presentation ? { presentation: args.presentation } : {}),
           },
         },
       };
@@ -709,6 +772,7 @@ export function createTimelineEventFactory(
             exitCode: args.exitCode,
             status: args.status ?? "pending",
             approvalStatus: args.approvalStatus ?? null,
+            ...(args.presentation ? { presentation: args.presentation } : {}),
           },
         },
       };
@@ -726,6 +790,9 @@ export function createTimelineEventFactory(
           item: {
             type: "contextCompaction",
             id: args.itemId ?? "compact-1",
+            ...(args.parentToolCallId
+              ? { parentToolCallId: args.parentToolCallId }
+              : {}),
           },
         },
       };
@@ -743,6 +810,9 @@ export function createTimelineEventFactory(
           item: {
             type: "contextCompaction",
             id: args.itemId ?? "compact-1",
+            ...(args.parentToolCallId
+              ? { parentToolCallId: args.parentToolCallId }
+              : {}),
           },
         },
       };
@@ -1115,28 +1185,6 @@ export function createTimelineEventFactory(
         },
       };
     },
-    planStepsStarted(args) {
-      const base = nextProviderTurnScopedRowBase("plan-steps-started", args);
-      return {
-        ...base,
-        type: "item/started",
-        data: {
-          ...providerFields(args),
-          item: {
-            type: "planSteps",
-            id: args.itemId ?? `plan-steps-${base.seq}`,
-            steps: args.steps,
-            ...(args.explanation === undefined
-              ? {}
-              : { explanation: args.explanation }),
-            status: args.status ?? "pending",
-            ...(args.presentation === undefined
-              ? {}
-              : { presentation: args.presentation }),
-          },
-        },
-      };
-    },
     planStepsCompleted(args) {
       const base = nextProviderTurnScopedRowBase("plan-steps-completed", args);
       return {
@@ -1265,8 +1313,11 @@ export function createTimelineEventFactory(
           item: {
             type: "reasoning",
             id: args.itemId ?? `reasoning-${base.seq}`,
-            summary: [],
+            summary: args.summary ? [args.summary] : [],
             content: [args.text],
+            ...(args.parentToolCallId
+              ? { parentToolCallId: args.parentToolCallId }
+              : {}),
           },
         },
       };
@@ -1280,6 +1331,34 @@ export function createTimelineEventFactory(
           ...providerFields(args),
           itemId: args.itemId ?? `reasoning-${base.seq}`,
           delta: args.delta,
+          ...(args.parentToolCallId
+            ? { parentToolCallId: args.parentToolCallId }
+            : {}),
+        },
+      };
+    },
+    reasoningSummaryDelta(args) {
+      return {
+        ...this.reasoningDelta(args),
+        type: "item/reasoning/summaryTextDelta",
+      };
+    },
+    reasoningStarted(args = {}) {
+      const base = nextProviderTurnScopedRowBase("reasoning-started", args);
+      return {
+        ...base,
+        type: "item/started",
+        data: {
+          ...providerFields(args),
+          item: {
+            type: "reasoning",
+            id: args.itemId ?? `reasoning-${base.seq}`,
+            summary: [],
+            content: [],
+            ...(args.parentToolCallId
+              ? { parentToolCallId: args.parentToolCallId }
+              : {}),
+          },
         },
       };
     },
@@ -1351,20 +1430,42 @@ export function createTimelineEventFactory(
         },
       };
     },
-    warning(args = {}) {
-      const base = nextThreadScopedRowBase("warning", args);
-      return {
-        ...base,
-        type: "provider/warning",
-        data: {
-          providerThreadId: defaults.providerThreadId ?? "provider-thread-1",
-          category: args.category ?? "general",
-          summary: args.summary,
-          details: args.details,
-        },
-      };
-    },
   };
+}
+
+export function flattenTimelineRows(
+  rows: readonly TimelineRow[],
+): TimelineRow[] {
+  return rows.flatMap((row) => {
+    if (row.kind === "turn") {
+      return [row, ...flattenTimelineRows(row.children ?? [])];
+    }
+    if (row.kind === "work" && row.workKind === "delegation") {
+      return [row, ...flattenTimelineRows(row.childRows ?? [])];
+    }
+    return [row];
+  });
+}
+
+export function rowsOfKind<K extends TimelineRow["kind"]>(
+  rows: readonly TimelineRow[],
+  kind: K,
+): Extract<TimelineRow, { kind: K }>[] {
+  return flattenTimelineRows(rows).filter(
+    (row): row is Extract<TimelineRow, { kind: K }> => row.kind === kind,
+  );
+}
+
+type TimelineWorkRow = Extract<TimelineRow, { kind: "work" }>;
+
+export function workRowsOfKind<K extends TimelineWorkRow["workKind"]>(
+  rows: readonly TimelineRow[],
+  workKind: K,
+): Extract<TimelineWorkRow, { workKind: K }>[] {
+  return flattenTimelineRows(rows).filter(
+    (row): row is Extract<TimelineWorkRow, { workKind: K }> =>
+      row.kind === "work" && row.workKind === workKind,
+  );
 }
 
 export function renderTimelineFixture(
@@ -1380,8 +1481,9 @@ export function renderTimelineFixture(
       : args.projectionOptions.turnMessageDetail,
   });
   const commonProjectionOptions = {
-    includeProviderUnhandledOperations:
-      args.projectionOptions.includeProviderUnhandledOperations ?? false,
+    completedTurnDisplay: args.completedTurnDisplay ?? "collapse",
+    includeDiagnosticOperations:
+      args.projectionOptions.includeDiagnosticOperations ?? false,
     isLatestPage: true,
     threadStatus: args.projectionOptions.threadStatus ?? "idle",
     threadName: args.projectionOptions.threadName ?? "",
@@ -1394,12 +1496,46 @@ export function renderTimelineFixture(
     options: {
       ...commonProjectionOptions,
       includeNestedRows,
-      turnMessageDetail: includeNestedRows
-        ? "full"
-        : args.projectionOptions.turnMessageDetail,
     },
   });
   const rows = timeline.rows;
+  const ownershipProjection =
+    includeNestedRows || args.projectionOptions.turnMessageDetail === "full"
+      ? projection
+      : buildEventProjection(decodedEvents, {
+          ...args.projectionOptions,
+          threadName: args.projectionOptions.threadName ?? "",
+          turnMessageDetail: "full",
+        });
+  const pendingMessages = buildPendingSteerMessagesFromEvents(
+    EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
+    decodedEvents,
+    commonProjectionOptions,
+  );
+  const lazyRows = rows.map((row) => {
+    if (row.kind !== "turn") return row;
+    const details = buildThreadTimelineTurnDetailsFromEvents({
+      events: decodedEvents,
+      options: {
+        ...commonProjectionOptions,
+        sourceSeqStart: row.sourceSeqStart,
+        turnId: row.turnId,
+      },
+    });
+    if (details.kind !== "matched") {
+      throw new Error(`Missing lazy details for timeline summary ${row.id}`);
+    }
+    return { ...row, children: details.rows };
+  });
+  for (const candidateRows of [rows, lazyRows]) {
+    assertTimelineSourceOwnership(
+      decodedEvents,
+      ownershipProjection,
+      candidateRows,
+      pendingMessages,
+    );
+  }
+
   const messages = flattenEventProjectionMessagesDeep(projection);
   const text = formatThreadTimelineText(rows, {
     color: false,

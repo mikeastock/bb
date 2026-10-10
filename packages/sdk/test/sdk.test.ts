@@ -31,15 +31,20 @@ function makeEnvironment(overrides: EnvironmentOverrides = {}): Environment {
     projectId: "proj_test",
     hostId: "host_test",
     path: "/workspace",
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
-    workspaceProvisionType: "unmanaged",
     baseBranch: null,
     branchName: null,
     defaultBranch: null,
     mergeBaseBranch: null,
     status: "ready",
+    environmentProviderId: null,
+    environmentProviderSelection: null,
+    environmentProviderInstanceKey: null,
+    lifecycle: { phase: "active", retireAt: null, teardown: null },
+    hostLifecycle: "active",
+    managed: false,
+    workspaceProvisionType: null,
     createdAt: 1,
     updatedAt: 2,
     ...overrides,
@@ -102,6 +107,163 @@ function createFetchQueue(
 }
 
 describe("@bb/sdk", () => {
+  it("pages prompt history with an opaque cursor", async () => {
+    const response = {
+      entries: [
+        {
+          id: "phist_1",
+          createdAt: 10,
+          input: [{ type: "text", text: "Fix auth", mentions: [] }],
+          projectId: "proj_1",
+          threadId: "thr_1",
+        },
+      ],
+      nextCursor: "next",
+    };
+    const queue = createFetchQueue([{ body: response }]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await expect(
+      sdk.experimental_promptHistory.list({ cursor: "abc", limit: "25" }),
+    ).resolves.toEqual(response);
+    expect(queue.requests).toEqual([
+      {
+        bodyText: undefined,
+        method: "GET",
+        url: "http://bb.test/api/v1/prompt-history?cursor=abc&limit=25",
+      },
+    ]);
+  });
+
+  it("creates a DigitalOcean machine through the SDK without a project", async () => {
+    const host = {
+      id: "host_do",
+      name: "Dev box",
+      type: "ephemeral",
+      status: "connected",
+      machineProviderId: "digitalocean",
+      lifecycle: {
+        phase: "active",
+        suspendedAt: null,
+
+        message: null,
+        teardown: null,
+      },
+      maxPermissionMode: "full",
+      lastSeenAt: 1,
+      lastRejectedProtocolVersion: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const creating = {
+      ...host,
+      status: "disconnected",
+      lifecycle: {
+        ...host.lifecycle,
+        phase: "creating",
+        message: "Creating DigitalOcean machine…",
+      },
+    };
+    const queue = createFetchQueue([{ body: creating }, { body: host }]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+    expect(
+      await sdk.hosts.experimental_create({
+        machineProviderId: "digitalocean",
+        inputs: {},
+      }),
+    ).toEqual(host);
+    expect(queue.requests).toEqual([
+      {
+        bodyText: JSON.stringify({
+          machineProviderId: "digitalocean",
+          inputs: {},
+        }),
+        method: "POST",
+        url: "http://bb.test/api/v1/hosts",
+      },
+      {
+        bodyText: undefined,
+        method: "GET",
+        url: "http://bb.test/api/v1/hosts/host_do",
+      },
+    ]);
+  });
+
+  it("requests a machine join code without a host type", async () => {
+    const queue = createFetchQueue([
+      { body: { joinCode: "one", hostId: "host_1", expiresAt: 1 } },
+    ]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await sdk.hosts.createJoinCode();
+
+    expect(queue.requests).toEqual([
+      {
+        bodyText: JSON.stringify({}),
+        method: "POST",
+        url: "http://bb.test/api/v1/hosts/join-codes",
+      },
+    ]);
+  });
+
+  it("reads provider installation events through the response instance", async () => {
+    const events = [
+      {
+        type: "started",
+        provider: "codex",
+        command: "npm install --global @openai/codex",
+      },
+      {
+        type: "completed",
+        provider: "codex",
+        exitCode: 0,
+        signal: null,
+        success: true,
+      },
+    ];
+    const response = new Response(null, {
+      status: 200,
+      headers: { "content-type": "application/x-ndjson" },
+    });
+    Object.defineProperty(response, "text", {
+      value: async () =>
+        events.map((event) => JSON.stringify(event)).join("\n"),
+    });
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: async () => response,
+        runtime: "node",
+      }),
+    });
+
+    await expect(
+      sdk.hosts.installProviderCli({
+        hostId: "host_test",
+        provider: "codex",
+        actionKind: "install",
+      }),
+    ).resolves.toEqual(events);
+  });
+
   it("sends thread pane presentation actions through the typed transport", async () => {
     const queue = createFetchQueue([{ body: { delivered: 3 } }]);
     const sdk = createBbSdk({
@@ -125,20 +287,6 @@ describe("@bb/sdk", () => {
         url: "http://bb.test/api/v1/threads/thr_test/pane-action",
       },
     ]);
-  });
-
-  it("keeps realtime subscriptions distinct under subscribe", () => {
-    const queue = createFetchQueue([]);
-    const sdk = createBbSdk({
-      transport: createHttpTransport({
-        baseUrl: "http://bb.test",
-        fetch: queue.fetch,
-        runtime: "node",
-      }),
-    });
-
-    expect(typeof sdk.subscribe).toBe("function");
-    expect("on" in sdk).toBe(false);
   });
 
   it("maps thread event filters and reverse pagination onto the public query", async () => {
@@ -187,6 +335,29 @@ describe("@bb/sdk", () => {
     await expect(
       sdk.threads.list({ signal: controller.signal }),
     ).resolves.toEqual([]);
+    expect(receivedSignal).toBe(controller.signal);
+  });
+
+  it("forwards thread read action abort signals to fetch", async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | null | undefined;
+    const fetch: FetchImplementation = async (_input, init) => {
+      receivedSignal = init?.signal;
+      return jsonResponse({ body: {} });
+    };
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch,
+        runtime: "node",
+      }),
+    });
+
+    await sdk.threads.markRead({
+      signal: controller.signal,
+      threadId: "thr_test",
+    });
+
     expect(receivedSignal).toBe(controller.signal);
   });
 
@@ -289,6 +460,38 @@ describe("@bb/sdk", () => {
         bodyText: JSON.stringify({ themeId: "nord", faviconColor: "purple" }),
         method: "PUT",
         url: "http://bb.test/api/v1/settings/appearance",
+      },
+    ]);
+  });
+
+  it("resolves a theme by id without touching the active appearance", async () => {
+    const resolved = {
+      themeId: "plugin:pack:ocean",
+      customCss: ":root { --canvas: black; }",
+      faviconColor: "purple" as const,
+      resolvedCodeTheme: {
+        dark: "github-dark",
+        light: "github-light",
+        files: {},
+      },
+    };
+    const queue = createFetchQueue([{ body: resolved }]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await expect(
+      sdk.theme.resolve({ themeId: "plugin:pack:ocean" }),
+    ).resolves.toEqual(resolved);
+    expect(queue.requests).toEqual([
+      {
+        bodyText: undefined,
+        method: "GET",
+        url: "http://bb.test/api/v1/settings/themes/plugin:pack:ocean",
       },
     ]);
   });
@@ -416,7 +619,7 @@ describe("@bb/sdk", () => {
           jsonResponse({
             body: {
               code: "invalid_request",
-              message: "Attachment exceeds 10MB limit",
+              message: "huge.png is 36MB, over the 35MB attachment limit",
             },
             status: 400,
           }),
@@ -433,7 +636,7 @@ describe("@bb/sdk", () => {
       }),
     ).rejects.toMatchObject({
       code: "invalid_request",
-      message: "HTTP 400: Attachment exceeds 10MB limit",
+      message: "HTTP 400: huge.png is 36MB, over the 35MB attachment limit",
       status: 400,
     });
   });
@@ -465,16 +668,10 @@ describe("@bb/sdk", () => {
         },
       }),
       new Response("remote text", {
-        headers: {
-          "content-type": "text/plain",
-          "x-bb-content-encoding": "utf8",
-        },
+        headers: { "content-type": "text/plain" },
       }),
       new Response(new Uint8Array([0, 1, 254, 255]), {
-        headers: {
-          "content-type": "application/octet-stream",
-          "x-bb-content-encoding": "base64",
-        },
+        headers: { "content-type": "application/octet-stream" },
       }),
     ];
     const fetch: FetchImplementation = async (input, init) => {
@@ -528,9 +725,16 @@ describe("@bb/sdk", () => {
 
     expect(requests.map((request) => request.url)).toEqual([
       "http://bb.test/api/v1/projects/proj_remote/files?hostId=host_remote",
-      "http://bb.test/api/v1/projects/proj_remote/files/content?environmentId=env_remote&path=remote.txt",
-      "http://bb.test/api/v1/projects/proj_remote/files/content?hostId=host_remote&path=image.bin",
+      "http://bb.test/api/v1/environments/env_remote/files/remote.txt",
+      "http://bb.test/api/v1/projects/proj_remote/hosts/host_remote/files/image.bin",
     ]);
+
+    for (const path of ["../../hosts", "docs/./a.md", "/etc/hosts", "a\\b"]) {
+      await expect(
+        sdk.projects.fileContent({ projectId: "proj_remote", path }),
+      ).rejects.toThrow(`Invalid file path: ${path}`);
+    }
+    expect(requests).toHaveLength(3);
   });
 
   it("routes provider list and model discovery through portable host selectors", async () => {
@@ -603,6 +807,51 @@ describe("@bb/sdk", () => {
         bodyText: undefined,
         method: "GET",
         url: "http://bb.test/api/v1/system/usage-limits?hostId=host_remote&providerId=codex",
+      },
+    ]);
+  });
+
+  it("lists environment providers as an array for a project and machine", async () => {
+    const providers = [
+      {
+        id: "project-checkout",
+        displayName: "Project checkout",
+        description: "Prepare a workspace for this thread.",
+        icon: "Folder",
+        logoUrl: null,
+        pluginId: "environment-project-checkout",
+        requires: {
+          projectCheckout: true,
+          gitCheckout: false,
+          gitRemote: false,
+          projectless: false,
+        },
+        inputs: null,
+        acceptsEmptyInputs: true,
+        machineAvailability: {},
+        availability: { status: "available" as const },
+      },
+    ];
+    const queue = createFetchQueue([{ body: { providers } }]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await expect(
+      sdk.environments.listProviders({
+        projectId: "proj_test",
+        hostId: "host_test",
+      }),
+    ).resolves.toEqual(providers);
+    expect(queue.requests).toEqual([
+      {
+        bodyText: undefined,
+        method: "GET",
+        url: "http://bb.test/api/v1/system/environment-providers?projectId=proj_test&hostId=host_test",
       },
     ]);
   });
@@ -1017,7 +1266,7 @@ describe("@bb/sdk", () => {
     );
   });
 
-  it("fills thread fork defaults and preserves an agent-only context seed", async () => {
+  it("defaults thread forks to source-environment reuse and preserves an agent-only context seed", async () => {
     const queue = createFetchQueue([{ body: { id: "thr_fork" }, status: 201 }]);
     const sdk = createBbSdk({
       transport: createHttpTransport({
@@ -1055,7 +1304,6 @@ describe("@bb/sdk", () => {
       ],
       origin: "sdk",
       visibility: "visible",
-      workspace: "isolated",
     });
   });
 
@@ -1115,6 +1363,10 @@ describe("@bb/sdk", () => {
       input: [{ type: "text", text: "Accept edits", mentions: [] }],
       mode: "start",
       permissionMode: "accept-edits",
+      pluginSubmission: {
+        pluginId: "example-plugin",
+        data: { action: "hold" },
+      },
     });
     await sdk.threads.queuedMessages.create({
       threadId: "thr_auto",
@@ -1126,7 +1378,13 @@ describe("@bb/sdk", () => {
       queue.requests.map((request) => JSON.parse(request.bodyText ?? "{}")),
     ).toEqual([
       expect.objectContaining({ permissionMode: "auto" }),
-      expect.objectContaining({ permissionMode: "accept-edits" }),
+      expect.objectContaining({
+        permissionMode: "accept-edits",
+        pluginSubmission: {
+          pluginId: "example-plugin",
+          data: { action: "hold" },
+        },
+      }),
       expect.objectContaining({ permissionMode: "full" }),
     ]);
   });
@@ -1230,6 +1488,39 @@ describe("@bb/sdk", () => {
     });
   });
 
+  it("sends chosen session options when updating a thread", async () => {
+    const queue = createFetchQueue([
+      {
+        body: {
+          id: "thr_section",
+          projectId: "proj_123",
+          status: "idle",
+          title: null,
+        },
+      },
+    ]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await sdk.threads.update({
+      threadId: "thr_section",
+      sessionOptions: { mode: "plan", web: true, stale: null },
+    });
+
+    expect(queue.requests[0]).toEqual({
+      bodyText: JSON.stringify({
+        sessionOptions: { mode: "plan", web: true, stale: null },
+      }),
+      method: "PATCH",
+      url: "http://bb.test/api/v1/threads/thr_section",
+    });
+  });
+
   it("sends the queued message version when updating its content", async () => {
     const queue = createFetchQueue([{ body: { id: "qmsg_123" } }]);
     const sdk = createBbSdk({
@@ -1301,9 +1592,11 @@ describe("@bb/sdk", () => {
         body: {
           ok: true,
           delivery: "queued",
-          queuedMessageId: "qm_1",
-          waitingOn: { kind: "time" },
-          sendAt: 1750,
+          queuedMessage: {
+            id: "qm_1",
+            waitingOn: { kind: "time" },
+            sendAt: 1750,
+          },
         },
       },
     ]);
@@ -1329,9 +1622,11 @@ describe("@bb/sdk", () => {
     ).resolves.toEqual({
       ok: true,
       delivery: "queued",
-      queuedMessageId: "qm_1",
-      waitingOn: { kind: "time" },
-      sendAt: 1750,
+      queuedMessage: {
+        id: "qm_1",
+        waitingOn: { kind: "time" },
+        sendAt: 1750,
+      },
     });
 
     expect(queue.requests[0].url).toBe(
@@ -1413,6 +1708,29 @@ describe("@bb/sdk", () => {
     // No filters at all: the occupying set is small, and a caller that needs
     // more than "which ids, on which hosts" fetches the threads it named.
     expect(queue.requests[0].url).toBe("http://bb.test/api/v1/threads/running");
+  });
+
+  it("lists thread sections without fetching sidebar projects", async () => {
+    const sections = [
+      { id: "sec_123", name: "Review", createdAt: 1, updatedAt: 2 },
+    ];
+    const queue = createFetchQueue([{ body: sections }]);
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: "http://bb.test",
+        fetch: queue.fetch,
+        runtime: "node",
+      }),
+    });
+
+    await expect(sdk.threadSections.list()).resolves.toEqual(sections);
+    expect(queue.requests).toEqual([
+      {
+        bodyText: undefined,
+        method: "GET",
+        url: "http://bb.test/api/v1/thread-sections",
+      },
+    ]);
   });
 
   it("exposes thread section mutations", async () => {
@@ -1565,6 +1883,7 @@ describe("@bb/sdk", () => {
               official: false,
               author: { name: "Acme", url: null },
               installed: true,
+              conflictingInstallSource: null,
               compatible: true,
               incompatibleReason: null,
             },
@@ -1979,5 +2298,4 @@ describe("@bb/sdk", () => {
       },
     ]);
   });
-
 });

@@ -12,6 +12,10 @@
     "ios": {
       "bundleIdentifier": "app.getbb.mobile",
       "supportsTablet": true,
+      "icon": {
+        "light": "./assets/icon.png",
+        "dark": "./assets/ios-icon-dark.png"
+      },
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "bb connects to a bb server on your local network or tailnet.",
         "NSCameraUsageDescription": "bb attaches photos you take to your prompts.",
@@ -27,6 +31,7 @@
     },
     "android": {
       "package": "app.getbb.mobile",
+      "permissions": ["android.permission.MODIFY_AUDIO_SETTINGS"],
       "adaptiveIcon": {
         "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -63,25 +68,32 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      "./plugins/with-selection-accent",
+      "./plugins/with-push-consent",
       "expo-router",
       "expo-secure-store",
       "expo-image",
       [
         "expo-splash-screen",
         {
-          "image": "./assets/splash-icon.png",
-          "imageWidth": 200,
+          "image": "./assets/splash-logo.png",
+          "imageWidth": 88,
           "backgroundColor": "#ffffff",
           "dark": {
-            "image": "./assets/splash-icon-dark.png",
+            "image": "./assets/splash-logo-dark.png",
             "backgroundColor": "#000000"
+          },
+          "android": {
+            "dark": {
+              "backgroundColor": "#151515"
+            }
           }
         }
       ],
       [
         "expo-notifications",
         {
-          "icon": "./assets/android-icon-monochrome.png",
+          "icon": "./assets/android-notification-icon.png",
           "color": "#000000",
           "defaultChannel": "threads"
         }

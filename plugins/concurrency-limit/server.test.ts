@@ -2,22 +2,20 @@ import type {
   BbPluginApi,
   MessageDispatchHookContext,
   PluginDispatchAttemptKind,
-  PluginThreadEventPayloads,
 } from "@get-bb/plugin-sdk";
 import {
   createFakePluginHost,
+  makeHostResponse,
+  makeMessageDispatchHookContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import plugin from "./server.js";
 
-type ThreadResponse = PluginThreadEventPayloads["thread.created"]["thread"];
-type HostRecord = Awaited<
-  ReturnType<BbPluginApi["sdk"]["hosts"]["list"]>
->[number];
 type RunningThread = Awaited<
   ReturnType<BbPluginApi["sdk"]["threads"]["listRunning"]>
 >[number];
+type HostResponse = ReturnType<typeof makeHostResponse>;
 type SdkSubscription = Parameters<BbPluginApi["sdk"]["subscribe"]>[0];
 type HostChangedSubscription = Extract<
   SdkSubscription,
@@ -31,31 +29,12 @@ function isHostChangedSubscription(
 }
 
 const PLUGIN_ID = "concurrency-limit";
-const PROJECT = {
-  id: "proj_1",
-  kind: "standard" as const,
-  name: "bb",
-  gitRemoteUrl: null,
-  createdAt: 1,
-  updatedAt: 1,
-};
-
 function hostRecord(
   id: string,
-  status: HostRecord["status"] = "connected",
+  status: "connected" | "disconnected" = "connected",
   name = id,
-): HostRecord {
-  return {
-    id,
-    name,
-    type: "persistent",
-    status,
-    maxPermissionMode: "full",
-    lastSeenAt: null,
-    lastRejectedProtocolVersion: null,
-    createdAt: 1,
-    updatedAt: 1,
-  };
+): HostResponse {
+  return makeHostResponse({ id, name, status });
 }
 
 function running(overrides: Partial<RunningThread> = {}): RunningThread {
@@ -65,48 +44,24 @@ function running(overrides: Partial<RunningThread> = {}): RunningThread {
 interface GateContextOverrides {
   hostId?: string | null;
   hostName?: string;
-  thread?: Partial<ThreadResponse>;
+  thread?: Partial<MessageDispatchHookContext["thread"]>;
   attempt?: PluginDispatchAttemptKind;
 }
 
-function dispatchContext(
-  overrides: GateContextOverrides = {},
-): MessageDispatchHookContext {
+function dispatchContext(overrides: GateContextOverrides = {}) {
   const hostId = overrides.hostId === undefined ? "host-a" : overrides.hostId;
-  return {
-    thread: makeThreadResponse({
+  return makeMessageDispatchHookContext({
+    thread: {
       id: "thr_1",
       status: "pending",
       ...overrides.thread,
-    }),
+    },
     attempt: overrides.attempt ?? "start-turn",
-    queuedMessage: null,
-    project: PROJECT,
-    environment: null,
     host:
       hostId === null
         ? null
-        : hostRecord(hostId, "connected", overrides.hostName ?? hostId),
-    input: { blocks: [], text: "go" },
-    requestedExecution: {
-      providerId: "codex",
-      model: null,
-      reasoningLevel: null,
-      serviceTier: null,
-      permissionMode: null,
-    },
-    executionSources: {
-      providerId: null,
-      model: null,
-      reasoningLevel: null,
-      serviceTier: null,
-      permissionMode: null,
-    },
-    origin: null,
-    originPluginId: null,
-    startedOnBehalfOf: null,
-    parentThreadId: null,
-  };
+        : { id: hostId, name: overrides.hostName ?? hostId },
+  });
 }
 
 interface SetupOptions {
@@ -115,7 +70,7 @@ interface SetupOptions {
     hostOverrides: Array<{ hostId: string; limit: number }>;
   };
   capacities?: Array<{ hostId: string; availableParallelism: number }>;
-  hosts?: HostRecord[] | (() => HostRecord[]);
+  hosts?: HostResponse[] | (() => HostResponse[]);
   running?: RunningThread[];
   detectedParallelism?: number;
   subscribe?: BbPluginApi["sdk"]["subscribe"];
@@ -152,17 +107,20 @@ async function setup(options: SetupOptions = {}) {
 }
 
 function hostChanges(): {
-  emitHostConnected(hostId: string): void;
+  emitHostChanges(
+    hostId: string,
+    changes: Parameters<HostChangedSubscription["callback"]>[0]["changes"],
+  ): void;
   subscribe: BbPluginApi["sdk"]["subscribe"];
 } {
   let callback: HostChangedSubscription["callback"] | null = null;
   return {
-    emitHostConnected(hostId) {
+    emitHostChanges(hostId, changes) {
       callback?.({
         type: "changed",
         entity: "host",
         id: hostId,
-        changes: ["host-connected"],
+        changes,
       });
     },
     subscribe(subscription) {
@@ -181,13 +139,6 @@ describe("configuration", () => {
     const { harness } = await setup();
 
     expect(harness.registrations.settingsDescriptors).toEqual({});
-    expect(harness.registrations.rpcMethods).toEqual([
-      "getConfiguration",
-      "setConfiguration",
-    ]);
-    expect(
-      harness.registrations.services.map((service) => service.name),
-    ).toEqual(["capacity-detector"]);
   });
 
   it("returns each host's detected automatic limit and retained offline capacity", async () => {
@@ -297,7 +248,7 @@ describe("configuration", () => {
 
   it("detects a host when it connects after startup", async () => {
     const changes = hostChanges();
-    let status: HostRecord["status"] = "disconnected";
+    let status: HostResponse["status"] = "disconnected";
     const { harness } = await setup({
       hosts: () => [hostRecord("host-a", status)],
       subscribe: changes.subscribe,
@@ -309,10 +260,38 @@ describe("configuration", () => {
     expect(harness.experimental_hostRpcCalls).toHaveLength(0);
 
     status = "connected";
-    changes.emitHostConnected("host-a");
+    changes.emitHostChanges("host-a", ["host-connected"]);
     await vi.waitFor(() => {
       expect(harness.experimental_hostRpcCalls).toHaveLength(1);
     });
+
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("ignores host messages that only report a provider model catalog change", async () => {
+    const changes = hostChanges();
+    const { harness } = await setup({
+      hosts: [hostRecord("host-a")],
+      subscribe: changes.subscribe,
+    });
+    const service = harness.behavior.runService("capacity-detector");
+    await vi.waitFor(() => {
+      expect(harness.experimental_hostRpcCalls).toHaveLength(1);
+      expect(harness.realtimeSignals).toHaveLength(1);
+    });
+    const hostListCalls = harness.inspection.sdk.callsTo("hosts.list").length;
+
+    changes.emitHostChanges("host-a", ["provider-model-catalog-changed"]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(harness.realtimeSignals).toHaveLength(1);
+    expect(harness.experimental_hostRpcCalls).toHaveLength(1);
+    expect(harness.inspection.sdk.callsTo("hosts.list")).toHaveLength(
+      hostListCalls,
+    );
+
+    changes.emitHostChanges("host-a", ["host-disconnected"]);
+    expect(harness.realtimeSignals).toHaveLength(2);
 
     service.controller.abort();
     await service.done;
@@ -345,6 +324,39 @@ describe("configuration", () => {
     await expect(
       harness.behavior.runCli(["global", "1.5"]),
     ).resolves.toMatchObject({ exitCode: 1 });
+  });
+
+  it("documents the limit range in help and reports errors as JSON", async () => {
+    const { harness } = await setup({
+      hosts: [hostRecord("host-a", "connected", "Laptop")],
+      capacities: [{ hostId: "host-a", availableParallelism: 8 }],
+    });
+
+    const help = (await harness.behavior.runCli(["host", "--help"])).stdout;
+    expect(help).toContain("bb concurrency-limit host");
+    expect(help).toContain("0 to 10000");
+
+    const envelope = await harness.behavior.runCli([
+      "host",
+      "host-b",
+      "--json",
+    ]);
+    expect(envelope.exitCode).toBe(1);
+    expect(JSON.parse(envelope.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: "unknown_host",
+        message: "Unknown host: host-b",
+        hint: "Run `bb machine list` for the enrolled host ids.",
+      },
+    });
+    expect(envelope.stderr).toContain("Unknown host: host-b");
+
+    const badLimit = await harness.behavior.runCli(["host", "host-a", "many"]);
+    expect(badLimit.exitCode).toBe(1);
+    expect(badLimit.stderr).toContain(
+      "Limit must be auto or a whole number from 0 to 10000",
+    );
   });
 });
 

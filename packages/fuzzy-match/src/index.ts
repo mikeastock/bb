@@ -140,10 +140,6 @@ function isPresent<T>(value: T | null): value is T {
   return value !== null;
 }
 
-function getNormalizedQuery(query: string): string {
-  return query.replaceAll("\\", "/");
-}
-
 function getBaseName(path: string): string {
   const separatorIndex = path.lastIndexOf("/");
   if (separatorIndex === -1) {
@@ -248,14 +244,14 @@ function compareRankedMatches<T>(
   if (left.start !== right.start) {
     return left.start - right.start;
   }
+  if (left.path.length !== right.path.length) {
+    return left.path.length - right.path.length;
+  }
   if (left.path < right.path) {
     return -1;
   }
   if (left.path > right.path) {
     return 1;
-  }
-  if (left.path.length !== right.path.length) {
-    return left.path.length - right.path.length;
   }
   return 0;
 }
@@ -506,7 +502,11 @@ function getStructuredPathMatch<T>(
       )
     : null;
   if (leafMatch) {
-    score += PATH_INTENT_SCORE.leafSegment + leafMatch.score;
+    const leafQuery = querySegments[querySegments.length - 1];
+    score +=
+      PATH_INTENT_SCORE.leafSegment +
+      leafMatch.score -
+      Math.max(leafSegment.text.length - leafQuery.length, 0);
   }
 
   return {
@@ -626,7 +626,7 @@ function mergeRankedMatches<T>(
 }
 
 function rankedMatchesToFuzzyMatches<T>(
-  matches: readonly RankedPathMatch<T>[],
+  matches: readonly FuzzyMatch<T>[],
   limit: number,
 ): FuzzyMatch<T>[] {
   return matches.slice(0, limit).map((match) => ({
@@ -766,17 +766,6 @@ function mergeRankedTextMatches<T>(
   return [...matchesByItemIndex.values()].sort(compareRankedTextMatches);
 }
 
-function rankedTextMatchesToFuzzyMatches<T>(
-  matches: readonly RankedTextMatch<T>[],
-  limit: number,
-): FuzzyMatch<T>[] {
-  return matches.slice(0, limit).map((match) => ({
-    item: match.item,
-    score: match.score,
-    positions: match.positions,
-  }));
-}
-
 export function fuzzyMatchPaths<T>(
   args: FuzzyMatchPathsArgs<T>,
 ): FuzzyMatch<T>[] {
@@ -792,7 +781,7 @@ export function fuzzyMatchPaths<T>(
     }));
   }
 
-  const normalizedQuery = getNormalizedQuery(args.query);
+  const normalizedQuery = args.query.replaceAll("\\", "/");
   if (normalizedQuery.length > FUZZY_MATCH_QUERY_MAX_LENGTH) {
     return [];
   }
@@ -830,7 +819,7 @@ export function fuzzyMatchText<T>(
     return [];
   }
 
-  return rankedTextMatchesToFuzzyMatches(
+  return rankedMatchesToFuzzyMatches(
     mergeRankedTextMatches(
       rankTextQueryMatches(
         getTextCandidates(args.items, args.getText, args.getAliases),

@@ -6,25 +6,16 @@ import {
   buildTimelineActivityIntentTitles,
   buildTimelineRowTitle,
   buildTimelineViewRows,
-  timelineRowActivityIntents,
 } from "../src/index.js";
+import { timelineRowActivityIntents } from "../src/timeline-activity-intents.js";
 import {
   createTimelineEventFactory,
+  flattenTimelineRows,
   renderTimelineFixture,
 } from "./timeline-test-harness.js";
 
-function flattenRows(rows: readonly TimelineRow[]): TimelineRow[] {
-  return rows.flatMap((row) =>
-    row.kind === "turn" && row.children
-      ? [row, ...flattenRows(row.children)]
-      : row.kind === "work" && row.workKind === "delegation"
-        ? [row, ...flattenRows(row.childRows)]
-        : [row],
-  );
-}
-
 function workRows(rows: readonly TimelineRow[]): TimelineWorkRow[] {
-  return flattenRows(rows).filter(
+  return flattenTimelineRows(rows).filter(
     (row): row is TimelineWorkRow => row.kind === "work",
   );
 }
@@ -86,6 +77,18 @@ const ECHO_PRESENTATION: ThreadEventItemPresentation = {
   tint: { light: "#1d4ed8", dark: "#93c5fd" },
 };
 
+const SANDBOX_ESCAPED_COMMAND_PRESENTATION: ThreadEventItemPresentation = {
+  label: { pending: "Running command", completed: "Ran command" },
+  icon: { glyph: "Terminal" },
+  title: "ls -la ~/.claude/ide",
+  badge: {
+    glyph: "SquareUnlock02",
+    label: "Outside of sandbox",
+    hint: "Outside of sandbox",
+    tone: "destructive",
+  },
+};
+
 const PLAN_PRESENTATION: ThreadEventItemPresentation = {
   label: { pending: "Updating plan", completed: "Updated plan" },
   icon: { glyph: "ListTodo" },
@@ -100,6 +103,94 @@ const SUBAGENT_PRESENTATION: ThreadEventItemPresentation = {
 };
 
 describe("v3 item projection", () => {
+  it.each([
+    { decision: "allow_once", interleaved: false },
+    { decision: "allow_for_session", interleaved: true },
+  ] as const)(
+    "excludes the approval wait after $decision (interleaved: $interleaved)",
+    ({ decision, interleaved }) => {
+      const event = createTimelineEventFactory({
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+      const command = { itemId: "command-1", command: "mkdir -p build" };
+      const approval = event.permissionGrantLifecycle({
+        status: "resolved",
+        providerId: "claude-code",
+        resolution: { decision, grantedPermissions: null },
+        createdAt: 145_000,
+      });
+      approval.data.interaction.payload = {
+        kind: "approval",
+        reason: null,
+        subject: {
+          kind: "command",
+          ...command,
+          cwd: "/repo",
+          actions: [],
+          sessionGrant: null,
+        },
+      };
+      const events = [
+        event.turnStarted({ createdAt: 0, seq: 0 }),
+        event.commandStarted({ ...command, createdAt: 1_000, seq: 1 }),
+        event.commandStarted({
+          ...command,
+          approvalStatus: "waiting_for_approval",
+          createdAt: 2_000,
+          seq: 2,
+        }),
+        ...(interleaved
+          ? [
+              event.commandStarted({
+                itemId: "other-command",
+                command: "pwd",
+                createdAt: 3_000,
+                seq: 3,
+              }),
+            ]
+          : []),
+        { ...approval, seq: 4 },
+      ];
+      const running = renderTimelineFixture({
+        events,
+        projectionOptions: { turnMessageDetail: "full" },
+      });
+      expect(workRow(running.rows, "command", command.itemId)).toMatchObject({
+        startedAt: 145_000,
+        sourceSeqStart: 1,
+        approvalStatus: null,
+        completedAt: null,
+      });
+      const completed = renderTimelineFixture({
+        events: [
+          ...events,
+          event.commandCompleted({
+            ...command,
+            exitCode: 0,
+            createdAt: 145_100,
+            seq: 5,
+          }),
+        ],
+        projectionOptions: { turnMessageDetail: "full" },
+      });
+      expect(workRow(completed.rows, "command", command.itemId)).toMatchObject({
+        startedAt: 145_000,
+        completedAt: 145_100,
+        sourceSeqStart: 1,
+      });
+      expect(
+        workRows(completed.rows).filter(
+          (row) => "callId" in row && row.callId === command.itemId,
+        ),
+      ).toHaveLength(1);
+      const [viewRow] = buildTimelineViewRows([
+        workRow(completed.rows, "command", command.itemId),
+      ]);
+      expect(viewRow && plainTitle(viewRow)).toBe("Ran mkdir -p build");
+    },
+  );
+
   it("projects fileRead and search items to file-read and search rows; bare tool calls derive no intent", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
     const v3 = renderTimelineFixture({
@@ -256,6 +347,35 @@ describe("v3 item projection", () => {
     expect(
       buildTimelineActivityIntentTitles(read).map((title) => title.title.plain),
     ).toEqual(["Read src/index.ts"]);
+  });
+
+  it("carries a command item's presentation through projection into its title", () => {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const rendered = renderTimelineFixture({
+      events: [
+        event.turnStarted({ turnId: "turn-1", createdAt: 0 }),
+        event.commandStarted({
+          turnId: "turn-1",
+          itemId: "cmd-1",
+          command: "ls -la ~/.claude/ide",
+          presentation: SANDBOX_ESCAPED_COMMAND_PRESENTATION,
+          createdAt: 1_000,
+        }),
+        event.commandCompleted({
+          turnId: "turn-1",
+          itemId: "cmd-1",
+          command: "ls -la ~/.claude/ide",
+          presentation: SANDBOX_ESCAPED_COMMAND_PRESENTATION,
+          exitCode: 0,
+          createdAt: 2_000,
+        }),
+      ],
+      projectionOptions: { threadStatus: "idle", turnMessageDetail: "full" },
+    });
+
+    const row = workRow(rendered.rows, "command", "cmd-1");
+    expect(row.presentation).toEqual(SANDBOX_ESCAPED_COMMAND_PRESENTATION);
+    expect(plainTitle(row)).toContain("(Outside of sandbox)");
   });
 
   it("groups v3 exploration rows into one exploration bundle like legacy reads", () => {

@@ -1,51 +1,60 @@
-import type { Thread } from "@bb/domain";
+import { isStandaloneBuiltinClearCommand, type Thread } from "@bb/domain";
 import type {
   SendMessageRequest,
   SendMessageResponse,
 } from "@bb/server-contract";
 import type { LoggedPendingInteractionWorkSessionDeps } from "../../types.js";
 import { attemptDispatch } from "./dispatch-attempt.js";
+import { requireThreadCommandEnvironment } from "./thread-command-environment.js";
+import { sendThreadMessage } from "./thread-send.js";
+import { assertThreadHostAcceptsWork } from "./thread-host-admission.js";
+import { runWithTurnTrace } from "../system/turn-trace.js";
 
 interface AcceptThreadSendRequestArgs {
   payload: SendMessageRequest;
   thread: Thread;
 }
 
-/**
- * Takes a public `send` request (the `/threads/:id/send` route, `bb thread
- * tell`, `sdk.threads.send`) and runs it through the dispatch checkpoint.
- *
- * There is nothing left here to decide. What used to be a four-way routing
- * decision — queue it, defer it behind an interaction, hold it back, or
- * send it — was four spellings of "this cannot run yet", and the checkpoint
- * answers all four with one typed wait on one queued row. So this function's
- * whole job is now to translate the attempt's outcome into the wire response.
- */
 export async function acceptThreadSendRequest(
   deps: LoggedPendingInteractionWorkSessionDeps,
   args: AcceptThreadSendRequestArgs,
 ): Promise<SendMessageResponse> {
-  const outcome = await attemptDispatch(deps, {
-    thread: args.thread,
-    payload: args.payload,
-    source: { kind: "inline" },
-    queuePayload: { kind: "inline" },
-    origin: null,
-    originPluginId: null,
-    startedOnBehalfOf: null,
-    trigger: "user",
-  });
+  assertThreadHostAcceptsWork(deps.db, args.thread);
+  if (isStandaloneBuiltinClearCommand(args.payload.input)) {
+    const environment = await requireThreadCommandEnvironment(deps, {
+      thread: args.thread,
+    });
+    await sendThreadMessage(deps, {
+      environment,
+      payload: args.payload,
+      thread: args.thread,
+      trigger: "user",
+    });
+    return { ok: true, delivery: "sent" };
+  }
+
+  const outcome = await runWithTurnTrace(
+    deps,
+    { threadId: args.thread.id },
+    () =>
+      attemptDispatch(deps, {
+        thread: args.thread,
+        payload: args.payload,
+        source: { kind: "inline" },
+        queuePayload: { kind: "inline" },
+        pluginSubmission: args.payload.pluginSubmission ?? null,
+        origin: null,
+        originPluginId: null,
+        startedOnBehalfOf: null,
+        trigger: "user",
+      }),
+  );
   if (outcome.kind === "dispatched") {
     return { ok: true, delivery: "sent" };
   }
   return {
     ok: true,
     delivery: "queued",
-    queuedMessageId: outcome.entry.id,
-    // A queued row's `waitingOn` is null only when a drain cleared its wait
-    // and is about to re-attempt it — a state this row, just written by the
-    // attempt above, cannot be in. The fallback narrows the type honestly.
-    waitingOn: outcome.entry.waitingOn ?? { kind: "thread-busy" },
-    sendAt: outcome.entry.sendAt,
+    queuedMessage: outcome.entry,
   };
 }

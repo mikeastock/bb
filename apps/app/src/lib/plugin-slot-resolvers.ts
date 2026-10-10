@@ -132,6 +132,23 @@ export function resolveComposerPlusMenuItems(
   return resolved;
 }
 
+export function resolveComposerSendMenuItems(
+  customizations: readonly PluginComposerCustomizationSlot[],
+  scopeKind: PluginComposerScope["kind"],
+): readonly ResolvedComposerPlusMenuItem[] {
+  const resolved: ResolvedComposerPlusMenuItem[] = [];
+  for (const customization of customizations) {
+    if (!composerCustomizationApplies(customization, scopeKind)) continue;
+    for (const item of customization.sendMenu ?? []) {
+      resolved.push({
+        ...resolvedComposerContribution(customization, item.id),
+        item,
+      });
+    }
+  }
+  return resolved;
+}
+
 export function resolveComposerEditorEffects(
   customizations: readonly PluginComposerCustomizationSlot[],
   scopeKind: PluginComposerScope["kind"],
@@ -183,12 +200,23 @@ export function resolveTimelineRenderer(
   registrations: readonly PluginTimelineRendererSlot[],
   target:
     | { kind: "extension"; extensionKind: string }
+    | { kind: "form"; pluginId: string; rendererId: string }
     | { kind: "tool"; providerPluginId: string | null },
 ): PluginTimelineRendererSlot | null {
   if (target.kind === "extension") {
     return (
       registrations.find(
         (registration) => registration.kind === target.extensionKind,
+      ) ?? null
+    );
+  }
+  if (target.kind === "form") {
+    const kind = `${target.pluginId}/${target.rendererId}`;
+    return (
+      registrations.find(
+        (registration) =>
+          registration.pluginId === target.pluginId &&
+          registration.kind === kind,
       ) ?? null
     );
   }
@@ -317,3 +345,21 @@ export function resolveFileOpenerReplacement(args: {
         buildFileOpenerRef(candidate) === preference),
   );
 }
+
+export function resolveComposerPopups(
+  customizations: readonly PluginComposerCustomizationSlot[],
+  scopeKind: PluginComposerScope["kind"],
+) {
+  return customizations.flatMap((customization) =>
+    composerCustomizationApplies(customization, scopeKind)
+      ? (customization.experimental_popups ?? []).map((popup) => ({
+          ...resolvedComposerContribution(customization, popup.id),
+          popup,
+        }))
+      : [],
+  );
+}
+
+export type ResolvedComposerPopup = ReturnType<
+  typeof resolveComposerPopups
+>[number];

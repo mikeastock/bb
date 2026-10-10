@@ -41,7 +41,7 @@ import {
   makePullRequest,
   makeWorkspaceStatus,
 } from "./ThreadMetadataContent.fixtures";
-import { resolveRightPanelFileVisual } from "./rightPanelFileVisuals";
+import { resolveRightPanelFileIconName } from "./rightPanelFileVisuals";
 import { useThreadStorageBrowser } from "./useThreadStorageBrowser";
 import { FilePreview } from "./FilePreview";
 import { threadListQueryKey } from "@/hooks/queries/query-keys";
@@ -216,6 +216,7 @@ function RepresentativeInfoContent() {
     files: INFO_STORAGE_FILES,
     onSelectPath: setSelectedStoragePath,
     selectedPath: selectedStoragePath,
+    threadId: "thr_story",
   });
   const props: ThreadMetadataContentProps = {
     ...baseMetadataProps,
@@ -228,7 +229,6 @@ function RepresentativeInfoContent() {
     storage: {
       controller: storageController,
       filesError: null,
-      isFilesLoading: false,
     },
     onCommitClick: noop,
   };
@@ -409,12 +409,15 @@ function FileTabsShellInner({
     () =>
       openFiles.map((filename) => {
         const tab = createStoryFileTab(filename);
-        const visual = resolveRightPanelFileVisual({ path: filename });
         return {
           label: filename,
           isPinned: filename === pinnedFilename,
           leadingVisual: (
-            <Icon name={visual.iconName} className="size-3.5" aria-hidden />
+            <Icon
+              name={resolveRightPanelFileIconName(filename)}
+              className="size-3.5"
+              aria-hidden
+            />
           ),
           statusLabel: null,
           onSelect: () => setActiveFilename(filename),
@@ -427,10 +430,7 @@ function FileTabsShellInner({
   );
 
   return (
-    <PanelStage
-      width={stage}
-      height={stage === "shelf" ? "info" : "compact"}
-    >
+    <PanelStage width={stage} height={stage === "shelf" ? "info" : "compact"}>
       <ThreadSecondaryPanel
         activeTab={activeTab}
         canUseGitUi
@@ -753,7 +753,7 @@ export function Overview() {
     <StoryCard>
       <StoryRow
         label="thread"
-        hint="tab strip shows Info + Diff (Diff is exercised in the right-panel/Diff story)"
+        hint="tab strip shows Info + Diff (Diff is exercised in the right-panel/Diff File Card story)"
       >
         <ShellRow initialPanel="thread-info" />
       </StoryRow>

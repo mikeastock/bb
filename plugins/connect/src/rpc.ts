@@ -5,18 +5,11 @@ import {
   type DesktopSession,
   type ListAccountServersResult,
 } from "@bb/connect-client";
-import { ConnectPairError } from "./redeem.js";
 import type { ConnectTunnel } from "./tunnel.js";
-import type { ConnectStatus } from "./types.js";
+import type { ConnectStatus, ShareListing } from "./types.js";
 import { MachineCodeError, type MachineCode } from "./machine-code.js";
 import type { ShareHostResolver } from "./hosts.js";
-import type { ShareListing } from "./shares.js";
-
-const pairInputSchema = z.object({
-  code: z.string().min(1),
-  server: z.string().url().optional(),
-  baseUrl: z.string().url().optional(),
-});
+import type { HostedConnectApi } from "./hosted.js";
 
 const portInputSchema = z
   .object({
@@ -26,7 +19,7 @@ const portInputSchema = z
   .strict();
 const revokeMachineInputSchema = z.object({ machineId: z.string().min(1) });
 
-const connectShareStatusSchema = z
+const shareListingSchema: z.ZodType<ShareListing> = z
   .object({
     hostId: z.string(),
     hostName: z.string(),
@@ -41,6 +34,7 @@ const connectStatusSchema: z.ZodType<ConnectStatus> = z
   .object({
     state: z.enum(["disconnected", "pairing", "connected", "reconnecting"]),
     paired: z.boolean(),
+    enabled: z.boolean(),
     handle: z.string().nullable(),
     url: z.string().nullable(),
     dashboardUrl: z.string(),
@@ -49,18 +43,7 @@ const connectStatusSchema: z.ZodType<ConnectStatus> = z
     since: z.number(),
     remoteClients: z.number().int(),
     lastRemoteActivityAt: z.number().nullable(),
-    shares: z.array(connectShareStatusSchema),
-  })
-  .strict();
-
-const shareListingSchema: z.ZodType<ShareListing> = z
-  .object({
-    hostId: z.string(),
-    hostName: z.string(),
-    port: z.number().int(),
-    createdAt: z.number(),
-    url: z.string(),
-    unavailableReason: z.string().optional(),
+    shares: z.array(shareListingSchema),
   })
   .strict();
 
@@ -93,12 +76,6 @@ const desktopSessionSchema: z.ZodType<DesktopSession> = z
   })
   .strict();
 
-const mobilePairingSchema = z
-  .object({
-    enabled: z.boolean(),
-  })
-  .strict();
-
 const machineCodeSchema: z.ZodType<MachineCode> = z
   .object({
     code: z.string(),
@@ -108,9 +85,11 @@ const machineCodeSchema: z.ZodType<MachineCode> = z
   .strict();
 
 export const connectRpcContract = defineRpcContract({
-  pair: { input: pairInputSchema, output: connectStatusSchema },
   status: { input: z.null(), output: connectStatusSchema },
-  disconnect: { input: z.null(), output: connectStatusSchema },
+  setRemoteAccess: {
+    input: z.object({ enabled: z.boolean() }).strict(),
+    output: connectStatusSchema,
+  },
   expose: { input: portInputSchema, output: shareListingSchema },
   unexpose: {
     input: portInputSchema,
@@ -123,13 +102,16 @@ export const connectRpcContract = defineRpcContract({
       })
       .strict(),
   },
+  unexposeAll: {
+    input: z.object({ hostId: z.string().min(1) }).strict(),
+    output: z.object({ removed: z.number().int().nonnegative() }).strict(),
+  },
   listShares: { input: z.null(), output: z.array(shareListingSchema) },
   listAccountServers: {
     input: z.null(),
     output: listAccountServersResultSchema,
   },
   createDesktopSession: { input: z.null(), output: desktopSessionSchema },
-  mobilePairing: { input: z.null(), output: mobilePairingSchema },
   createMachineCode: { input: z.null(), output: machineCodeSchema },
   revokeMachine: {
     input: revokeMachineInputSchema,
@@ -139,35 +121,45 @@ export const connectRpcContract = defineRpcContract({
 
 type ConnectRpcHandlers = PluginRpcHandlers<typeof connectRpcContract>;
 
-export interface MobilePairingGate {
-  enabled(): Promise<boolean>;
+async function rethrowErrorCode<T>(
+  operation: () => Promise<T>,
+  isCoded: (error: unknown) => error is { code: string },
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isCoded(error)) throw new Error(error.code);
+    throw error;
+  }
 }
 
-export function createRpcHandlers(
-  tunnel: ConnectTunnel,
-  hostResolver: ShareHostResolver,
-  mobilePairing: MobilePairingGate,
-): ConnectRpcHandlers {
+export interface RemoteAccessSwitch {
+  set(enabled: boolean): Promise<ConnectStatus>;
+}
+
+export function createRpcHandlers(args: {
+  tunnel: ConnectTunnel;
+  hosted: HostedConnectApi;
+  hostResolver: ShareHostResolver;
+  remoteAccess: RemoteAccessSwitch;
+}): ConnectRpcHandlers {
+  const { tunnel, hosted, hostResolver, remoteAccess } = args;
+  const identity = () => {
+    const current = tunnel.getIdentity();
+    if (current === null) {
+      throw new ConnectListError(
+        "not_paired",
+        "this bb isn't signed in to a bb account — run `bb account login`",
+      );
+    }
+    return current;
+  };
   return {
-    async pair(args) {
-      try {
-        return await tunnel.pair({
-          code: args.code,
-          ...(args.server !== undefined ? { serverUrl: args.server } : {}),
-          ...(args.baseUrl !== undefined ? { baseUrl: args.baseUrl } : {}),
-        });
-      } catch (error) {
-        if (error instanceof ConnectPairError) {
-          throw new Error(error.code);
-        }
-        throw error;
-      }
-    },
     async status() {
       return tunnel.refreshStatus();
     },
-    async disconnect() {
-      return tunnel.disconnect();
+    async setRemoteAccess(args) {
+      return remoteAccess.set(args.enabled);
     },
     async expose(args) {
       const host =
@@ -182,44 +174,41 @@ export function createRpcHandlers(
         args.hostId ?? (await hostResolver.serverHostId()),
       );
     },
+    async unexposeAll(args) {
+      return tunnel.unexposeAll(args.hostId);
+    },
     async listShares() {
       return tunnel.listShares();
     },
     async listAccountServers() {
-      try {
-        return await tunnel.listAccountServers();
-      } catch (error) {
-        if (error instanceof ConnectListError) {
-          throw new Error(error.code);
-        }
-        throw error;
-      }
+      return rethrowErrorCode(
+        () => hosted.listAccountServers(identity()),
+        (error) => error instanceof ConnectListError,
+      );
     },
     async createDesktopSession() {
-      try {
-        return await tunnel.createDesktopSession();
-      } catch (error) {
-        if (error instanceof ConnectListError) {
-          throw new Error(error.code);
-        }
-        throw error;
-      }
-    },
-    async mobilePairing() {
-      return { enabled: await mobilePairing.enabled() };
+      return rethrowErrorCode(
+        () => {
+          identity();
+          return hosted.createDesktopSession();
+        },
+        (error) => error instanceof ConnectListError,
+      );
     },
     async createMachineCode() {
-      try {
-        return await tunnel.createMachineCode();
-      } catch (error) {
-        if (error instanceof MachineCodeError) {
-          throw new Error(error.code);
-        }
-        throw error;
-      }
+      return rethrowErrorCode(
+        () => {
+          if (tunnel.getIdentity() === null) {
+            throw new MachineCodeError("not_paired");
+          }
+          return hosted.createMachineCode(AbortSignal.timeout(10_000));
+        },
+        (error) => error instanceof MachineCodeError,
+      );
     },
     async revokeMachine(args) {
-      await tunnel.revokeMachine(args.machineId);
+      if (tunnel.getIdentity() === null) throw new Error("not_paired");
+      await hosted.revokeMachine(args.machineId);
       return { ok: true };
     },
   };

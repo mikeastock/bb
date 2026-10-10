@@ -1,15 +1,12 @@
 import { useState } from "react";
-import {
-  UrlLink as UrlLink,
-  useBbNavigate,
-  useRpc,
-} from "@get-bb/plugin-sdk/app";
+import { UrlLink, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { DelegationRpcContract } from "../../delegate/contract.js";
 import type {
   Preset,
   TaskPullRequest,
   TaskThread,
 } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   PR_STATE_META,
   THREAD_STATUS_META,
@@ -17,18 +14,21 @@ import {
   isActiveThread,
 } from "./meta.js";
 import { PresetDialog, savePresetDraft } from "../manage/preset-dialog.js";
-import { ConfirmDialog } from "../../components/confirm-dialog.js";
+import {
+  ConfirmDeleteDialog,
+  ConfirmDeleteDialogContent,
+} from "@/components/ui/confirm-delete-dialog";
 import { useTasksRpc } from "../../shell/data.js";
-import { Button } from "@bb/shared-ui/button";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/dropdown-menu";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 
 function ThreadPullRequestPill({
   pullRequest,
@@ -169,7 +169,7 @@ export function DispatchControl({
     try {
       await rpc.call("delegate", { taskId, presetId });
     } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
+      onError(errorMessage(error));
     } finally {
       setDispatching(false);
     }
@@ -293,7 +293,7 @@ export function ThreadsSection({
     try {
       await onDetach(thread);
     } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
+      onError(errorMessage(error));
     } finally {
       setPending((current) => {
         const next = new Set(current);
@@ -330,22 +330,28 @@ export function ThreadsSection({
           onDetach={() => setConfirm(thread)}
         />
       ))}
-      <ConfirmDialog
+      <ConfirmDeleteDialog
+        className="max-w-sm"
         open={confirm !== null}
         onOpenChange={(open) => {
           if (!open) setConfirm(null);
         }}
-        title="Detach thread?"
-        description={
-          confirm
-            ? `"${confirm.title}" will no longer be listed on this task. The thread itself is not deleted; re-attach it with bb tasks attach.`
-            : ""
-        }
-        confirmLabel="Detach"
-        onConfirm={() => {
-          if (confirm) void performDetach(confirm);
-        }}
-      />
+      >
+        {confirm ? (
+          <ConfirmDeleteDialogContent
+            title="Detach thread?"
+            description={`"${confirm.title}" will no longer be listed on this task. The thread itself is not deleted; re-attach it with bb tasks attach.`}
+            confirmLabel="Detach"
+            pending={false}
+            size="sm"
+            onCancel={() => setConfirm(null)}
+            onConfirm={() => {
+              setConfirm(null);
+              void performDetach(confirm);
+            }}
+          />
+        ) : null}
+      </ConfirmDeleteDialog>
     </section>
   );
 }

@@ -13,6 +13,7 @@ const mockUseThreadDetailBootstrap = vi.hoisted(() => vi.fn());
 const commandHandlers = vi.hoisted(() => new Map<string, () => boolean>());
 
 vi.mock("@/components/commands/AppCommandProvider", () => ({
+  useIndexedAppCommandHandlers: () => {},
   useAppCommandHandler: (command: string, handler: () => boolean) => {
     commandHandlers.set(command, handler);
   },
@@ -30,13 +31,13 @@ vi.mock("@/components/sidebar/AppSidebar", () => ({
 }));
 
 vi.mock("@/hooks/queries/system-queries", () => ({
+  useUiPreferences: () => ({ data: undefined, isError: false }),
   useSystemConfig: () => ({
     data: {
       experiments: {
         changelogPreview: false,
-        editMessages: false,
-        mobileApp: false,
-        timelineWindowing: false,
+        serverMove: false,
+        performanceDiagnostics: false,
       },
     },
   }),
@@ -47,11 +48,17 @@ vi.mock("@/hooks/useHostDaemon", () => ({
   useLocalHostDaemonAccess: () => ({ accessState: "unavailable" }),
 }));
 
+vi.mock("@/hooks/usePluginSafeModeCommands", () => ({
+  usePluginSafeModeCommands: () => undefined,
+}));
+
 vi.mock("@/components/project/ProjectActionsProvider", () => ({
   ProjectActionsProvider: ({ children }: { children: ReactNode }) => (
     <>{children}</>
   ),
 }));
+
+vi.mock("@/hooks/mutations/thread-state-mutations", () => ({}));
 
 vi.mock("@/components/thread/ThreadActionsProvider", () => ({
   ThreadActionsProvider: ({ children }: { children: ReactNode }) => (
@@ -89,8 +96,8 @@ vi.mock("@/lib/bb-desktop", () => ({
   DEFAULT_DESKTOP_WINDOW_STATE: { isFullScreen: false },
   MACOS_CHROME_CONTROL_AXIS_CLASS: "",
   MACOS_CHROME_CONTROL_NO_DRAG_CLASS: "",
-  MACOS_CHROME_TRAFFIC_LIGHT_AXIS_NUDGE_CLASS: "",
   MACOS_TRAFFIC_LIGHT_RESERVE_OFFSET_CLASS: "",
+  MACOS_TRAFFIC_LIGHT_RESERVE_PADDING_CLASS: "",
   MACOS_WINDOW_DRAG_CLASS: "",
   MACOS_WINDOW_NO_DRAG_CLASS: "",
   getBbDesktopInfo: () => null,
@@ -154,7 +161,6 @@ vi.mock("@/hooks/queries/thread-queries", () => ({
   useThreadDetailBootstrap: (...args: unknown[]) =>
     mockUseThreadDetailBootstrap(...args),
   useThreadPendingInteractions: () => ({ data: undefined }),
-  getLatestPendingInteraction: () => null,
 }));
 
 describe("AppLayout root compose project preference", () => {

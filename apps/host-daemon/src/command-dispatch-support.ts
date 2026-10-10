@@ -1,29 +1,35 @@
-import type { AgentRuntimeBridgeLaunch } from "@bb/agent-runtime";
+import type { DesktopBrowserBroker } from "./desktop-browser-broker.js";
+import {
+  CompetingTurnError,
+  type AgentRuntimeBridgeLaunch,
+} from "@bb/agent-runtime";
 import type { AvailableModel } from "@bb/domain";
-import type { EventSinkInput } from "./event-sink.js";
-import type {
-  HostDaemonCommand,
-  ProviderHealthResult,
-  ProviderUsageResult,
-  HostDaemonBridgeLaunch,
-  HostDaemonInjectedSkillSource,
-  HostDaemonOnlineRpcCommand,
-  HostDaemonConnectTunnelIdentity,
-  WorkspaceContext,
+import type { EventSink } from "./event-sink.js";
+import {
+  COMPETING_TURN_ERROR_CODE,
+  type EnvironmentHookProgressMessage,
+  type HostDaemonCommand,
+  type ProviderHealthResult,
+  type ProviderUsageResult,
+  type HostDaemonBridgeLaunch,
+  type HostDaemonInjectedSkillSource,
+  type HostDaemonOnlineRpcCommand,
+  type HostDaemonConnectTunnelIdentity,
+  type WorkspaceContext,
 } from "@bb/host-daemon-contract";
+import { BRIDGE_JSON_RPC_ERRORS } from "@bb/provider-bridge-protocol";
 import type {
   ProviderInstallationCommand,
   ProviderInstallationRunResult,
   ProviderInstallationStatus,
 } from "@bb/provider-bridge-protocol";
-import { getPersonalWorkspaceRoot } from "@bb/host-workspace";
 import { ensurePluginProcessDataDir } from "@bb/process-utils";
 import type { InteractiveResolveCommandInput } from "./interactive-request-registry.js";
 import { RuntimeManager, type RuntimeEntry } from "./runtime-manager.js";
-import type { TerminalManager } from "./terminals/terminal-manager.js";
 import type { FetchProjectAttachment } from "./project-attachments.js";
 import type { FetchSkillTree } from "./skill-trees.js";
 import type { HostDaemonLogger } from "./logger.js";
+import type { ServerMoveService } from "./server-move/service.js";
 import {
   ensureCachedPluginHostArtifact,
   type FetchPluginHostArtifact,
@@ -36,25 +42,18 @@ export type CommandOf<TType extends DispatchCommand["type"]> = Extract<
   { type: TType }
 >;
 
-export interface EventSink {
-  emit: (event: EventSinkInput) => void;
-  flush: () => Promise<void>;
-}
-
-export const noopEventSink: EventSink = {
-  emit: () => undefined,
-  flush: async () => undefined,
-};
-
 export interface CommandDispatchOptions {
+  emitEnvironmentHookProgress?: (
+    message: EnvironmentHookProgressMessage,
+  ) => void;
+  desktopBrowserBroker?: DesktopBrowserBroker;
   dataDir: string;
   logger: Pick<HostDaemonLogger, "debug" | "warn">;
   fetchProjectAttachment: FetchProjectAttachment;
   fetchSkillTree?: FetchSkillTree;
   fetchPluginHostArtifact?: FetchPluginHostArtifact;
   runtimeManager: RuntimeManager;
-  terminalManager?: Pick<TerminalManager, "closeEnvironmentTerminals">;
-  eventSink: EventSink;
+  eventSink: Pick<EventSink, "emit" | "flush">;
   listModels: (args: {
     providerId: string;
     bridgeLaunch: AgentRuntimeBridgeLaunch;
@@ -78,6 +77,7 @@ export interface CommandDispatchOptions {
     bridgeLaunch: AgentRuntimeBridgeLaunch;
     cwd?: string;
     requirement?: "thread_rewind";
+    checkUpdates?: boolean;
   }) => Promise<ProviderInstallationStatus>;
   providerInstallationRun: (args: {
     providerId: string;
@@ -90,11 +90,12 @@ export interface CommandDispatchOptions {
     plan: ProviderInstallationCommand;
     env?: NodeJS.ProcessEnv;
   }) => ReadableStream<Uint8Array>;
-  refreshShellEnv: () => Promise<void>;
+  refreshShellEnv: (args: { allowStale: boolean }) => Promise<void>;
   resolveInteractiveRequest?: (
     request: InteractiveResolveCommandInput,
   ) => Promise<void>;
   ensureConnectTunnelIdentity?: () => Promise<HostDaemonConnectTunnelIdentity>;
+  serverMove?: ServerMoveService;
   threadStorageRootPath: string;
 }
 
@@ -186,6 +187,12 @@ export function getErrorCode(error: unknown): string {
   if (error instanceof CommandDispatchError) {
     return error.code;
   }
+  if (error instanceof CompetingTurnError) {
+    return COMPETING_TURN_ERROR_CODE;
+  }
+  if (isBridgeMissingExecutableError(error)) {
+    return "missing_executable";
+  }
   if (isStructuredSpawnMissingExecutableError(error)) {
     return "missing_executable";
   }
@@ -200,6 +207,14 @@ export function getErrorCode(error: unknown): string {
     return "missing_executable";
   }
   return "command_failed";
+}
+
+function isBridgeMissingExecutableError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === BRIDGE_JSON_RPC_ERRORS.MISSING_EXECUTABLE
+  );
 }
 
 function isStructuredSpawnMissingExecutableError(error: unknown): boolean {
@@ -229,7 +244,6 @@ function isMessageOnlySpawnMissingExecutableError(error: unknown): boolean {
 
 export async function requireWorkspaceEnvironment(
   args: {
-    dataDir?: string;
     environmentId: string;
     injectedSkillSources?: readonly HostDaemonInjectedSkillSource[];
     targetThreadId?: string;
@@ -256,10 +270,6 @@ export async function requireWorkspaceEnvironment(
     ...(args.targetThreadId !== undefined
       ? { targetThreadId: args.targetThreadId }
       : {}),
-    ...(args.dataDir
-      ? { personalWorkspaceRoot: getPersonalWorkspaceRoot(args.dataDir) }
-      : {}),
     workspacePath: args.workspaceContext.workspacePath,
-    workspaceProvisionType: args.workspaceContext.workspaceProvisionType,
   });
 }

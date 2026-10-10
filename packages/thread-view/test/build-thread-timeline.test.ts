@@ -14,6 +14,7 @@ import type {
   TimelineApprovalWorkRow,
   ThreadContextWindowUsage,
   TimelineFileChangeWorkRow,
+  TimelineImageGenerationWorkRow,
   TimelineImageViewWorkRow,
   TimelineParentChange,
   TimelineQuestionWorkRow,
@@ -29,10 +30,14 @@ import {
   type ThreadEventWithMeta,
 } from "../src/index.js";
 import { EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT } from "../src/accepted-client-request-context.js";
+import type { AcceptedClientRequestContext } from "../src/accepted-client-request-context.js";
 import { parseOperationMessage } from "../src/parse-operation-message.js";
 import {
   createTimelineEventFactory,
   fromRows,
+  renderTimelineFixture,
+  rowsOfKind,
+  workRowsOfKind,
 } from "./timeline-test-harness.js";
 
 interface ContextWindowUsageEventArgs {
@@ -66,6 +71,13 @@ interface ImageViewItemEventArgs {
   itemId?: string;
   path?: string;
   seq: number;
+  type: "item/completed" | "item/started";
+}
+
+interface ImageGenerationItemEventArgs {
+  itemId?: string;
+  seq: number;
+  status?: ThreadEventItemStatus;
   type: "item/completed" | "item/started";
 }
 
@@ -335,6 +347,45 @@ function imageViewItemEvent({
         type: "imageView",
         id: itemId,
         path,
+      },
+    },
+    meta: {
+      id: `event-${seq}`,
+      seq,
+      createdAt: seq,
+    },
+  };
+}
+
+function imageGenerationItemEvent({
+  itemId = "image-generation-1",
+  seq,
+  status,
+  type,
+}: ImageGenerationItemEventArgs): ThreadEventWithMeta {
+  return {
+    event: {
+      type,
+      threadId: "thread-1",
+      providerThreadId: "provider-thread-1",
+      scope: turnScope("turn-1"),
+      item: {
+        type: "imageGeneration",
+        id: itemId,
+        status: status ?? (type === "item/completed" ? "completed" : "pending"),
+        prompt: "Draw a blue circle",
+        path: "/tmp/generated.png",
+        result: "encoded-image-result",
+        error: null,
+        transparentBackground: false,
+        presentation: {
+          label: {
+            pending: "Generating image",
+            completed: "Generated image",
+          },
+          icon: { glyph: "Palette" },
+          title: "generated.png",
+        },
       },
     },
     meta: {
@@ -680,12 +731,12 @@ function buildContextWindowUsage(
     contextWindowEvents,
     events: [],
     options: {
+      completedTurnDisplay: "collapse",
       includeNestedRows: false,
-      includeProviderUnhandledOperations: false,
+      includeDiagnosticOperations: false,
       isLatestPage: true,
       threadStatus: "idle",
       threadName: "",
-      turnMessageDetail: "summary",
       workspaceRoot: null,
     },
   }).contextWindowUsage;
@@ -695,248 +746,78 @@ function buildTimelineRows(
   events: ThreadEventWithMeta[],
   threadStatus: BuildTimelineRowsThreadStatus = "idle",
   workspaceRoot: string | null = null,
+  acceptedClientRequestContext: AcceptedClientRequestContext = EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
 ): TimelineRow[] {
   return buildThreadTimelineFromEvents({
-    acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
+    acceptedClientRequestContext,
     contextWindowEvents: [],
     events,
     options: {
+      completedTurnDisplay: "collapse",
       includeNestedRows: true,
-      includeProviderUnhandledOperations: false,
+      includeDiagnosticOperations: false,
       isLatestPage: true,
       threadStatus,
       threadName: "",
-      turnMessageDetail: "full",
       workspaceRoot,
     },
   }).rows;
 }
 
-function buildTimelineRowsWithAcceptedContext(
-  events: ThreadEventWithMeta[],
-  acceptedClientRequestEvents: ThreadEventWithMeta[],
-): TimelineRow[] {
-  return buildThreadTimelineFromEvents({
-    acceptedClientRequestContext: {
-      acceptedClientRequestEvents,
-      rejectedClientRequestEvents: [],
-    },
-    contextWindowEvents: [],
-    events,
-    options: {
-      includeNestedRows: true,
-      includeProviderUnhandledOperations: false,
-      isLatestPage: true,
-      threadStatus: "idle",
-      threadName: "",
-      turnMessageDetail: "full",
-      workspaceRoot: null,
-    },
-  }).rows;
-}
-
-function buildTimelineRowsWithRejectedContext(
-  events: ThreadEventWithMeta[],
-  rejectedClientRequestEvents: ThreadEventWithMeta[],
-): TimelineRow[] {
-  return buildThreadTimelineFromEvents({
-    acceptedClientRequestContext: {
-      acceptedClientRequestEvents: [],
-      rejectedClientRequestEvents,
-    },
-    contextWindowEvents: [],
-    events,
-    options: {
-      includeNestedRows: true,
-      includeProviderUnhandledOperations: false,
-      isLatestPage: true,
-      threadStatus: "idle",
-      threadName: "",
-      turnMessageDetail: "full",
-      workspaceRoot: null,
-    },
-  }).rows;
-}
-
-function isFileChangeRow(row: TimelineRow): row is TimelineFileChangeWorkRow {
-  return row.kind === "work" && row.workKind === "file-change";
-}
-
-function isToolRow(row: TimelineRow): row is TimelineToolWorkRow {
-  return row.kind === "work" && row.workKind === "tool";
-}
-
 function collectFileChangeRows(
   rows: readonly TimelineRow[],
 ): TimelineFileChangeWorkRow[] {
-  const fileChangeRows: TimelineFileChangeWorkRow[] = [];
-  for (const row of rows) {
-    if (isFileChangeRow(row)) {
-      fileChangeRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      fileChangeRows.push(...collectFileChangeRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      fileChangeRows.push(...collectFileChangeRows(row.childRows));
-    }
-  }
-  return fileChangeRows;
+  return workRowsOfKind(rows, "file-change");
 }
 
 function collectToolRows(rows: readonly TimelineRow[]): TimelineToolWorkRow[] {
-  const toolRows: TimelineToolWorkRow[] = [];
-  for (const row of rows) {
-    if (isToolRow(row)) {
-      toolRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      toolRows.push(...collectToolRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      toolRows.push(...collectToolRows(row.childRows));
-    }
-  }
-  return toolRows;
+  return workRowsOfKind(rows, "tool");
 }
 
 function collectDelegationRows(
   rows: readonly TimelineRow[],
 ): TimelineDelegationWorkRow[] {
-  const delegationRows: TimelineDelegationWorkRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "work" && row.workKind === "delegation") {
-      delegationRows.push(row);
-      delegationRows.push(...collectDelegationRows(row.childRows));
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      delegationRows.push(...collectDelegationRows(row.children));
-    }
-  }
-  return delegationRows;
+  return workRowsOfKind(rows, "delegation");
 }
 
 function collectWorkflowRows(
   rows: readonly TimelineRow[],
 ): TimelineWorkflowRow[] {
-  const workflowRows: TimelineWorkflowRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "work" && row.workKind === "workflow") {
-      workflowRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      workflowRows.push(...collectWorkflowRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      workflowRows.push(...collectWorkflowRows(row.childRows));
-    }
-  }
-  return workflowRows;
+  return workRowsOfKind(rows, "workflow");
 }
 
 function collectApprovalRows(
   rows: readonly TimelineRow[],
 ): TimelineApprovalWorkRow[] {
-  const approvalRows: TimelineApprovalWorkRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "work" && row.workKind === "approval") {
-      approvalRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      approvalRows.push(...collectApprovalRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      approvalRows.push(...collectApprovalRows(row.childRows));
-    }
-  }
-  return approvalRows;
+  return workRowsOfKind(rows, "approval");
 }
 
 function collectQuestionRows(
   rows: readonly TimelineRow[],
 ): TimelineQuestionWorkRow[] {
-  const questionRows: TimelineQuestionWorkRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "work" && row.workKind === "question") {
-      questionRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      questionRows.push(...collectQuestionRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      questionRows.push(...collectQuestionRows(row.childRows));
-    }
-  }
-  return questionRows;
+  return workRowsOfKind(rows, "question");
 }
 
 function collectImageViewRows(
   rows: readonly TimelineRow[],
 ): TimelineImageViewWorkRow[] {
-  const imageViewRows: TimelineImageViewWorkRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "work" && row.workKind === "image-view") {
-      imageViewRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      imageViewRows.push(...collectImageViewRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      imageViewRows.push(...collectImageViewRows(row.childRows));
-    }
-  }
-  return imageViewRows;
+  return workRowsOfKind(rows, "image-view");
+}
+
+function collectImageGenerationRows(
+  rows: readonly TimelineRow[],
+): TimelineImageGenerationWorkRow[] {
+  return workRowsOfKind(rows, "image-generation");
 }
 
 function collectConversationRows(
   rows: readonly TimelineRow[],
 ): TimelineConversationRow[] {
-  const conversationRows: TimelineConversationRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "conversation") {
-      conversationRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      conversationRows.push(...collectConversationRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      conversationRows.push(...collectConversationRows(row.childRows));
-    }
-  }
-  return conversationRows;
+  return rowsOfKind(rows, "conversation");
 }
 
 function collectSystemRows(rows: readonly TimelineRow[]): TimelineSystemRow[] {
-  const systemRows: TimelineSystemRow[] = [];
-  for (const row of rows) {
-    if (row.kind === "system") {
-      systemRows.push(row);
-      continue;
-    }
-    if (row.kind === "turn" && row.children) {
-      systemRows.push(...collectSystemRows(row.children));
-      continue;
-    }
-    if (row.kind === "work" && row.workKind === "delegation") {
-      systemRows.push(...collectSystemRows(row.childRows));
-    }
-  }
-  return systemRows;
+  return rowsOfKind(rows, "system");
 }
 
 function fileChangeRowIdByPath(
@@ -1021,6 +902,45 @@ describe("buildThreadTimelineFromEvents", () => {
     expect(row).not.toHaveProperty("statusLabels");
   });
 
+  it("hides a delivered tool result whose tool row is suppressed and shows one whose tool row is not", () => {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const subject = (toolName: string, suppress: boolean) => ({
+      kind: "tool-call" as const,
+      toolName,
+      suppress,
+    });
+    const fixture = renderTimelineFixture({
+      events: [
+        event.clientTurnRequested({ text: "start" }),
+        event.turnStarted({ turnId: "turn-1" }),
+        event.turnCompleted({ turnId: "turn-1" }),
+        event.clientTurnRequested({
+          initiator: "system",
+          systemMessageKind: "tool-result-delivered",
+          systemMessageSubject: subject("AskUserQuestion", true),
+          text: "Your earlier AskUserQuestion tool call has finished.",
+        }),
+        event.clientTurnRequested({
+          initiator: "system",
+          systemMessageKind: "tool-result-delivered",
+          systemMessageSubject: subject("grill_round", false),
+          text: "Your earlier grill_round tool call has finished.",
+        }),
+      ],
+      projectionOptions: {
+        threadStatus: "idle",
+        turnMessageDetail: "full",
+      },
+    });
+
+    const userRows = fixture.rows.filter(
+      (row) => row.kind === "conversation" && row.role === "user",
+    );
+    expect(
+      userRows.map((row) => row.kind === "conversation" && row.text),
+    ).toEqual(["start", "Your earlier grill_round tool call has finished."]);
+  });
+
   it("extracts the exact active Plan turn id from the accepted input scope", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
     const requestId = "creq_23456789ab";
@@ -1088,77 +1008,44 @@ describe("buildThreadTimelineFromEvents", () => {
     ).toBeNull();
   });
 
-  it("projects active Claude plan mode from an accepted plan command pill", () => {
-    const event = createTimelineEventFactory({ threadId: "thread-1" });
-    const requestId = "creq_23456789ab";
+  it.each(["claude-code", "codex"])(
+    "projects active %s plan mode from an accepted plan command pill",
+    (providerId) => {
+      const event = createTimelineEventFactory({ threadId: "thread-1" });
+      const requestId = "creq_23456789ab";
 
-    const timeline = buildThreadTimelineFromEvents({
-      acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
-      contextWindowEvents: [],
-      events: fromRows([
-        event.clientTurnRequested({
-          requestId,
-          text: "/plan inspect the failing command",
-          input: planPromptInput,
-        }),
-        event.turnStarted(),
-        event.inputAccepted({ clientRequestId: requestId }),
-      ]),
-      options: {
-        includeNestedRows: true,
-        includeProviderUnhandledOperations: false,
-        isLatestPage: true,
-        planCommand: { trigger: "/", name: "plan" },
-        providerId: "claude-code",
-        threadStatus: "active",
-        threadName: "",
-        turnMessageDetail: "full",
-        workspaceRoot: null,
-      },
-    });
+      const timeline = buildThreadTimelineFromEvents({
+        acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
+        contextWindowEvents: [],
+        events: fromRows([
+          event.clientTurnRequested({
+            requestId,
+            text: "/plan inspect the failing command",
+            input: planPromptInput,
+          }),
+          event.turnStarted(),
+          event.inputAccepted({ clientRequestId: requestId }),
+        ]),
+        options: {
+          completedTurnDisplay: "collapse",
+          includeNestedRows: true,
+          includeDiagnosticOperations: false,
+          isLatestPage: true,
+          planCommand: { trigger: "/", name: "plan" },
+          providerId,
+          threadStatus: "active",
+          threadName: "",
+          workspaceRoot: null,
+        },
+      });
 
-    expect(timeline.activePromptMode).toEqual({
-      mode: "plan",
-      providerId: "claude-code",
-      prompt: "inspect the failing command",
-    });
-  });
-
-  it("projects active Codex plan mode from an accepted plan command pill", () => {
-    const event = createTimelineEventFactory({ threadId: "thread-1" });
-    const requestId = "creq_23456789ab";
-
-    const timeline = buildThreadTimelineFromEvents({
-      acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
-      contextWindowEvents: [],
-      events: fromRows([
-        event.clientTurnRequested({
-          requestId,
-          text: "/plan inspect the failing command",
-          input: planPromptInput,
-        }),
-        event.turnStarted(),
-        event.inputAccepted({ clientRequestId: requestId }),
-      ]),
-      options: {
-        includeNestedRows: true,
-        includeProviderUnhandledOperations: false,
-        isLatestPage: true,
-        planCommand: { trigger: "/", name: "plan" },
-        providerId: "codex",
-        threadStatus: "active",
-        threadName: "",
-        turnMessageDetail: "full",
-        workspaceRoot: null,
-      },
-    });
-
-    expect(timeline.activePromptMode).toEqual({
-      mode: "plan",
-      providerId: "codex",
-      prompt: "inspect the failing command",
-    });
-  });
+      expect(timeline.activePromptMode).toEqual({
+        mode: "plan",
+        providerId,
+        prompt: "inspect the failing command",
+      });
+    },
+  );
 
   it("does not project active plan mode from plain text", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
@@ -1176,14 +1063,14 @@ describe("buildThreadTimelineFromEvents", () => {
         event.inputAccepted({ clientRequestId: requestId }),
       ]),
       options: {
+        completedTurnDisplay: "collapse",
         includeNestedRows: true,
-        includeProviderUnhandledOperations: false,
+        includeDiagnosticOperations: false,
         isLatestPage: true,
         planCommand: { trigger: "/", name: "plan" },
         providerId: "claude-code",
         threadStatus: "active",
         threadName: "",
-        turnMessageDetail: "full",
         workspaceRoot: null,
       },
     });
@@ -1209,14 +1096,14 @@ describe("buildThreadTimelineFromEvents", () => {
         event.turnCompleted(),
       ]),
       options: {
+        completedTurnDisplay: "collapse",
         includeNestedRows: true,
-        includeProviderUnhandledOperations: false,
+        includeDiagnosticOperations: false,
         isLatestPage: true,
         planCommand: { trigger: "/", name: "plan" },
         providerId: "claude-code",
         threadStatus: "idle",
         threadName: "",
-        turnMessageDetail: "full",
         workspaceRoot: null,
       },
     });
@@ -1479,7 +1366,9 @@ describe("buildThreadTimelineFromEvents", () => {
       throw new Error("Expected a delegation row");
     }
     expect(
-      collectWorkflowRows(delegation.childRows).map((row) => row.taskType),
+      collectWorkflowRows(delegation.childRows ?? []).map(
+        (row) => row.taskType,
+      ),
     ).toEqual(["local_workflow"]);
     expect(delegation.childRows).toEqual(
       expect.arrayContaining([
@@ -1523,14 +1412,14 @@ describe("buildThreadTimelineFromEvents", () => {
       contextWindowEvents: [],
       events,
       options: {
+        completedTurnDisplay: "collapse",
         includeNestedRows: true,
-        includeProviderUnhandledOperations: false,
+        includeDiagnosticOperations: false,
         isLatestPage: true,
         planCommand: { trigger: "/", name: "plan" },
         providerId: "claude-code",
         threadStatus: "idle",
         threadName: "",
-        turnMessageDetail: "full",
         workspaceRoot: null,
       },
     });
@@ -1649,6 +1538,87 @@ describe("buildThreadTimelineFromEvents", () => {
     });
   });
 
+  it("projects image generation without exposing its encoded result", () => {
+    const rows = buildTimelineRows([
+      turnStartedEvent({ seq: 1 }),
+      imageGenerationItemEvent({ seq: 2, type: "item/started" }),
+      imageGenerationItemEvent({ seq: 3, type: "item/completed" }),
+    ]);
+    const [row] = collectImageGenerationRows(rows);
+    if (!row) {
+      throw new Error("Expected an image generation row");
+    }
+
+    expect(row).toMatchObject({
+      workKind: "image-generation",
+      callId: "image-generation-1",
+      prompt: "Draw a blue circle",
+      path: "/tmp/generated.png",
+      status: "completed",
+      completedAt: 3,
+    });
+    expect(JSON.stringify(row)).not.toContain("encoded-image-result");
+    expect(
+      buildTimelineRowTitle(row, {
+        summaryStyle: "bundle",
+        workStyle: "default",
+      }).plain,
+    ).toContain("Generated image");
+  });
+
+  it("projects a legacy Codex image generation envelope as the same compact row", () => {
+    const rows = buildTimelineRows([
+      turnStartedEvent({ seq: 1 }),
+      {
+        event: {
+          type: "provider/unhandled",
+          threadId: "thread-1",
+          providerThreadId: "provider-thread-1",
+          providerId: "codex",
+          rawType: "item/completed",
+          rawEvent: {
+            jsonrpc: "2.0",
+            method: "item/completed",
+            params: {
+              threadId: "provider-thread-1",
+              turnId: "turn-1",
+              item: {
+                type: "imageGeneration",
+                id: "legacy-image-generation-1",
+                status: "completed",
+                revisedPrompt: "Draw an old image",
+                savedPath: "/tmp/legacy-generated.png",
+                result: "bounded-preview",
+                failure: null,
+              },
+            },
+          },
+          scope: turnScope("turn-1"),
+        },
+        meta: { id: "event-2", seq: 2, createdAt: 2 },
+      },
+    ]);
+    const [row] = collectImageGenerationRows(rows);
+    if (!row) {
+      throw new Error("Expected a legacy image generation row");
+    }
+
+    expect(row).toMatchObject({
+      workKind: "image-generation",
+      callId: "legacy-image-generation-1",
+      prompt: "Draw an old image",
+      path: "/tmp/legacy-generated.png",
+      status: "completed",
+    });
+    expect(JSON.stringify(row)).not.toContain("bounded-preview");
+    expect(
+      buildTimelineRowTitle(row, {
+        summaryStyle: "bundle",
+        workStyle: "default",
+      }).plain,
+    ).toBe("Generated image");
+  });
+
   it("interrupts a pending image view row when its turn is interrupted", () => {
     const rows = buildTimelineRows([
       turnStartedEvent({ seq: 1 }),
@@ -1763,6 +1733,40 @@ describe("buildThreadTimelineFromEvents", () => {
     ]);
   });
 
+  it("keeps an accepted steer's request seq as its message seq", () => {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const steerRequest = event.clientTurnRequested({
+      target: { kind: "steer", expectedTurnId: "turn-1" },
+      text: "Also check the tests",
+    });
+    const events = fromRows([
+      event.turnStarted({ turnId: "turn-1" }),
+      steerRequest,
+      event.inputAccepted({
+        clientRequestId: steerRequest.data.requestId,
+        turnId: "turn-1",
+      }),
+    ]);
+    const [, requestEvent, acceptedEvent] = events;
+
+    const userRows = rowsOfKind(
+      buildTimelineRows(events, "active"),
+      "conversation",
+    ).filter((row) => row.role === "user");
+
+    expect(userRows).toEqual([
+      expect.objectContaining({
+        text: "Also check the tests",
+        messageSeq: requestEvent?.meta.seq,
+        sourceSeqStart: acceptedEvent?.meta.seq,
+        sourceSeqEnd: acceptedEvent?.meta.seq,
+      }),
+    ]);
+    expect(acceptedEvent?.meta.seq).toBeGreaterThan(
+      requestEvent?.meta.seq ?? 0,
+    );
+  });
+
   it("uses accepted context to suppress pending steers without rendering future accepted rows", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
     const turnStarted = event.turnStarted({ turnId: "turn-1" });
@@ -1777,9 +1781,14 @@ describe("buildThreadTimelineFromEvents", () => {
       }),
     ]);
 
-    const rows = buildTimelineRowsWithAcceptedContext(
+    const rows = buildTimelineRows(
       fromRows([turnStarted, steerRequest]),
-      acceptedContext,
+      "idle",
+      null,
+      {
+        acceptedClientRequestEvents: acceptedContext,
+        rejectedClientRequestEvents: [],
+      },
     );
 
     expect(
@@ -1797,9 +1806,14 @@ describe("buildThreadTimelineFromEvents", () => {
       event.clientTurnRejected({ requestId: steerRequest.data.requestId }),
     ]);
 
-    const rows = buildTimelineRowsWithRejectedContext(
+    const rows = buildTimelineRows(
       fromRows([event.turnStarted({ turnId: "turn-1" }), steerRequest]),
-      rejectedContext,
+      "idle",
+      null,
+      {
+        acceptedClientRequestEvents: [],
+        rejectedClientRequestEvents: rejectedContext,
+      },
     );
 
     expect(
@@ -1825,9 +1839,14 @@ describe("buildThreadTimelineFromEvents", () => {
       }),
     ]);
 
-    const rows = buildTimelineRowsWithAcceptedContext(
+    const rows = buildTimelineRows(
       fromRows([turnStarted, steerRequest, fallbackTurnStarted]),
-      acceptedContext,
+      "idle",
+      null,
+      {
+        acceptedClientRequestEvents: acceptedContext,
+        rejectedClientRequestEvents: [],
+      },
     );
     const userRows = rows.filter(
       (row) => row.kind === "conversation" && row.role === "user",
@@ -1895,25 +1914,6 @@ describe("buildThreadTimelineFromEvents", () => {
     },
   );
 
-  it("uses a neutral completed ownership title for legacy metadata", () => {
-    const event = systemOperationEvent({
-      message: "Ownership operation completed",
-      metadata: {
-        action: "unknown-action",
-        nextParentThreadId: null,
-        nextParentThreadTitle: null,
-        previousParentThreadId: null,
-        previousParentThreadTitle: null,
-      },
-      seq: 1,
-    });
-
-    expect(parseOperationMessage(event.event, event.meta)).toMatchObject({
-      kind: "operation",
-      title: "Ownership change completed",
-    });
-  });
-
   it.each(ownershipOperationCases)(
     "does not duplicate $action ownership operation titles as row detail",
     ({
@@ -1956,28 +1956,6 @@ describe("buildThreadTimelineFromEvents", () => {
       ]);
     },
   );
-
-  it("keeps system error message and detail as separate row fields", () => {
-    const rows = buildTimelineRows([
-      systemErrorEvent({
-        code: "thread_command_failed",
-        message: "Command thread/start failed",
-        detail:
-          "Error: Cannot find claude code binary\n  at resolveBinary (sdk.js:42)\n  at start (sdk.js:88)",
-        seq: 1,
-      }),
-    ]);
-
-    expect(collectSystemRows(rows)).toEqual([
-      expect.objectContaining({
-        systemKind: "error",
-        status: "error",
-        title: "Command thread/start failed",
-        detail:
-          "Error: Cannot find claude code binary\n  at resolveBinary (sdk.js:42)\n  at start (sdk.js:88)",
-      }),
-    ]);
-  });
 
   it("leaves system error detail null when only message is provided", () => {
     const rows = buildTimelineRows([
@@ -2031,7 +2009,8 @@ describe("buildThreadTimelineFromEvents", () => {
       systemErrorEvent({
         code: "thread_command_failed",
         message: "Command turn.submit failed",
-        detail: "Payload exceeded provider limit",
+        detail:
+          "Error: Cannot find claude code binary\n  at resolveBinary (sdk.js:42)\n  at start (sdk.js:88)",
         seq: 3,
       }),
     ]);
@@ -2041,31 +2020,14 @@ describe("buildThreadTimelineFromEvents", () => {
         systemKind: "error",
         status: "error",
         title: "The provider stream closed unexpectedly",
+        detail: null,
       }),
       expect.objectContaining({
         systemKind: "error",
         status: "error",
         title: "Command turn.submit failed",
-        detail: "Payload exceeded provider limit",
-      }),
-    ]);
-  });
-
-  it("uses legacy provider error detail as the title for generic provider errors", () => {
-    const rows = buildTimelineRows([
-      turnStartedEvent({ seq: 1 }),
-      providerErrorEvent({
-        detail: "API Error: Overloaded",
-        seq: 2,
-      }),
-    ]);
-
-    expect(collectSystemRows(rows)).toEqual([
-      expect.objectContaining({
-        systemKind: "error",
-        status: "error",
-        title: "API Error: Overloaded",
-        detail: null,
+        detail:
+          "Error: Cannot find claude code binary\n  at resolveBinary (sdk.js:42)\n  at start (sdk.js:88)",
       }),
     ]);
   });
@@ -2152,7 +2114,7 @@ describe("buildThreadTimelineFromEvents", () => {
     expect(collectSystemRows(rows)[0]).not.toHaveProperty("parentChange");
   });
 
-  it("contributes no row for an interaction that shows elsewhere (a command approval, a plugin request)", () => {
+  it("contributes no row for a command approval, which shows on its item, and a title-only row for a plugin request", () => {
     const rows = buildTimelineRows([
       {
         event: {
@@ -2206,44 +2168,154 @@ describe("buildThreadTimelineFromEvents", () => {
         meta: { id: "event-2", seq: 2, createdAt: 2 },
       },
     ]);
-    expect(rows.filter((row) => row.kind === "work")).toEqual([]);
-    expect(collectSystemRows(rows)).toEqual([]);
-  });
-
-  it("suppresses the legacy plugin interaction lifecycle operations", () => {
-    const rows = buildTimelineRows([
-      systemOperationEvent({
-        message: "Plugin interaction lifecycle changed",
-        operation: "plugin_interaction",
-        operationId: "pint-test",
-        seq: 1,
-        status: "pending",
-      }),
-      systemOperationEvent({
-        message: "Plugin interaction lifecycle changed",
-        operation: "plugin_interaction",
-        operationId: "pint-test",
-        seq: 2,
-        status: "resolved",
+    expect(rows.filter((row) => row.kind === "work")).toEqual([
+      expect.objectContaining({
+        workKind: "form",
+        interactionId: "pint-plugin",
+        pluginId: "secrets",
+        title: "Add secrets",
+        lifecycle: "submitted",
       }),
     ]);
-
     expect(collectSystemRows(rows)).toEqual([]);
   });
 
-  it("suppresses the internal message-edit commit marker", () => {
-    const rows = buildTimelineRows([
-      systemOperationEvent({
-        message: "Message edited",
-        operation: "edit_message",
-        operationId: "edit-op-test",
-        seq: 1,
-        status: "completed",
+  it("places a plugin request made during a running turn at its point in that turn", () => {
+    const pluginRequest = (
+      seq: number,
+      status: "pending" | "resolved",
+    ): ThreadEventWithMeta => ({
+      event: {
+        type: "system/interaction/lifecycle",
+        threadId: "thread-1",
+        scope: threadScope(),
+        interaction: {
+          id: "pint-plugin",
+          status,
+          statusReason: null,
+          origin: {
+            kind: "plugin",
+            pluginId: "secrets",
+            rendererId: "secret-request",
+          },
+          payload: { kind: "plugin", title: "Add secrets" },
+          resolution:
+            status === "resolved" ? { kind: "plugin_submitted" } : null,
+        },
+      },
+      meta: { id: `event-${seq}`, seq, createdAt: seq },
+    });
+    const rows = buildTimelineRows(
+      [
+        turnStartedEvent({ seq: 1 }),
+        toolCallItemEvent({
+          itemId: "before",
+          seq: 2,
+          tool: "before_request",
+          type: "item/completed",
+        }),
+        pluginRequest(3, "pending"),
+        toolCallItemEvent({
+          itemId: "after",
+          seq: 4,
+          tool: "after_request",
+          type: "item/completed",
+        }),
+        pluginRequest(5, "resolved"),
+        toolCallItemEvent({
+          itemId: "latest",
+          seq: 6,
+          tool: "latest",
+          type: "item/started",
+        }),
+      ],
+      "active",
+    );
+
+    const flattened = rows.flatMap((row) =>
+      row.kind === "turn" ? (row.children ?? []) : [row],
+    );
+    expect(
+      flattened.flatMap((row) => {
+        if (row.kind !== "work") return [];
+        if (row.workKind === "form") return [row.interactionId];
+        if (row.workKind === "tool") return [row.toolName];
+        return [];
       }),
+    ).toEqual(["before_request", "pint-plugin", "after_request", "latest"]);
+    expect(flattened.at(-1)).toEqual(
+      expect.objectContaining({ workKind: "tool", toolName: "latest" }),
+    );
+  });
+
+  it("keeps a plugin request made between turns as its own entry", () => {
+    const rows = buildTimelineRows([
+      turnStartedEvent({ seq: 1 }),
+      turnCompletedEvent({ seq: 2 }),
+      {
+        event: {
+          type: "system/interaction/lifecycle",
+          threadId: "thread-1",
+          scope: threadScope(),
+          interaction: {
+            id: "pint-plugin",
+            status: "pending",
+            statusReason: null,
+            origin: {
+              kind: "plugin",
+              pluginId: "secrets",
+              rendererId: "secret-request",
+            },
+            payload: { kind: "plugin", title: "Add secrets" },
+            resolution: null,
+          },
+        },
+        meta: { id: "event-3", seq: 3, createdAt: 3 },
+      },
     ]);
 
-    expect(collectSystemRows(rows)).toEqual([]);
+    expect(rows.at(-1)).toEqual(
+      expect.objectContaining({
+        kind: "work",
+        workKind: "form",
+        interactionId: "pint-plugin",
+      }),
+    );
   });
+
+  it.each([
+    {
+      operation: "plugin_interaction",
+      message: "Plugin interaction lifecycle changed",
+      statuses: ["pending", "resolved"],
+    },
+    {
+      operation: "edit_message",
+      message: "Message edited",
+      statuses: ["completed"],
+    },
+  ] satisfies Array<{
+    operation: string;
+    message: string;
+    statuses: Array<NonNullable<SystemOperationEventArgs["status"]>>;
+  }>)(
+    "suppresses internal $operation operations",
+    ({ operation, message, statuses }) => {
+      const rows = buildTimelineRows(
+        statuses.map((status, index) =>
+          systemOperationEvent({
+            message,
+            operation,
+            operationId: "internal-op-test",
+            seq: index + 1,
+            status,
+          }),
+        ),
+      );
+
+      expect(collectSystemRows(rows)).toEqual([]);
+    },
+  );
 
   it.each([
     {
@@ -2350,41 +2422,27 @@ describe("buildThreadTimelineFromEvents", () => {
     },
   );
 
-  it.each([
-    {
-      expectedLifecycle: "interrupted",
-      expectedStatus: "interrupted",
-      status: "interrupted",
-      statusReason: "Thread stopped by user request",
-    },
-  ] satisfies Array<{
-    expectedLifecycle: "interrupted";
-    expectedStatus: "interrupted";
-    status: "interrupted";
-    statusReason: string;
-  }>)(
-    "preserves permission grant $status status reason on timeline rows",
-    ({ expectedLifecycle, expectedStatus, status, statusReason }) => {
-      const rows = buildTimelineRows([
-        turnStartedEvent({ seq: 0 }),
-        permissionGrantLifecycleEvent({
-          seq: 1,
-          status,
-          statusReason,
-        }),
-      ]);
+  it("preserves permission grant interrupted status reason on timeline rows", () => {
+    const statusReason = "Thread stopped by user request";
+    const rows = buildTimelineRows([
+      turnStartedEvent({ seq: 0 }),
+      permissionGrantLifecycleEvent({
+        seq: 1,
+        status: "interrupted",
+        statusReason,
+      }),
+    ]);
 
-      expect(collectApprovalRows(rows)).toEqual([
-        expect.objectContaining({
-          approvalKind: "permission-grant",
-          grantScope: null,
-          lifecycle: expectedLifecycle,
-          status: expectedStatus,
-          statusReason,
-        }),
-      ]);
-    },
-  );
+    expect(collectApprovalRows(rows)).toEqual([
+      expect.objectContaining({
+        approvalKind: "permission-grant",
+        grantScope: null,
+        lifecycle: "interrupted",
+        status: "interrupted",
+        statusReason,
+      }),
+    ]);
+  });
 
   it.each([
     {
@@ -2491,6 +2549,90 @@ describe("buildThreadTimelineFromEvents", () => {
     },
   );
 
+  it("projects a plugin form to a title-and-outcome row without its data", () => {
+    const formEvent = (
+      seq: number,
+      status: "pending" | "resolved" | "interrupted",
+      statusReason: string | null = null,
+    ): ThreadEventWithMeta => ({
+      event: {
+        type: "system/interaction/lifecycle",
+        threadId: "thread-1",
+        scope: threadScope(),
+        interaction: {
+          id: "pi-form",
+          status,
+          statusReason,
+          origin: {
+            kind: "plugin",
+            pluginId: "secrets",
+            rendererId: "secret-request",
+          },
+          payload: {
+            kind: "plugin",
+            title: "Add secrets to .env",
+            presentation: {
+              label: { pending: "Adding secrets", completed: "Added secrets" },
+              icon: { glyph: "Lock" },
+            },
+          },
+          resolution:
+            status === "resolved"
+              ? {
+                  kind: "plugin_submitted",
+                  description: {
+                    title: "Added API_KEY to .env",
+                    detail: "- API_KEY",
+                    payload: { names: ["API_KEY"] },
+                  },
+                }
+              : null,
+        },
+      },
+      meta: { id: `event-${seq}`, seq, createdAt: seq },
+    });
+    const collectFormRows = (rows: readonly TimelineRow[]) =>
+      rows.filter((row) => row.kind === "work" && row.workKind === "form");
+
+    expect(
+      collectFormRows(
+        buildTimelineRows([formEvent(1, "pending"), formEvent(2, "resolved")]),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        workKind: "form",
+        interactionId: "pi-form",
+        pluginId: "secrets",
+        rendererId: "secret-request",
+        title: "Add secrets to .env",
+        lifecycle: "submitted",
+        status: "completed",
+        presentation: {
+          label: { pending: "Adding secrets", completed: "Added secrets" },
+          icon: { glyph: "Lock" },
+          title: "Added API_KEY to .env",
+          detail: "- API_KEY",
+        },
+        payload: { names: ["API_KEY"] },
+      }),
+    ]);
+    expect(
+      collectFormRows(
+        buildTimelineRows([
+          formEvent(1, "pending"),
+          formEvent(2, "interrupted", "user"),
+        ]),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        lifecycle: "cancelled",
+        status: "interrupted",
+        statusReason: "user",
+        payload: null,
+      }),
+    ]);
+  });
+
   it.each([
     { lateStatus: "pending" },
     { lateStatus: "resolving" },
@@ -2538,53 +2680,39 @@ describe("buildThreadTimelineFromEvents", () => {
     },
   );
 
-  it.each([
-    {
-      expectedLifecycle: "interrupted",
-      expectedStatus: "interrupted",
-      status: "interrupted",
-      statusReason: "Thread stopped by user request",
-    },
-  ] satisfies Array<{
-    expectedLifecycle: "interrupted";
-    expectedStatus: "interrupted";
-    status: "interrupted";
-    statusReason: string;
-  }>)(
-    "preserves terminal user-question $status rows after late resolving events",
-    ({ expectedLifecycle, expectedStatus, status, statusReason }) => {
-      const rows = buildTimelineRows([
-        turnStartedEvent({ seq: 0 }),
-        userQuestionLifecycleEvent({
-          seq: 1,
-          status,
-          statusReason,
-        }),
-        userQuestionLifecycleEvent({
-          resolution: {
-            kind: "user_answer",
-            answers: {
-              "question-1": {
-                selected: ["production"],
-              },
+  it("preserves terminal user-question interrupted rows after late resolving events", () => {
+    const statusReason = "Thread stopped by user request";
+    const rows = buildTimelineRows([
+      turnStartedEvent({ seq: 0 }),
+      userQuestionLifecycleEvent({
+        seq: 1,
+        status: "interrupted",
+        statusReason,
+      }),
+      userQuestionLifecycleEvent({
+        resolution: {
+          kind: "user_answer",
+          answers: {
+            "question-1": {
+              selected: ["production"],
             },
           },
-          seq: 2,
-          status: "resolving",
-        }),
-      ]);
+        },
+        seq: 2,
+        status: "resolving",
+      }),
+    ]);
 
-      expect(collectQuestionRows(rows)).toEqual([
-        expect.objectContaining({
-          answers: null,
-          lifecycle: expectedLifecycle,
-          sourceSeqEnd: 2,
-          status: expectedStatus,
-          statusReason,
-        }),
-      ]);
-    },
-  );
+    expect(collectQuestionRows(rows)).toEqual([
+      expect.objectContaining({
+        answers: null,
+        lifecycle: "interrupted",
+        sourceSeqEnd: 2,
+        status: "interrupted",
+        statusReason,
+      }),
+    ]);
+  });
 
   it.each(["ToolSearch", "TaskCreate", "TaskUpdate", "AskUserQuestion"])(
     "keeps a bare %s tool row: suppression comes from the bridge's presentation, not a name table",
@@ -2625,29 +2753,6 @@ describe("buildThreadTimelineFromEvents", () => {
           modelContextWindow: null,
           seq: 2,
           usedTokens: 60,
-        }),
-      ]),
-    ).toEqual({
-      estimated: true,
-      modelContextWindow: 200_000,
-      usedTokens: 60,
-    });
-  });
-
-  it("extracts context-window usage from unordered events", () => {
-    expect(
-      buildContextWindowUsage([
-        contextWindowUsageEvent({
-          estimated: true,
-          modelContextWindow: null,
-          seq: 2,
-          usedTokens: 60,
-        }),
-        contextWindowUsageEvent({
-          estimated: false,
-          modelContextWindow: 200_000,
-          seq: 1,
-          usedTokens: 120,
         }),
       ]),
     ).toEqual({
@@ -2991,4 +3096,65 @@ describe("buildThreadTimelineFromEvents", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.change.path).toBe("/etc/hosts");
   });
+});
+
+it("keeps a canonical disclosure ID when completed reasoning gains a delegation prefix", () => {
+  const event = createTimelineEventFactory({
+    threadId: "thread-1",
+    turnId: "turn-1",
+  });
+  const parentToolCallId = "helper";
+  const events = [
+    event.turnStarted({ seq: 1 }),
+    event.toolCallStarted({
+      seq: 2,
+      itemId: parentToolCallId,
+      tool: "spawn_helper",
+    }),
+    event.reasoningStarted({ seq: 3, itemId: "reasoning", parentToolCallId }),
+    event.reasoningDelta({
+      seq: 4,
+      itemId: "reasoning",
+      parentToolCallId,
+      delta: "Inspect the helper.",
+    }),
+  ];
+  const live = buildThreadTimelineFromEvents({
+    acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
+    contextWindowEvents: [],
+    events: fromRows(events),
+    options: {
+      completedTurnDisplay: "collapse",
+      includeNestedRows: true,
+      includeDiagnosticOperations: false,
+      isLatestPage: true,
+      threadStatus: "active",
+      threadName: "",
+      workspaceRoot: null,
+    },
+  });
+  const rows = buildTimelineRows(
+    fromRows([
+      ...events,
+      event.reasoningCompleted({
+        seq: 5,
+        itemId: "reasoning",
+        parentToolCallId,
+        text: "Inspect the helper.",
+      }),
+      event.toolCallCompleted({
+        seq: 6,
+        itemId: parentToolCallId,
+        tool: "spawn_helper",
+      }),
+    ]),
+  );
+  const [delegation] = collectDelegationRows(rows);
+  const completed = delegation?.childRows?.find((row) => row.kind === "system");
+  expect(live.activeThinking?.id).toBeTruthy();
+  expect(completed).toMatchObject({
+    reasoningId: live.activeThinking?.id,
+    operationKind: "reasoning",
+  });
+  expect(completed?.id).not.toBe(live.activeThinking?.id);
 });

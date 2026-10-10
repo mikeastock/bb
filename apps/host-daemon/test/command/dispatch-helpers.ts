@@ -24,13 +24,16 @@ import type {
   PullRequestActionOptions,
 } from "@bb/host-workspace";
 import { RuntimeManager } from "../../src/runtime-manager.js";
-import { listFilesRecursively } from "../../src/command-handlers/file-list.js";
-import { noopEventSink } from "../../src/command-dispatch-support.js";
 import type { CommandDispatchOptions } from "../../src/command-dispatch-support.js";
 import type { FetchProjectAttachment } from "../../src/project-attachments.js";
 
 const tempDirs: string[] = [];
 const execFileAsync = promisify(execFile);
+export const noopEventSink: CommandDispatchOptions["eventSink"] = {
+  emit: () => undefined,
+  flush: async () => undefined,
+};
+
 export const silentLogger: CommandDispatchOptions["logger"] = {
   debug: () => undefined,
   warn: () => undefined,
@@ -121,7 +124,6 @@ interface FakeRuntimeState {
   startedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   startedEnvironmentId: string | undefined;
   startedInput: PromptInput[] | undefined;
-  startedInputGroups: PromptInput[][] | undefined;
   startedInstructions: string | undefined;
   startedThreadId: string | undefined;
   steeredClientRequestId: ClientTurnRequestId | undefined;
@@ -152,7 +154,6 @@ export function createFakeWorkspace(pathname: string) {
   };
   const workspace: FakeHostWorkspace = {
     path: pathname,
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
     async getDefaultBranch() {
@@ -240,30 +241,12 @@ export function createFakeWorkspace(pathname: string) {
       state.lastPullRequestAction = action;
       state.pullRequestActionShellPath = options?.shellPath;
     },
-    async listFiles() {
-      return listFilesRecursively(pathname, pathname);
-    },
     async commit(options: { message: string; noVerify: boolean }) {
       state.lastCommitMessage = options.message;
       return {
         commitSha: "commit-1",
         commitSubject: options.message,
       };
-    },
-    async reset() {},
-    async squashMerge(options: {
-      targetBranch: string;
-      commitMessage: string;
-    }) {
-      return {
-        merged: true,
-        commitSha: `merge-${options.targetBranch}`,
-        commitSubject: options.commitMessage,
-        targetBranch: options.targetBranch,
-      };
-    },
-    async destroy() {
-      state.destroyed = true;
     },
   };
 
@@ -290,7 +273,6 @@ export function createFakeRuntime() {
     startedBridgeLaunch: undefined,
     startedEnvironmentId: undefined,
     startedInput: undefined,
-    startedInputGroups: undefined,
     startedInstructions: undefined,
     startedThreadId: undefined,
     steeredClientRequestId: undefined,
@@ -336,7 +318,6 @@ export function createFakeRuntime() {
       state.startedThreadId = args.threadId;
       state.startedDynamicTools = args.dynamicTools;
       state.startedInput = args.input;
-      state.startedInputGroups = args.inputGroups;
       state.startedInstructions = args.instructions;
       providerSessionsByThreadId.set(args.threadId, {
         providerId: args.providerId,
@@ -546,9 +527,14 @@ export async function runGitCommand(
 
 export async function cleanupTempDirs(): Promise<void> {
   await Promise.all(
-    tempDirs
-      .splice(0)
-      .map((dir) => fs.rm(dir, { recursive: true, force: true })),
+    tempDirs.splice(0).map((dir) =>
+      fs.rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 100,
+      }),
+    ),
   );
 }
 
@@ -604,6 +590,3 @@ export function dispatchTestRuntimeBridgeLaunch(
     envPassthrough: [],
   };
 }
-
-export const DISPATCH_TEST_RUNTIME_BRIDGE_LAUNCH: AgentRuntimeBridgeLaunch =
-  dispatchTestRuntimeBridgeLaunch();

@@ -1,19 +1,21 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { shuffle } from "@vitest/utils/helpers";
 import { mergeConfig, type ViteUserConfig } from "vitest/config";
 import { BaseSequencer, type TestSpecification } from "vitest/node";
 
-const GLOBAL_OBJECT = String.raw`(?:window|globalThis|global|document|navigator|[A-Z][\w$]*\.prototype)`;
+const GLOBAL_OBJECT = String.raw`(?:window|globalThis|global|document|navigator|process|[A-Z][\w$]*\.prototype)`;
 const GLOBAL_TARGET = String.raw`(?:${GLOBAL_OBJECT}|\(\s*${GLOBAL_OBJECT}\s+as\b[^)]*\))`;
+const GLOBAL_MEMBER = String.raw`(?:\.[A-Za-z_$][\w$]*|\[[^\]]+\])`;
 
 const ISOLATION_REQUIRING_API = new RegExp(
   [
-    String.raw`\bvi\.(mock|doMock|unmock|doUnmock|resetModules|stubGlobal|stubEnv)\(`,
+    String.raw`\bvi\.(mock|doMock|unmock|doUnmock|resetModules|stubGlobal|stubEnv|useFakeTimers|setSystemTime)\(`,
     String.raw`\bprocess\.chdir\(`,
-    String.raw`\bprocess\.env(\.[A-Za-z_$][\w$]*|\[[^\]]+\])\s*=[^=]`,
+    String.raw`\bprocess\.env(?:${GLOBAL_MEMBER})?\s*=[^=]`,
     String.raw`\bdelete\s+process\.env\b`,
-    String.raw`\b${GLOBAL_TARGET}\.[A-Za-z_$][\w$.]*\s*=[^=]`,
+    String.raw`\b${GLOBAL_TARGET}(?:${GLOBAL_MEMBER})+\s*=[^=]`,
     String.raw`\bdelete\s+${GLOBAL_TARGET}(?![\w$])`,
     String.raw`\b(?:Object\.(?:defineProperty|defineProperties|assign)|Reflect\.(?:set|defineProperty|deleteProperty))\(\s*${GLOBAL_TARGET}(?![\w$])`,
   ].join("|"),
@@ -64,7 +66,6 @@ const ISOLATED_ENVIRONMENTS = new Set(["jsdom", "happy-dom"]);
 
 export interface PartitionOptions {
   aliases?: Record<string, string>;
-  defaultEnvironment?: string;
 }
 
 export interface SharedTestFileGroup {
@@ -163,7 +164,6 @@ export function partitionTestFiles(
   roots: string[],
   options: PartitionOptions = {},
 ): TestFilePartition {
-  const defaultEnvironment = options.defaultEnvironment ?? "node";
   const scan: IsolationScan = {
     pkgDir,
     aliases: options.aliases ?? {},
@@ -191,7 +191,7 @@ export function partitionTestFiles(
         const source = readFileSync(fullPath, "utf8");
         const environment = ENVIRONMENT_DOCBLOCK.exec(source)?.[1] ?? null;
         if (
-          ISOLATED_ENVIRONMENTS.has(environment ?? defaultEnvironment) ||
+          ISOLATED_ENVIRONMENTS.has(environment ?? "node") ||
           requiresIsolation(fullPath, scan)
         ) {
           isolated.add(relative);
@@ -227,7 +227,6 @@ export interface SharedWorkerProjectsArgs {
   include: string[];
   exclude?: string[];
   aliases?: Record<string, string>;
-  defaultEnvironment?: string;
 }
 
 export function sharedWorkerProjects(
@@ -236,9 +235,6 @@ export function sharedWorkerProjects(
   const exclude = args.exclude ?? ["dist/**", "node_modules/**"];
   const options: PartitionOptions = {};
   if (args.aliases !== undefined) options.aliases = args.aliases;
-  if (args.defaultEnvironment !== undefined) {
-    options.defaultEnvironment = args.defaultEnvironment;
-  }
   const partition = partitionTestFiles(
     args.pkgDir,
     args.include.map(globRoot),
@@ -289,7 +285,17 @@ export class SharedWorkerSequencer extends BaseSequencer {
   override async sort(
     files: TestSpecification[],
   ): Promise<TestSpecification[]> {
-    const sorted = await super.sort(files);
+    const sorted = this.ctx.config.sequence.shuffle
+      ? shuffle(
+          [...files].sort(
+            (a, b) =>
+              a.project.name.localeCompare(b.project.name) ||
+              a.moduleId.localeCompare(b.moduleId) ||
+              a.pool.localeCompare(b.pool),
+          ),
+          this.ctx.config.sequence.seed,
+        )
+      : await super.sort(files);
     const rank = (spec: TestSpecification) =>
       spec.project.config.isolate ? 0 : 1;
     return sorted
@@ -315,37 +321,18 @@ function globRoot(glob: string): string {
   return literal.length > 0 ? literal.join("/") : ".";
 }
 
-function hugeiconsBundleAlias(): { find: RegExp; replacement: string }[] {
-  try {
-    const require = createRequire(path.join(process.cwd(), "package.json"));
-    const packageJson =
-      require.resolve("@hugeicons/core-free-icons/package.json");
-    return [
-      {
-        find: /^@hugeicons\/core-free-icons$/,
-        replacement: path.join(
-          path.dirname(packageJson),
-          "dist",
-          "esm",
-          "index.min.js",
-        ),
-      },
-    ];
-  } catch {
-    return [];
-  }
-}
-
 export function defineWorkspaceTestConfig(
   config: ViteUserConfig,
 ): ViteUserConfig {
   return mergeConfig(
     {
       resolve: {
-        alias: hugeiconsBundleAlias(),
         conditions: ["source"],
       },
       test: {
+        globalSetup: [
+          fileURLToPath(new URL("./vitest.global-tmpdir.ts", import.meta.url)),
+        ],
         sequence: { sequencer: SharedWorkerSequencer },
         coverage: {
           provider: "v8",

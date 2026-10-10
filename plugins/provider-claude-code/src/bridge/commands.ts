@@ -16,6 +16,7 @@ import {
   bridgeRequestEnvelopeSchema,
   providerMaintenanceParamsSchema,
   providerInstallationRunParamsSchema,
+  providerInstallationStatusParamsSchema,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { z } from "zod";
 import { claudePermissionModeSchema } from "../interactive-contract.js";
@@ -50,13 +51,15 @@ export const claudeThreadStartParamsSchema = z.object({
   config: z.record(z.string(), z.unknown()).optional(),
   model: z.string().optional(),
   reasoningLevel: reasoningLevelSchema.optional(),
+  serviceTier: z.enum(["default", "fast"]),
   workflowsEnabled: z.boolean(),
-  idleQueryReleaseEnabled: z.boolean(),
+  chromeEnabled: z.boolean(),
+  disable1MContext: z.boolean(),
+  sandboxEnabled: z.boolean(),
   memoryEnabled: z.boolean().optional(),
   providerSubagentsEnabled: z.boolean().optional(),
   instructionMode: bridgeInstructionModeSchema,
   dynamicTools: z.array(dynamicToolSchema).optional(),
-  disallowedTools: z.array(z.string()).optional(),
 });
 
 export const claudeThreadResumeParamsSchema =
@@ -78,29 +81,24 @@ export const claudeTurnStartParamsSchema = z.object({
   input: z.array(z.unknown()),
   model: z.string().optional(),
   reasoningLevel: reasoningLevelSchema.optional(),
+  serviceTier: z.enum(["default", "fast"]).optional(),
   workflowsEnabled: z.boolean().optional(),
-  idleQueryReleaseEnabled: z.boolean().optional(),
+  chromeEnabled: z.boolean().optional(),
+  disable1MContext: z.boolean().optional(),
+  sandboxEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().optional(),
   providerSubagentsEnabled: z.boolean().optional(),
   config: z.record(z.string(), z.unknown()).optional(),
+  permissionMode: claudePermissionModeSchema,
+  permissionScope: bridgePermissionScopeSchema,
+  additionalWorkspaceWriteRoots: z.array(z.string()),
   permissionEscalation: bridgePermissionEscalationSchema,
   claudeCodePermissionMode: z.literal("plan").optional(),
 });
 
-export const claudeTurnSteerParamsSchema = z.object({
-  threadId: z.string(),
-  providerThreadId: z.string().nullable(),
-  expectedTurnId: z.string(),
-  input: z.array(z.unknown()),
-  model: z.string().optional(),
-  reasoningLevel: reasoningLevelSchema.optional(),
-  workflowsEnabled: z.boolean().optional(),
-  idleQueryReleaseEnabled: z.boolean().optional(),
-  memoryEnabled: z.boolean().optional(),
-  providerSubagentsEnabled: z.boolean().optional(),
-  permissionEscalation: bridgePermissionEscalationSchema,
-  claudeCodePermissionMode: z.literal("plan").optional(),
-});
+export const claudeTurnSteerParamsSchema = claudeTurnStartParamsSchema
+  .omit({ config: true })
+  .extend({ expectedTurnId: z.string() });
 
 const claudeCodeCommandSchema = z.discriminatedUnion("method", [
   z.object({
@@ -121,7 +119,7 @@ const claudeCodeCommandSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     method: z.literal("provider/installation/status"),
-    params: providerMaintenanceParamsSchema,
+    params: providerInstallationStatusParamsSchema,
   }),
   z.object({
     method: z.literal("provider/installation/run"),

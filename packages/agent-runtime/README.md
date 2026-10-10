@@ -20,7 +20,7 @@ const runtime = createAgentRuntime({
   bridgeBundleDir: "/path/to/bundled-bridges", // optional; used when bridges are packaged outside src/dist
   onEvent: (event) => {
     // Every event has event.threadId (bb ID) and event.providerThreadId (provider's internal ID)
-    // See ProviderThreadEvent in @bb/domain for the full type
+    // See ThreadEvent in @bb/domain for the full type
   },
   onToolCall: async (req) => { /* ToolCallRequest → ToolCallResponse */ },
   onStderr: (line) => { /* provider stderr */ },
@@ -67,10 +67,6 @@ await runtime.resumeThread({
 await runtime.shutdown();
 ```
 
-### Event types
-
-Events from provider processes are `ProviderThreadEvent` — they carry both `threadId` (bb ID) and `providerThreadId` (provider's internal ID). Events from the server/system layer are `SystemThreadEvent` — they only have `threadId`. Both are part of the `ThreadEvent` union from `@bb/domain`.
-
 ### Fail-fast behavior
 
 The runtime fails fast when providers crash or are unavailable:
@@ -89,14 +85,11 @@ A single runtime can manage multiple threads across multiple providers simultane
 ## Running Tests
 
 ```bash
-# Unit tests (no credentials needed, uses fake provider process)
-pnpm --filter @bb/agent-runtime test:unit
+# Unit tests (no credentials needed, uses fake provider process; excludes integration suites)
+pnpm --filter @bb/agent-runtime test
 
 # Integration tests (requires real provider credentials)
 pnpm --filter @bb/agent-runtime test:integration
-
-# All tests
-pnpm --filter @bb/agent-runtime test
 ```
 
 ### Integration test requirements
@@ -125,7 +118,7 @@ The root `test:integration --force` run also schedules `@bb/integration-tests#te
 
 - Bridge Zod schema rejects the request silently (check that `buildCommand` output matches what the bridge expects)
 - Provider needs credentials that aren't in the environment
-- Bridge process crashed on startup (check stderr — the runtime captures it in `proc.stderrChunks`)
+- Bridge process crashed on startup (check stderr — the runtime passes it to `onStderr` and appends its tail to the rejection)
 
 ### Building
 
@@ -170,7 +163,7 @@ local path); the provider id is an opaque label here.
 
 ## Dependencies
 
-- `@bb/domain` — shared types (ThreadEvent, ProviderThreadEvent, PromptInput, ToolCallRequest, etc.)
+- `@bb/domain` — shared types (ThreadEvent, PromptInput, ToolCallRequest, etc.)
 - `@bb/provider-bridge-protocol` — the bridge wire contract, the `thread/delta` assembler, and the bridge kit
 - `@bb/process-utils` — child-process helpers
 - `zod` — schema validation at provider boundaries

@@ -7,11 +7,18 @@ import {
   type ServiceTier,
   type ThreadVisibility,
 } from "@bb/domain";
-import { action } from "../../action.js";
+import { threadEnvironmentUnavailableApiErrorSchema } from "@bb/server-contract";
+import { action, CliExitError } from "../../action.js";
 import { createCliBbSdk } from "../../client.js";
-import type { ThreadRetryResult, ThreadSendResult } from "@bb/sdk";
+import { requireTextInput, TEXT_FILE_HELP_SUFFIX } from "../../text-input.js";
+import {
+  BbHttpError,
+  type ThreadRetryResult,
+  type ThreadSendResult,
+} from "@bb/sdk";
 import type { QueuedMessageWaitingOn } from "@bb/domain";
 import {
+  collectOption,
   confirmDestructiveAction,
   outputJson,
   parseReasoningLevel,
@@ -25,10 +32,11 @@ import {
 import {
   parsePermissionMode,
   parseServiceTier,
+  SERVICE_TIER_HELP,
   PERMISSION_MODE_HELP,
   PLAN_HELP,
   buildPromptInputs,
-  collectOption,
+  uploadClientAttachmentInputs,
 } from "./helpers.js";
 import { SEND_AT_HELP, parseSendAt } from "./send-time.js";
 
@@ -55,6 +63,11 @@ interface ThreadUnarchiveCommandOptions {
   json?: boolean;
 }
 
+interface ThreadRestoreEnvironmentCommandOptions {
+  self?: boolean;
+  json?: boolean;
+}
+
 interface ThreadPinCommandOptions {
   self?: boolean;
   json?: boolean;
@@ -68,6 +81,7 @@ interface ThreadDeleteCommandOptions {
 
 interface ThreadTellCommandOptions {
   json?: boolean;
+  messageFile?: string;
   model?: string;
   permissionMode?: string;
   reasoningLevel?: string;
@@ -95,7 +109,8 @@ interface ThreadRetryCommandOptions {
 interface ThreadEditMessageCommandOptions {
   expectedRequestSequence?: string;
   json?: boolean;
-  message: string;
+  message?: string;
+  messageFile?: string;
   self?: boolean;
 }
 
@@ -313,34 +328,58 @@ export function registerActionsCommands(
     );
 
   parent
-    .command("pin [id]")
-    .description("Pin a thread")
+    .command("restore-environment [id]")
+    .description(
+      "Restore the workspace of a thread whose environment was destroyed, when its environment provider supports restoring",
+    )
     .option("--self", "Target the current thread (from BB_THREAD_ID)")
     .option("--json", "Print machine-readable JSON output")
     .action(
-      action(async (id: string | undefined, opts: ThreadPinCommandOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        const thread = await sdk.threads.pin({ threadId });
-        if (outputJson(opts, thread)) return;
-        console.log(`Thread ${thread.id} pinned`);
-      }),
+      action(
+        async (
+          id: string | undefined,
+          opts: ThreadRestoreEnvironmentCommandOptions,
+        ) => {
+          const threadId = requireThreadIdOrSelf(id, opts);
+          const sdk = createCliBbSdk(getUrl());
+          let thread;
+          try {
+            thread = await sdk.threads.restoreEnvironment({ threadId });
+          } catch (err: unknown) {
+            throw prependErrorContext(
+              `Failed to restore the workspace for thread ${threadId}`,
+              err,
+            );
+          }
+          if (outputJson(opts, thread)) return;
+          console.log(
+            `Thread ${threadId} is restoring its workspace (status: ${thread.status})`,
+          );
+        },
+      ),
     );
 
-  parent
-    .command("unpin [id]")
-    .description("Unpin a thread")
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string | undefined, opts: ThreadPinCommandOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        const thread = await sdk.threads.unpin({ threadId });
-        if (outputJson(opts, thread)) return;
-        console.log(`Thread ${thread.id} unpinned`);
-      }),
-    );
+  for (const { name, description, done } of [
+    { name: "pin", description: "Pin a thread", done: "pinned" },
+    { name: "unpin", description: "Unpin a thread", done: "unpinned" },
+  ] as const) {
+    parent
+      .command(`${name} [id]`)
+      .description(description)
+      .option("--self", "Target the current thread (from BB_THREAD_ID)")
+      .option("--json", "Print machine-readable JSON output")
+      .action(
+        action(
+          async (id: string | undefined, opts: ThreadPinCommandOptions) => {
+            const threadId = requireThreadIdOrSelf(id, opts);
+            const sdk = createCliBbSdk(getUrl());
+            const thread = await sdk.threads[name]({ threadId });
+            if (outputJson(opts, thread)) return;
+            console.log(`Thread ${thread.id} ${done}`);
+          },
+        ),
+      );
+  }
 
   parent
     .command("delete <id>")
@@ -382,7 +421,11 @@ export function registerActionsCommands(
   parent
     .command("edit-message [id]")
     .description("Replace an accepted user message and rerun from that point")
-    .requiredOption("--message <text>", "Replacement message text")
+    .option("--message <text>", "Replacement message text")
+    .option(
+      "--message-file <path>",
+      `Read the replacement message from a file; ${TEXT_FILE_HELP_SUFFIX}`,
+    )
     .option("--self", "Target the current thread (from BB_THREAD_ID)")
     .option(
       "--expected-request-sequence <sequence>",
@@ -396,6 +439,12 @@ export function registerActionsCommands(
           opts: ThreadEditMessageCommandOptions,
         ) => {
           const threadId = requireThreadIdOrSelf(id, opts);
+          const message = await requireTextInput({
+            file: opts.messageFile,
+            fileLabel: "--message-file",
+            inline: opts.message,
+            inlineLabel: "--message <text>",
+          });
           const sdk = createCliBbSdk(getUrl());
           const expectedRequestSequence =
             opts.expectedRequestSequence === undefined
@@ -417,7 +466,7 @@ export function registerActionsCommands(
             ...(expectedRequestSequence !== undefined
               ? { expectedRequestSequence }
               : {}),
-            input: buildPromptInputs({ message: opts.message }),
+            input: buildPromptInputs({ message }),
             ...(senderThreadId !== undefined ? { senderThreadId } : {}),
           });
           if (outputJson(opts, { threadId, ...result })) {
@@ -431,14 +480,19 @@ export function registerActionsCommands(
     );
 
   parent
-    .command("tell <id> <message>")
+    .command("tell <id> [message]")
+    .aliases(["message", "send"])
     .description("Send a follow-up message to a thread")
+    .option(
+      "--message-file <path>",
+      `Read the message from a file instead of [message]; ${TEXT_FILE_HELP_SUFFIX}`,
+    )
     .option("--json", "Print machine-readable JSON output")
     .option("--model <model>", "Model ID for this message")
-    .option("--service-tier <tier>", "Service tier: fast or default")
+    .option("--service-tier <tier>", SERVICE_TIER_HELP)
     .option(
       "--reasoning-level <level>",
-      "Reasoning level: low, medium, high, xhigh, max (provider-dependent)",
+      "Reasoning level id the model lists: low, medium, high, xhigh, max, or a provider-specific id",
     )
     .option("--permission-mode <mode>", PERMISSION_MODE_HELP)
     .option(
@@ -449,19 +503,29 @@ export function registerActionsCommands(
     .option("--plan", PLAN_HELP)
     .option(
       "--file <path>",
-      "Pass a host-readable absolute or uploaded attachment file path (repeatable)",
+      "Upload an absolute path or file: URL from this CLI machine or pass an uploaded attachment path (repeatable)",
       collectOption,
       [],
     )
     .option(
       "--image <path>",
-      "Pass a host-readable absolute or uploaded attachment image path (repeatable)",
+      "Upload an absolute path or file: URL from this CLI machine or pass an uploaded attachment path (repeatable)",
       collectOption,
       [],
     )
     .action(
       action(
-        async (id: string, message: string, opts: ThreadTellCommandOptions) => {
+        async (
+          id: string,
+          inlineMessage: string | undefined,
+          opts: ThreadTellCommandOptions,
+        ) => {
+          const message = await requireTextInput({
+            file: opts.messageFile,
+            fileLabel: "--message-file",
+            inline: inlineMessage,
+            inlineLabel: "<message>",
+          });
           const response = await postThreadMessage({
             getUrl,
             threadId: id,
@@ -494,112 +558,137 @@ export function registerActionsCommands(
       "Retry this turn request id specifically; fails when it is not the thread's failed turn",
     )
     .option("--send-at <when>", SEND_AT_HELP)
-    .option("--reason <text>", "Why it is being retried, shown on the queued row")
+    .option(
+      "--reason <text>",
+      "Why it is being retried, shown on the queued row",
+    )
     .option("--json", "Print machine-readable JSON output")
     .action(
-      action(async (id: string | undefined, opts: ThreadRetryCommandOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        const response = await sdk.threads.retry({
-          threadId,
-          ...(opts.turn === undefined ? {} : { turnRequestId: opts.turn }),
-          ...(opts.sendAt === undefined
-            ? {}
-            : { sendAt: parseSendAt(opts.sendAt) }),
-          ...(opts.reason === undefined ? {} : { reason: opts.reason }),
-        });
-        if (outputJson(opts, { threadId, ...response })) return;
-        console.log(describeThreadRetryOutcome(threadId, response));
-      }),
+      action(
+        async (id: string | undefined, opts: ThreadRetryCommandOptions) => {
+          const threadId = requireThreadIdOrSelf(id, opts);
+          const sdk = createCliBbSdk(getUrl());
+          const response = await sdk.threads.retry({
+            threadId,
+            ...(opts.turn === undefined ? {} : { turnRequestId: opts.turn }),
+            ...(opts.sendAt === undefined
+              ? {}
+              : { sendAt: parseSendAt(opts.sendAt) }),
+            ...(opts.reason === undefined ? {} : { reason: opts.reason }),
+          });
+          if (outputJson(opts, { threadId, ...response })) return;
+          console.log(describeThreadRetryOutcome(threadId, response));
+        },
+      ),
     );
 
-  parent
-    .command("stop [id]")
-    .description("Stop work and release the loaded agent runtime")
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string | undefined, opts: ThreadActionOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        await sdk.threads.stop({ threadId });
-        if (outputJson(opts, { ok: true, threadId })) return;
-        console.log(`Thread ${threadId} stopped`);
-      }),
-    );
-
-  parent
-    .command("compact [id]")
-    .description("Request compaction of an idle or errored thread's context")
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string | undefined, opts: ThreadActionOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        await sdk.threads.compact({ threadId });
-        if (outputJson(opts, { ok: true, threadId })) return;
-        console.log(`Thread ${threadId} context compaction requested`);
-      }),
-    );
-
-  parent
-    .command("cancel-plan [id]")
-    .description("Ask the provider to exit the active Plan mode")
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string | undefined, opts: ThreadActionOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        await sdk.threads.cancelPlan({ threadId });
-        if (outputJson(opts, { ok: true, threadId })) return;
-        console.log(`Thread ${threadId} exited Plan mode`);
-      }),
-    );
-
-  parent
-    .command("clear-goal [id]")
-    .description("Ask the provider to clear the active Goal")
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string | undefined, opts: ThreadActionOptions) => {
-        const threadId = requireThreadIdOrSelf(id, opts);
-        const sdk = createCliBbSdk(getUrl());
-        await sdk.threads.clearGoal({ threadId });
-        if (outputJson(opts, { ok: true, threadId })) return;
-        console.log(`Thread ${threadId} cleared its Goal`);
-      }),
-    );
+  for (const { name, description, method, done } of [
+    {
+      name: "stop",
+      description: "Stop work and release the loaded agent runtime",
+      method: "stop",
+      done: "stopped",
+    },
+    {
+      name: "compact",
+      description: "Request compaction of an idle or errored thread's context",
+      method: "compact",
+      done: "context compaction requested",
+    },
+    {
+      name: "clear",
+      description: "Clear model context for an idle or failed thread",
+      method: "clearContext",
+      done: "context cleared",
+    },
+    {
+      name: "cancel-plan",
+      description: "Ask the provider to exit the active Plan mode",
+      method: "cancelPlan",
+      done: "exited Plan mode",
+    },
+    {
+      name: "clear-goal",
+      description: "Ask the provider to clear the active Goal",
+      method: "clearGoal",
+      done: "cleared its Goal",
+    },
+  ] as const) {
+    parent
+      .command(`${name} [id]`)
+      .description(description)
+      .option("--self", "Target the current thread (from BB_THREAD_ID)")
+      .option("--json", "Print machine-readable JSON output")
+      .action(
+        action(async (id: string | undefined, opts: ThreadActionOptions) => {
+          const threadId = requireThreadIdOrSelf(id, opts);
+          const sdk = createCliBbSdk(getUrl());
+          await sdk.threads[method]({ threadId });
+          if (outputJson(opts, { ok: true, threadId })) return;
+          console.log(`Thread ${threadId} ${done}`);
+        }),
+      );
+  }
 }
 
 async function postThreadMessage(
   args: PostThreadMessageArgs,
 ): Promise<PostThreadMessageResult> {
   const sdk = createCliBbSdk(args.getUrl());
-  const response = await sdk.threads.send({
-    threadId: args.threadId,
+  const input = await uploadClientAttachmentInputs({
     input: buildPromptInputs({
       message: args.message,
       plan: args.plan,
       files: args.files,
       images: args.images,
     }),
-    mode:
-      args.mode === "steer"
-        ? "steer-if-active"
-        : args.mode === "auto"
-          ? "auto"
-          : "queue-if-active",
-    ...(args.model ? { model: args.model } : {}),
-    ...(args.permissionMode ? { permissionMode: args.permissionMode } : {}),
-    ...(args.reasoningLevel ? { reasoningLevel: args.reasoningLevel } : {}),
-    ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
-    ...(args.senderThreadId ? { senderThreadId: args.senderThreadId } : {}),
-    ...(args.sendAt === undefined ? {} : { sendAt: args.sendAt }),
+    resolveProjectId: async () =>
+      (await sdk.threads.get({ threadId: args.threadId })).projectId,
+    sdk,
   });
+  let response: ThreadSendResult;
+  try {
+    response = await sdk.threads.send({
+      threadId: args.threadId,
+      input,
+      mode:
+        args.mode === "steer"
+          ? "steer-if-active"
+          : args.mode === "auto"
+            ? "auto"
+            : "queue-if-active",
+      ...(args.model ? { model: args.model } : {}),
+      ...(args.permissionMode ? { permissionMode: args.permissionMode } : {}),
+      ...(args.reasoningLevel ? { reasoningLevel: args.reasoningLevel } : {}),
+      ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
+      ...(args.senderThreadId ? { senderThreadId: args.senderThreadId } : {}),
+      ...(args.sendAt === undefined ? {} : { sendAt: args.sendAt }),
+    });
+  } catch (error: unknown) {
+    throw await withRestoreEnvironmentHint(sdk, args.threadId, error);
+  }
   return { ...response, mode: args.mode };
+}
+
+async function withRestoreEnvironmentHint(
+  sdk: ReturnType<typeof createCliBbSdk>,
+  threadId: string,
+  error: unknown,
+): Promise<unknown> {
+  if (!(error instanceof BbHttpError)) return error;
+  const parsed = threadEnvironmentUnavailableApiErrorSchema.safeParse(
+    error.body,
+  );
+  if (!parsed.success || parsed.data.details.reason !== "destroyed") {
+    return error;
+  }
+  const { canRestoreEnvironment } = await sdk.threads.get({ threadId });
+  return new CliExitError(error.message, 1, {
+    code: parsed.data.code,
+    hint: canRestoreEnvironment
+      ? `Its workspace was removed. Restore it with \`bb thread restore-environment ${threadId}\`, then send again.`
+      : "Its workspace was removed and its environment provider cannot restore it. Start a new thread to continue.",
+  });
 }
 
 function describeThreadTellOutcome(
@@ -610,7 +699,7 @@ function describeThreadTellOutcome(
     // The server says WHY it is waiting, so the CLI does not have to guess
     // from the flags it happened to send. `bb thread queue list` shows the
     // same reason for the row afterwards.
-    return `Thread ${threadId} message queued (${describeQueueWait(response)}); it dispatches when that clears`;
+    return `Thread ${threadId} message queued (${describeQueueWait(response.queuedMessage)}); it dispatches when that clears`;
   }
   return response.mode === "steer"
     ? `Thread ${threadId} steered`
@@ -645,6 +734,8 @@ export function describeQueueWait(row: {
         : `scheduled for ${new Date(row.sendAt).toLocaleString()}`;
     case "thread-busy":
       return "waiting for the current turn to finish";
+    case "stopping":
+      return "sending once the thread finishes stopping";
     case "turn-starting":
       return "waiting for the current turn to start";
     case "provisioning":

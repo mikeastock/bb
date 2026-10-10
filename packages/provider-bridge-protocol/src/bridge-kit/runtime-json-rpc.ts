@@ -1,3 +1,4 @@
+import { isClosedProcessStdinError } from "@bb/process-utils";
 import type { ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
 import { z } from "zod";
@@ -20,14 +21,6 @@ export interface ProviderInboundRequest {
 }
 
 export type ProviderRuntimeEvent = JsonRpcObject;
-
-export type JsonValue =
-  | boolean
-  | number
-  | string
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue | undefined };
 
 export const JSON_RPC_INVALID_PARAMS_CODE = -32602;
 
@@ -128,12 +121,6 @@ interface SendJsonRpcErrorArgs {
   message: string;
 }
 
-interface SendProviderRequestDecodeErrorArgs {
-  child: ChildProcess;
-  error: unknown;
-  id: string | number;
-}
-
 interface SendProviderResponseEncodeErrorArgs {
   child: ChildProcess;
   error: unknown;
@@ -146,7 +133,6 @@ interface SettleJsonRpcResponseArgs {
   response: JsonRpcObject;
 }
 
-const closedJsonRpcStdinErrorCodes = new Set(["EPIPE", "ERR_STREAM_DESTROYED"]);
 const jsonRpcStdinErrorHandledStreams = new WeakSet<Writable>();
 
 function isJsonRpcObject(value: unknown): value is JsonRpcObject {
@@ -187,16 +173,8 @@ function decodeRecoveryHint(data: unknown): ProviderRecoveryHint | null {
   return parsed.success ? (parsed.data.recovery ?? null) : null;
 }
 
-function isClosedJsonRpcStdinError(error: Error): boolean {
-  return (
-    "code" in error &&
-    typeof error.code === "string" &&
-    closedJsonRpcStdinErrorCodes.has(error.code)
-  );
-}
-
 function handleJsonRpcStdinError(error: Error): void {
-  if (isClosedJsonRpcStdinError(error)) {
+  if (isClosedProcessStdinError(error)) {
     return;
   }
   throw error;
@@ -294,15 +272,7 @@ export function settleJsonRpcResponse(args: SettleJsonRpcResponseArgs): void {
   pending.resolve(args.response.result);
 }
 
-export function sendJsonRpc(
-  child: ChildProcess,
-  message: JsonRpcMessage | ProviderRequestCommandPlan,
-): void {
-  const line = JSON.stringify(toJsonRpcMessage(message));
-  writeJsonRpcLine(child, line);
-}
-
-export function toJsonRpcMessage(
+function toJsonRpcMessage(
   message: JsonRpcMessage | ProviderRequestCommandPlan,
 ): JsonRpcMessage {
   if ("jsonrpc" in message) {
@@ -348,7 +318,7 @@ export function sendJsonRpcRequest<TResult>(
         reject(error);
       },
     });
-    sendJsonRpc(args.child, withId);
+    writeJsonRpcLine(args.child, JSON.stringify(withId));
   });
 }
 
@@ -375,22 +345,6 @@ export function sendJsonRpcError(args: SendJsonRpcErrorArgs): void {
       },
     }),
   );
-}
-
-export function sendProviderRequestDecodeErrorIfKnown(
-  args: SendProviderRequestDecodeErrorArgs,
-): boolean {
-  if (!(args.error instanceof ProviderRequestDecodeError)) {
-    return false;
-  }
-
-  sendJsonRpcError({
-    child: args.child,
-    id: args.id,
-    message: args.error.message,
-    code: args.error.code,
-  });
-  return true;
 }
 
 export function sendProviderResponseEncodeErrorIfKnown(

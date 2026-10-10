@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import {
   createEnvironment,
   createQueuedThreadMessage,
@@ -10,11 +11,13 @@ import {
   createProject,
   createThread,
   openSession,
+  threads,
   upsertHost,
 } from "@bb/db";
 import {
   HOST_DAEMON_PROTOCOL_VERSION,
   HOST_ID_FILE_NAME,
+  type HostPlatform,
 } from "@bb/host-daemon-contract";
 import {
   encodeClientTurnRequestIdNumber,
@@ -23,6 +26,7 @@ import {
   turnScope,
 } from "@bb/domain";
 import type {
+  EnvironmentProviderSelection,
   EnvironmentStatus,
   PermissionMode,
   PromptInput,
@@ -35,9 +39,9 @@ import type {
   ThreadOriginKind,
   ThreadStatus,
   ThreadVisibility,
-  WorkspaceProvisionType,
 } from "@bb/domain";
 import type { AppDeps } from "../../src/types.js";
+import { ARCHIVE_UNDO_GRACE_MS } from "../../src/constants.js";
 import { registerTestHostRpcCapture } from "./commands.js";
 
 interface SeedEventArgs<TType extends ThreadEventType> {
@@ -79,7 +83,6 @@ export function seedHost(
     connectMachineId?: string;
     id?: string;
     name?: string;
-    type?: "persistent";
   } = {},
 ) {
   return upsertHost(deps.db, deps.hub, {
@@ -88,16 +91,15 @@ export function seedHost(
       : {}),
     id: args.id,
     name: args.name ?? "Test Host",
-    type: args.type ?? "persistent",
   });
 }
 
 export function seedHostSession(
   deps: Pick<AppDeps, "db" | "hub">,
-  args: { id?: string; name?: string; type?: "persistent" } = {},
+  args: { id?: string; name?: string; platform?: HostPlatform } = {},
 ) {
   const host = seedHost(deps, args);
-  const session = seedSession(deps, host.id);
+  const session = seedSession(deps, host.id, { platform: args.platform });
   return { host, session };
 }
 
@@ -108,18 +110,24 @@ export function seedPrimaryHost(
   writeFileSync(join(deps.config.dataDir, HOST_ID_FILE_NAME), hostId);
 }
 
-export function seedSession(deps: Pick<AppDeps, "db" | "hub">, hostId: string) {
+export function seedSession(
+  deps: Pick<AppDeps, "db" | "hub">,
+  hostId: string,
+  options: { instanceId?: string; platform?: HostPlatform } = {},
+) {
   const session = openSession(deps.db, {
     hostId,
-    instanceId: "instance-1",
+    instanceId: options.instanceId ?? "instance-1",
     hostName: "Test Host",
-    hostType: "persistent",
     dataDir: `/tmp/bb-host-data/${hostId}`,
     protocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
     heartbeatIntervalMs: 5_000,
     leaseTimeoutMs: 30_000,
   });
-  deps.hub.recordDaemonSessionPlatform(session.id, "darwin");
+  deps.hub.recordDaemonSessionPlatform(
+    session.id,
+    options.platform ?? "darwin",
+  );
   registerTestHostRpcCapture(deps, { hostId, sessionId: session.id });
   return session;
 }
@@ -149,10 +157,12 @@ export function seedEnvironment(
     projectId: string;
     path?: string | null;
     status?: EnvironmentStatus;
-    managed?: boolean;
-    workspaceProvisionType?: WorkspaceProvisionType;
+    environmentProviderId?: string;
+    environmentProviderPluginId?: string;
+    environmentProviderInstanceKey?: string;
+    environmentProviderSelection?: EnvironmentProviderSelection;
+    providerOwnsPath?: boolean;
     isGitRepo?: boolean;
-    isWorktree?: boolean;
     branchName?: string | null;
     baseBranch?: string | null;
     defaultBranch?: string | null;
@@ -160,15 +170,25 @@ export function seedEnvironment(
   },
 ) {
   return createEnvironment(deps.db, deps.hub, {
+    providerOwnsPath: args.providerOwnsPath ?? false,
     projectId: args.projectId,
     hostId: args.hostId,
     path: args.path !== undefined ? args.path : "/tmp/test-environment",
     status: args.status ?? "ready",
-    managed: args.managed ?? false,
-    isGitRepo: args.isGitRepo ?? args.workspaceProvisionType !== "personal",
-    isWorktree:
-      args.isWorktree ?? args.workspaceProvisionType === "managed-worktree",
-    workspaceProvisionType: args.workspaceProvisionType ?? "unmanaged",
+    isGitRepo: args.isGitRepo ?? true,
+    ...(args.environmentProviderId !== undefined
+      ? {
+          environmentProvider: {
+            environmentProviderId: args.environmentProviderId,
+            pluginId: args.environmentProviderPluginId,
+            instanceKey: args.environmentProviderInstanceKey ?? null,
+            selection: args.environmentProviderSelection ?? {
+              machine: { type: "existing", hostId: args.hostId },
+              inputs: null,
+            },
+          },
+        }
+      : {}),
     branchName: args.branchName !== undefined ? args.branchName : "bb/test",
     baseBranch: args.baseBranch !== undefined ? args.baseBranch : null,
     defaultBranch:
@@ -187,6 +207,7 @@ export function seedThread(
     title?: string | null;
     parentThreadId?: string | null;
     sourceThreadId?: string | null;
+    lifecycleOwnerThreadId?: string | null;
     originKind?: ThreadOriginKind | null;
     originPluginId?: string | null;
     titleFallback?: string | null;
@@ -202,6 +223,7 @@ export function seedThread(
     titleFallback: args.titleFallback ?? "Test Thread",
     parentThreadId: args.parentThreadId ?? null,
     sourceThreadId: args.sourceThreadId ?? null,
+    lifecycleOwnerThreadId: args.lifecycleOwnerThreadId ?? null,
     originKind: args.originKind ?? null,
     originPluginId: args.originPluginId ?? null,
     visibility: args.visibility ?? "visible",
@@ -245,7 +267,7 @@ export function seedQueuedMessage(
     model?: string;
     reasoningLevel?: string;
     permissionMode?: PermissionMode;
-      senderThreadId?: string | null;
+    senderThreadId?: string | null;
     serviceTier?: string;
     /** Defaults to a row with no wait: an ordinary queued message. */
     waitingOn?: QueuedMessageWaitingOn | null;
@@ -282,19 +304,7 @@ export function seedEvent<TType extends ThreadEventType>(
     threadId: args.threadId,
     type: args.type,
   });
-  insertEvents(deps.db, deps.hub, [
-    {
-      createdAt: args.createdAt,
-      threadId: args.threadId,
-      environmentId: args.environmentId ?? null,
-      providerThreadId: args.providerThreadId ?? null,
-      scope: args.scope,
-      sequence: args.sequence,
-      type: args.type,
-      ...deriveStoredEventItemFields(event),
-      data: JSON.stringify(args.data),
-    },
-  ]);
+  seedStoredEvent(deps, { ...args, ...deriveStoredEventItemFields(event) });
 }
 
 export function seedTurnStarted(
@@ -321,6 +331,30 @@ export function seedTurnStarted(
     type: "turn/started",
     scope: turnScope(args.turnId),
     data: { providerThreadId },
+  });
+}
+
+export function seedThreadIdentity(
+  deps: Pick<AppDeps, "db" | "hub">,
+  args: {
+    createdAt?: number;
+    environmentId?: string | null;
+    providerThreadId: string;
+    sequence?: number;
+    threadId: string;
+  },
+): void {
+  seedEvent(deps, {
+    threadId: args.threadId,
+    environmentId: args.environmentId ?? null,
+    providerThreadId: args.providerThreadId,
+    createdAt: args.createdAt,
+    sequence:
+      args.sequence ??
+      getLatestThreadSequence(deps.db, { threadId: args.threadId }) + 1,
+    type: "thread/identity",
+    scope: threadScope(),
+    data: {},
   });
 }
 
@@ -402,4 +436,15 @@ export function seedStoredEvent(
       data: JSON.stringify(args.data),
     },
   ]);
+}
+
+export function expireArchiveUndoGrace(
+  deps: Pick<AppDeps, "db">,
+  threadId: string,
+): void {
+  deps.db
+    .update(threads)
+    .set({ archivedAt: Date.now() - ARCHIVE_UNDO_GRACE_MS - 1 })
+    .where(eq(threads.id, threadId))
+    .run();
 }

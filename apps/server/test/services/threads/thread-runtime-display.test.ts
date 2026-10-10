@@ -11,6 +11,7 @@ import {
   createThread,
   hostDaemonSessions,
   listQueuedThreadMessages,
+  listThreadsWithPendingInteractionState,
   migrate,
   noopNotifier,
   openSession,
@@ -30,7 +31,7 @@ import type {
   Thread,
   ThreadRuntimeState,
 } from "@bb/domain";
-import { DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS } from "../../../src/constants.js";
+import { HOST_RECONNECT_GRACE_MS } from "../../../src/constants.js";
 import {
   resolveThreadRuntimeState,
   toThreadListEntryResponses,
@@ -53,6 +54,7 @@ interface OpenTestSessionArgs {
 }
 
 interface CloseTestSessionArgs {
+  closeReason?: "daemon-disconnect" | "expired";
   closedAt: number;
   db: DbConnection;
   sessionId: string;
@@ -60,6 +62,7 @@ interface CloseTestSessionArgs {
 
 interface CreateThreadWithEnvironmentArgs {
   db: DbConnection;
+  environmentProviderId?: string;
   hostId: string;
   providerId?: string;
   status?: Thread["status"];
@@ -129,7 +132,6 @@ function setup(): SetupResult {
   const host = upsertHost(db, noopNotifier, {
     id: "host-runtime-display",
     name: "Runtime Display Host",
-    type: "persistent",
   });
   return { db, hostId: host.id, hub };
 }
@@ -149,7 +151,6 @@ function openTestSession(args: OpenTestSessionArgs) {
     hostId: args.hostId,
     instanceId: `instance-${randomUUID()}`,
     hostName: "Runtime Display Host",
-    hostType: "persistent",
     dataDir: `/tmp/${args.hostId}`,
     protocolVersion: 1,
     heartbeatIntervalMs: 5_000,
@@ -168,7 +169,12 @@ function openTestSession(args: OpenTestSessionArgs) {
 }
 
 function closeTestSession(args: CloseTestSessionArgs): void {
-  closeSession(args.db, noopNotifier, args.sessionId, "daemon-disconnect");
+  closeSession(
+    args.db,
+    noopNotifier,
+    args.sessionId,
+    args.closeReason ?? "daemon-disconnect",
+  );
   args.db
     .update(hostDaemonSessions)
     .set({
@@ -190,11 +196,22 @@ function createThreadWithEnvironment(args: CreateThreadWithEnvironmentArgs) {
     },
   });
   const environment = createEnvironment(args.db, noopNotifier, {
+    providerOwnsPath: false,
     hostId: args.hostId,
     projectId: project.id,
-    workspaceProvisionType: "unmanaged",
     path: `/tmp/${args.hostId}/environment/${suffix}`,
     status: "ready",
+    environmentProvider:
+      args.environmentProviderId === undefined
+        ? null
+        : {
+            environmentProviderId: args.environmentProviderId,
+            instanceKey: null,
+            selection: {
+              machine: { type: "existing", hostId: args.hostId },
+              inputs: null,
+            },
+          },
   });
   const thread = createThread(args.db, noopNotifier, {
     projectId: project.id,
@@ -213,14 +230,17 @@ function createThreadListEntry(
     ...args.thread,
     modelOverride: null,
     reasoningLevelOverride: null,
+    storageDeletedAt: null,
     environmentBranchName: null,
+    environmentPath: null,
+    environmentProviderId: null,
+    environmentIsWorktree: null,
     environmentHostId: args.environmentHostId,
     environmentName: null,
-    environmentWorkspaceDisplayKind: "other",
     hasPendingInteraction: false,
     // Only a `pending` thread whose first message queued carries one, and
     // these fixtures are all threads that already started.
-    pendingStartContext: null,
+    startupContext: null,
   };
 }
 
@@ -242,7 +262,6 @@ describe("thread runtime display", () => {
       ),
     ).toEqual({
       displayStatus: "active",
-      hostReconnectGraceExpiresAt: null,
     } satisfies ThreadRuntimeState);
   });
 
@@ -262,17 +281,15 @@ describe("thread runtime display", () => {
       ),
     ).toEqual({
       displayStatus: "waiting-for-host",
-      hostReconnectGraceExpiresAt: null,
     } satisfies ThreadRuntimeState);
   });
 
-  it("shows host-reconnecting for the full active-work grace after a daemon disconnect", () => {
+  it("keeps an active thread active while its host's closed socket is within the reconnect grace", () => {
     const { db, hostId, hub } = setup();
     const now = 60_000;
     const session = openTestSession({ db, hostId });
-    const closedAt = now - DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS + 1_000;
     closeTestSession({
-      closedAt,
+      closedAt: now - HOST_RECONNECT_GRACE_MS + 1_000,
       db,
       sessionId: session.id,
     });
@@ -283,18 +300,38 @@ describe("thread runtime display", () => {
         { environmentHostId: hostId, now, status: "active" },
       ),
     ).toEqual({
-      displayStatus: "host-reconnecting",
-      hostReconnectGraceExpiresAt:
-        closedAt + DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS,
+      displayStatus: "active",
     } satisfies ThreadRuntimeState);
   });
 
-  it("shows waiting-for-host after the active-work disconnect grace expires", () => {
+  it("keeps an active thread active while its reconnecting daemon has not registered its socket", () => {
+    const { db, hostId, hub } = setup();
+    const now = Date.now();
+    const lost = openTestSession({ db, hostId });
+    closeTestSession({
+      closedAt: now - 1_000,
+      db,
+      sessionId: lost.id,
+    });
+    openTestSession({ db, hostId });
+
+    expect(
+      resolveThreadRuntimeState(
+        { db, hub },
+        { environmentHostId: hostId, now, status: "active" },
+      ),
+    ).toEqual({
+      displayStatus: "active",
+    } satisfies ThreadRuntimeState);
+  });
+
+  it("shows waiting-for-host as soon as the server closes a silent daemon session", () => {
     const { db, hostId, hub } = setup();
     const now = 60_000;
     const session = openTestSession({ db, hostId });
     closeTestSession({
-      closedAt: now - DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS - 1,
+      closeReason: "expired",
+      closedAt: now - 1_000,
       db,
       sessionId: session.id,
     });
@@ -306,7 +343,26 @@ describe("thread runtime display", () => {
       ),
     ).toEqual({
       displayStatus: "waiting-for-host",
-      hostReconnectGraceExpiresAt: null,
+    } satisfies ThreadRuntimeState);
+  });
+
+  it("shows waiting-for-host after the reconnect grace expires", () => {
+    const { db, hostId, hub } = setup();
+    const now = 60_000;
+    const session = openTestSession({ db, hostId });
+    closeTestSession({
+      closedAt: now - HOST_RECONNECT_GRACE_MS - 1,
+      db,
+      sessionId: session.id,
+    });
+
+    expect(
+      resolveThreadRuntimeState(
+        { db, hub },
+        { environmentHostId: hostId, now, status: "active" },
+      ),
+    ).toEqual({
+      displayStatus: "waiting-for-host",
     } satisfies ThreadRuntimeState);
   });
 
@@ -324,7 +380,6 @@ describe("thread runtime display", () => {
       ),
     ).toEqual({
       displayStatus: "idle",
-      hostReconnectGraceExpiresAt: null,
     } satisfies ThreadRuntimeState);
   });
 
@@ -342,8 +397,70 @@ describe("thread runtime display", () => {
       ),
     ).toEqual({
       displayStatus: "active",
-      hostReconnectGraceExpiresAt: null,
     } satisfies ThreadRuntimeState);
+  });
+
+  it("carries the producing environment provider into the list entry", () => {
+    const { db, hostId, hub } = setup();
+    const provided = createThreadWithEnvironment({
+      db,
+      hostId,
+      environmentProviderId: "git-worktree",
+    });
+    const checkout = createThreadWithEnvironment({ db, hostId });
+
+    const providerIdByThreadId = new Map(
+      [provided, checkout].flatMap(({ project }) =>
+        toThreadListEntryResponses(
+          { db, hub, providerRegistry },
+          {
+            now: 1_000,
+            threads: listThreadsWithPendingInteractionState(db, {
+              projectId: project.id,
+            }),
+          },
+        ).map((entry) => [entry.id, entry.environmentProviderId]),
+      ),
+    );
+
+    expect(providerIdByThreadId.get(provided.thread.id)).toBe("git-worktree");
+    expect(providerIdByThreadId.get(checkout.thread.id)).toBeNull();
+  });
+
+  it("reports the selected machine before a new thread has an environment", () => {
+    const { db, hostId, hub } = setup();
+    const { project } = createThreadWithEnvironment({ db, hostId });
+    const thread = createThread(db, noopNotifier, {
+      projectId: project.id,
+      environmentId: null,
+      providerId: "codex",
+      status: "pending",
+      startupContext: JSON.stringify({
+        kind: "pending",
+        environmentIntent: {
+          type: "provider",
+          environmentProviderId: "git-worktree",
+          machine: { type: "existing", hostId },
+          inputs: null,
+          selectionResolved: true,
+        },
+        fork: null,
+        startedOnBehalfOf: null,
+        titleProvided: false,
+      }),
+    });
+
+    const [entry] = toThreadListEntryResponses(
+      { db, hub, providerRegistry },
+      {
+        threads: listThreadsWithPendingInteractionState(db, {
+          projectId: project.id,
+        }).filter((row) => row.id === thread.id),
+      },
+    );
+
+    expect(entry?.environmentHostId).toBe(hostId);
+    expect(entry?.environmentId).toBeNull();
   });
 
   it("resolves list entry runtime from daemon registration per host", () => {
@@ -387,15 +504,12 @@ describe("thread runtime display", () => {
     expect(entries.map((entry) => entry.runtime)).toEqual([
       {
         displayStatus: "active",
-        hostReconnectGraceExpiresAt: null,
       },
       {
         displayStatus: "active",
-        hostReconnectGraceExpiresAt: null,
       },
       {
         displayStatus: "active",
-        hostReconnectGraceExpiresAt: null,
       },
     ] satisfies ThreadRuntimeState[]);
   });
@@ -433,6 +547,8 @@ describe("thread runtime display", () => {
       id: failedRow.id,
       threadId: failed.thread.id,
       failureReason: "The message could not be sent.",
+      now: Date.now(),
+      retryDelaysMs: [],
     });
 
     const entries = toThreadListEntryResponses(
@@ -440,7 +556,10 @@ describe("thread runtime display", () => {
       {
         now: 1_000,
         threads: [empty.thread, waiting.thread, failed.thread].map((thread) =>
-          createThreadListEntry({ environmentHostId: hostId, thread: { ...thread, pinSortKey: null } }),
+          createThreadListEntry({
+            environmentHostId: hostId,
+            thread: { ...thread, pinSortKey: null },
+          }),
         ),
       },
     );

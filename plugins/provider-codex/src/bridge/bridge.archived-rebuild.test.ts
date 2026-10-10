@@ -1,25 +1,25 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import type { BridgeJsonRpcOutputMessage } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { handleLine } from "./bridge.js";
+import {
+  cleanupBridgeProcessTest,
+  spawnedAppServerPids,
+} from "./bridge-process.test-support.js";
+import {
+  FULL_ACCESS_SESSION_OPTIONS,
+  stubFakeCodexAppServer,
+} from "./fake-codex-app-server-harness.js";
 
 const THREAD_ID = "thr_archived_rebuild_1";
 const PROVIDER_THREAD_ID = "rebuild-rollout-1";
 const ARCHIVED_ERROR_TEXT = `session ${PROVIDER_THREAD_ID} is archived; unarchive it and retry`;
 
-const fakeAppServerPath = fileURLToPath(
-  new URL("./fake-codex-app-server.mjs", import.meta.url),
-);
-
 const sessionOptions = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
+  ...FULL_ACCESS_SESSION_OPTIONS,
   reasoningLevel: "low",
 } as const;
 
@@ -31,9 +31,9 @@ const changedSessionOptions = {
 const turnInput = [{ type: "text", text: "hello", mentions: [] }];
 
 let harness: ReturnType<typeof createBridgeJsonRpcTestHarness>;
-let workspaceDir: string;
-let archiveStatePath: string;
-let processLogPath: string;
+let workspaceDir = "";
+let archiveStatePath = "";
+let processLogPath = "";
 
 beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-codex-archived-rebuild-"));
@@ -44,60 +44,21 @@ beforeEach(() => {
     scriptPath,
     JSON.stringify({ archiveStatePath, processLogPath }),
   );
-  vi.stubEnv("BB_CODEX_BRIDGE_APP_SERVER_COMMAND", process.execPath);
-  vi.stubEnv(
-    "BB_CODEX_BRIDGE_APP_SERVER_ARGS",
-    JSON.stringify([fakeAppServerPath, scriptPath]),
-  );
+  stubFakeCodexAppServer(scriptPath);
   harness = createBridgeJsonRpcTestHarness(handleLine);
 });
 
 afterEach(async () => {
-  const cleanupId = 993_001;
-  harness.sendRequest(cleanupId, "thread/stop", {
+  await cleanupBridgeProcessTest({
+    harness,
+    cleanupId: 993_001,
     threadId: THREAD_ID,
     providerThreadId: PROVIDER_THREAD_ID,
-    intent: "release",
-    activeTurnId: null,
+    processLogPath,
+    workspaceDir,
+    unstubEnvs: vi.unstubAllEnvs,
   });
-  await harness.waitForResponse(cleanupId).catch(() => undefined);
-  await waitForAppServerChildrenToExit();
-  harness.restore();
-  vi.unstubAllEnvs();
-  rmSync(workspaceDir, { recursive: true, force: true });
 });
-
-function spawnedAppServerPids(): number[] {
-  return readFileSync(processLogPath, "utf8")
-    .split("\n")
-    .filter((line) => line.startsWith("spawn:"))
-    .map((line) => Number(line.split(":")[1]));
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && Reflect.get(error, "code") === "ESRCH") {
-      return false;
-    }
-    throw error;
-  }
-}
-
-async function waitForAppServerChildrenToExit(): Promise<void> {
-  const childPids = spawnedAppServerPids();
-  const deadline = Date.now() + 15_000;
-  while (childPids.some(processIsAlive)) {
-    if (Date.now() > deadline) {
-      throw new Error(
-        `Timed out waiting for app-server children to exit: ${JSON.stringify(childPids.filter(processIsAlive))}`,
-      );
-    }
-    await new Promise((resolveTick) => setTimeout(resolveTick, 20));
-  }
-}
 
 async function resumeThread(): Promise<void> {
   harness.sendRequest(1, "thread/resume", {
@@ -197,11 +158,11 @@ it("keeps the thread resumable when a settings-change rebuild hits an externally
 
 it("keeps the thread resumable when the rebuild after the child died hits an externally archived rollout", async () => {
   await resumeThread();
-  const spawnLine = readFileSync(processLogPath, "utf8")
-    .split("\n")
-    .find((line) => line.startsWith("spawn:"));
-  const childPid = Number(spawnLine?.split(":")[1]);
-  expect(Number.isInteger(childPid)).toBe(true);
+  const [childPid] = spawnedAppServerPids(processLogPath);
+  expect(childPid).toBeDefined();
+  if (childPid === undefined) {
+    throw new Error("Expected the fake app-server child to have spawned");
+  }
   process.kill(childPid, "SIGKILL");
   const deadline = Date.now() + 15_000;
   while (
