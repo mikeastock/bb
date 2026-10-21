@@ -21,6 +21,8 @@ import { resolveBundledNpmCli } from "@bb/plugin-build";
 import { omitNpmScriptPolicyEnv } from "@bb/process-utils";
 
 const execFileAsync = promisify(execFile);
+const BB_APP_PACKAGE_NAMES = ["bb-app", "buildr-bb-app"] as const;
+const HOST_PACKAGE_NAME = "bb-app";
 const HOST_DEPENDENCIES = [
   "@parcel/watcher",
   "fs-native-extensions",
@@ -60,10 +62,12 @@ interface CreateBbAppArtifactServiceOptions {
   serverEntryUrl: string;
 }
 
+type BbAppPackageName = (typeof BB_APP_PACKAGE_NAMES)[number];
+
 interface BbAppPackageJson {
   dependencies: Record<string, string>;
   engines: { node: string };
-  name: "bb-app";
+  name: BbAppPackageName;
   os: string[];
   version: string;
 }
@@ -86,6 +90,10 @@ export async function defaultCommandRunner(
   return result.stdout;
 }
 
+function isBbAppPackageName(value: unknown): value is BbAppPackageName {
+  return BB_APP_PACKAGE_NAMES.some((name) => name === value);
+}
+
 function isStringRecord(value: unknown): value is Record<string, string> {
   return (
     value !== null &&
@@ -104,7 +112,7 @@ async function readBbAppPackageJson(
     parsed === null ||
     typeof parsed !== "object" ||
     !("name" in parsed) ||
-    parsed.name !== "bb-app" ||
+    !isBbAppPackageName(parsed.name) ||
     !("version" in parsed) ||
     typeof parsed.version !== "string" ||
     !("dependencies" in parsed) ||
@@ -170,7 +178,7 @@ function hostPackageJson(packageJson: BbAppPackageJson): object {
     }),
   );
   return {
-    name: packageJson.name,
+    name: HOST_PACKAGE_NAME,
     version: packageJson.version,
     description: "bb enrolled host runtime",
     type: "module",

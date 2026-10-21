@@ -112,6 +112,12 @@ export function createFullBbAppArtifactService(
           "This server runs from a source checkout, so it can't send its full bb-app package.",
       };
     }
+    if (resolved.packageJson.name !== "bb-app") {
+      return {
+        available: false,
+        reason: `This server runs the ${resolved.packageJson.name} package, but the target machine installs a full package as bb-app.`,
+      };
+    }
     for (const relativePath of REQUIRED_PACKAGE_PATHS) {
       if (!(await pathExists(join(resolved.root, relativePath)))) {
         return {

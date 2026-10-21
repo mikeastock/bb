@@ -23,9 +23,9 @@ async function writePackageFile(
   await writeFile(path, body);
 }
 
-function packageJson(version: string): string {
+function packageJson(version: string, name = "bb-app"): string {
   return JSON.stringify({
-    name: "bb-app",
+    name,
     version,
     dependencies: {},
     engines: { node: ">=22" },
@@ -71,6 +71,43 @@ describe("full bb-app artifact availability", () => {
       unpackedSizeBytes: Buffer.byteLength(packageJson("1.2.40")) + 2_000,
       version: "1.2.40",
     });
+  });
+});
+
+describe("full bb-app artifact for a renamed package", () => {
+  it("is unavailable because the target installs the full package as bb-app", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bb-full-artifact-renamed-"));
+    tempDirs.push(root);
+    await writePackageFile(
+      root,
+      "package.json",
+      packageJson("1.2.3", "buildr-bb-app"),
+    );
+    await writePackageFile(root, "dist/bb-server.js", "a");
+    await writePackageFile(root, "dist/bb-app.js", "b");
+    await writePackageFile(root, "server/dist/index.js", "c");
+    await writePackageFile(root, "app/dist/index.html", "d");
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "bb-full-artifact-renamed-data-"),
+    );
+    tempDirs.push(dataDir);
+    const service = createFullBbAppArtifactService({
+      commandRunner: async () => {
+        throw new Error("a renamed package is never packed");
+      },
+      dataDir,
+      serverEntryUrl: pathToFileURL(join(root, "server", "dist", "index.js"))
+        .href,
+    });
+
+    expect(await service.availability()).toEqual({
+      available: false,
+      reason:
+        "This server runs the buildr-bb-app package, but the target machine installs a full package as bb-app.",
+    });
+    await expect(service.build()).rejects.toThrow(
+      "This server runs the buildr-bb-app package",
+    );
   });
 });
 

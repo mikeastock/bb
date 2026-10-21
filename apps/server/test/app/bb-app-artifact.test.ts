@@ -244,6 +244,55 @@ describe("bb-app artifact service (desktop packaging)", () => {
     ARTIFACT_LIFECYCLE_TIMEOUT_MS,
   );
 
+  it(
+    "packs a buildr-bb-app server as the bb-app host runtime enrolled machines install",
+    async () => {
+      const test = await fixture("packaged");
+      await writeFile(
+        join(test.packageRoot, "package.json"),
+        JSON.stringify({ ...packageJson, name: "buildr-bb-app" }),
+      );
+      const service = createBbAppArtifactService({
+        dataDir: join(test.root, "data"),
+        serverEntryUrl: pathToFileURL(test.serverEntry).href,
+      });
+
+      await expect(service.getVersion()).resolves.toBe("1.2.3-test");
+      const artifact = await service.getArtifact();
+      const packedPackageJson = JSON.parse(
+        (
+          await execFileAsync("tar", [
+            "-xOzf",
+            artifact.path,
+            "package/package.json",
+          ])
+        ).stdout,
+      );
+      expect(packedPackageJson).toMatchObject({
+        name: "bb-app",
+        version: "1.2.3-test",
+        bin: {
+          bb: "dist/bb.js",
+          "bb-app": "dist/bb-app.js",
+          "bb-host-daemon": "dist/bb-host-daemon.js",
+        },
+      });
+    },
+    ARTIFACT_LIFECYCLE_TIMEOUT_MS,
+  );
+
+  it("does not resolve a package with an unknown name", async () => {
+    const test = await fixture("packaged");
+    await writeFile(
+      join(test.packageRoot, "package.json"),
+      JSON.stringify({ ...packageJson, name: "some-other-app" }),
+    );
+
+    await expect(
+      resolveBbAppPackage(pathToFileURL(test.serverEntry).href),
+    ).rejects.toThrow("Unable to locate the bb-app package");
+  });
+
   it("rejects missing runtime files even when the README is absent", async () => {
     const test = await fixture("packaged");
     const runtimePath = join(
